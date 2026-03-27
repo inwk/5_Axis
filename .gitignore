@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+.vscode/
+
+# Generated datasets / artifacts
+axis_dataset_out/
+checkpoints/
+checkpoints_svd_v1/
+prt_dataset/
+*.parquet
+*.npy
+*.stl
+*.log
+*.prt
+
+# Local legacy backups
+old/
+
+# OS files
+Thumbs.db
+Desktop.ini
