@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from .schema import TOOL_CHOICE_TO_ID, tool_choice_key
+from .schema import TOOL_CHOICE_TO_ID, strategy_id_from_macro_class_id, tool_choice_key
 
 
 class ProcessSkeletonParquetDataset(Dataset):
@@ -56,6 +56,28 @@ class ProcessSkeletonParquetDataset(Dataset):
             np.float32,
             (num_nodes, 2),
         )
+        next_point_sdf = None
+        if "next_point_sdf" in row.index:
+            next_point_sdf = self._optional_array(
+                row["next_point_sdf"],
+                np.float32,
+                (num_nodes, state_points.shape[1]),
+            )
+        elif "next_state_points" in row.index:
+            next_state_points = self._optional_array(
+                row["next_state_points"],
+                np.float32,
+                state_points.shape,
+            )
+            next_point_sdf = next_state_points[..., 6]
+
+        next_node_sdf = None
+        if "next_node_sdf" in row.index:
+            next_node_sdf = self._optional_array(row["next_node_sdf"], np.float32, (num_nodes,))
+        elif next_point_sdf is not None:
+            next_node_sdf = next_point_sdf.mean(axis=1, dtype=np.float32)
+        else:
+            next_node_sdf = np.zeros((num_nodes,), dtype=np.float32)
 
         tool_choice_id = row["tool_choice_id"] if "tool_choice_id" in row.index else None
         if tool_choice_id is None or (isinstance(tool_choice_id, float) and np.isnan(tool_choice_id)):
@@ -70,18 +92,32 @@ class ProcessSkeletonParquetDataset(Dataset):
         if tool_choice_valid is None or (isinstance(tool_choice_valid, float) and np.isnan(tool_choice_valid)):
             tool_choice_valid = 1 if int(tool_choice_id) >= 0 else 0
 
+        strategy_id = row["strategy_id"] if "strategy_id" in row.index else None
+        if strategy_id is None or (isinstance(strategy_id, float) and np.isnan(strategy_id)):
+            strategy_id = strategy_id_from_macro_class_id(int(row["macro_class_id"]))
+        strategy_valid = row["strategy_valid"] if "strategy_valid" in row.index else None
+        if strategy_valid is None or (isinstance(strategy_valid, float) and np.isnan(strategy_valid)):
+            strategy_valid = 1
+
         batch = {
             "state_points": torch.from_numpy(state_points),
             "node_process_state": torch.from_numpy(node_process_state),
-            "next_node_sdf": torch.from_numpy(self._array(row["next_node_sdf"], np.float32)),
+            "next_node_sdf": torch.from_numpy(next_node_sdf),
             "node_mask": torch.from_numpy(self._array(row["node_mask"], np.int16).astype(np.bool_)),
             "point_mask": torch.from_numpy(self._array(row["point_mask"], np.int16).astype(np.bool_)),
             "macro_class_id": torch.tensor(int(row["macro_class_id"]), dtype=torch.long),
             "tool_choice_id": torch.tensor(int(max(int(tool_choice_id), 0)), dtype=torch.long),
+            "strategy_id": torch.tensor(int(max(int(strategy_id), 0)), dtype=torch.long),
             "target_node_id": torch.tensor(int(row["target_node_id"]), dtype=torch.long),
             "target_node_valid": torch.tensor(int(row["target_node_valid"]), dtype=torch.float32),
             "tool_choice_valid": torch.tensor(int(tool_choice_valid), dtype=torch.float32),
+            "strategy_valid": torch.tensor(int(strategy_valid), dtype=torch.float32),
         }
+        if next_point_sdf is not None:
+            batch["next_point_sdf"] = torch.from_numpy(next_point_sdf)
+
+        if "is_chosen" in row.index:
+            batch["is_chosen"] = torch.tensor(int(row["is_chosen"]), dtype=torch.bool)
 
         if "global_process_state" in row.index:
             batch["global_process_state"] = torch.from_numpy(
@@ -99,12 +135,26 @@ class ProcessSkeletonParquetDataset(Dataset):
             batch["tool_choice_mask"] = torch.from_numpy(
                 self._array(row["tool_choice_mask"], np.int16).astype(np.bool_)
             )
+        if "strategy_mask" in row.index:
+            batch["strategy_mask"] = torch.from_numpy(
+                self._array(row["strategy_mask"], np.int16).astype(np.bool_)
+            )
 
         if "centrality_512" in row.index:
-            batch["centrality_512"] = torch.from_numpy(self._array(row["centrality_512"], np.int16))
+            node_centrality = torch.from_numpy(self._array(row["centrality_512"], np.int16))
+            batch["centrality_512"] = node_centrality
+            batch["node_centrality"] = node_centrality
         if "spatial_pos_512x512" in row.index:
-            batch["spatial_pos_512x512"] = torch.from_numpy(self._array(row["spatial_pos_512x512"], np.int16))
+            spatial_pos = torch.from_numpy(self._array(row["spatial_pos_512x512"], np.int16))
+            batch["spatial_pos_512x512"] = spatial_pos
+            batch["spatial_pos"] = spatial_pos
         if "face_area_512x1" in row.index:
-            batch["face_area_512x1"] = torch.from_numpy(self._array(row["face_area_512x1"], np.float32))
+            face_area = torch.from_numpy(self._array(row["face_area_512x1"], np.float32))
+            batch["face_area_512x1"] = face_area
+            batch["face_area"] = face_area
+        if "axis_visible_512" in row.index:
+            axis_visible = torch.from_numpy(self._array(row["axis_visible_512"], np.int16))
+            batch["axis_visible_512"] = axis_visible
+            batch["axis_visible"] = axis_visible
 
         return batch

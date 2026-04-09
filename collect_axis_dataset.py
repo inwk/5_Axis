@@ -3,7 +3,6 @@ import os
 import json
 import math
 import gc
-import random
 import sys
 from typing import Any, Dict, Tuple, List
 from datetime import datetime
@@ -20,7 +19,9 @@ from graph_sdf.schema import (
     MACRO_CLASS_TO_ID,
     TOOL_CHOICE_TO_ID,
     TOOL_LIBRARY,
+    build_strategy_mask_for_macro_class,
     build_tool_choice_mask_for_macro_class,
+    strategy_id_from_macro_class_id,
     tool_choice_key,
 )
 
@@ -121,18 +122,18 @@ def pad_2d_int(mat: np.ndarray, n: int, pad_val: int = 0) -> np.ndarray:
     return out
 
 def pad_face_area(face_area: np.ndarray, n: int) -> np.ndarray:
-    """Performs: pad face area."""
+    """Pads raw face area values without normalization."""
     out = np.zeros((n, 1), dtype=np.float32)
     m = min(len(face_area), n)
-    out[:m, 0] = face_area[:m].astype(np.float32) / 1000.0
+    out[:m, 0] = face_area[:m].astype(np.float32)
     return out
 
 def pad_face_pc(points_group: np.ndarray, n: int = 512) -> np.ndarray:
-    """Performs: pad face pc."""
+    """Pads raw grouped point clouds without normalization."""
     K = points_group.shape[0]
     out = np.zeros((n, points_group.shape[1], 3), dtype=np.float32)
     m = min(K, n)
-    out[:m] = points_group[:m].astype(np.float32) / 10000.0
+    out[:m] = points_group[:m].astype(np.float32)
     return out
 
 def pad_visibility(vis: np.ndarray, n: int = 512) -> np.ndarray:
@@ -165,10 +166,16 @@ def reduce_scalar_by_groups(values: np.ndarray, groups, weights: np.ndarray) -> 
         out[k] = float((v*w).sum()/s) if s > 1e-12 else float(v.mean())
     return out
 
-def compute_done_mask_from_dev_red(dev_red_512: np.ndarray, tol: float) -> Tuple[np.ndarray, float]:
-    """Performs: compute done mask from dev red."""
+def compute_done_mask_from_dev_red(
+    dev_red_512: np.ndarray,
+    tol: float,
+    node_mask_512: np.ndarray | None = None,
+) -> Tuple[np.ndarray, float]:
+    """Computes done-mask from residual thickness (optionally excluding padded nodes)."""
     dev = np.asarray(dev_red_512, dtype=np.float32).reshape(-1)
-    valid = np.isfinite(dev) & (dev != 0.0)
+    valid = np.isfinite(dev)
+    if node_mask_512 is not None:
+        valid = valid & (np.asarray(node_mask_512, dtype=np.int16).reshape(-1) == 0)
     done = np.zeros_like(dev, dtype=np.int16)
     if valid.any():
         done[valid] = (dev[valid] <= float(tol)).astype(np.int16)
@@ -309,23 +316,145 @@ def build_point_mask_512x100(num_valid_nodes: int, points_per_node: int = 100, m
 def build_state_points_tensor(
     face_pc_512x100x3: np.ndarray,
     face_normal_512x3: np.ndarray,
-    node_sdf_512: np.ndarray,
+    point_sdf_512x100: np.ndarray,
+    reference_scale: float,
 ) -> np.ndarray:
-    """Builds state tensor [512, 100, 7] = xyz + normal + normalized residual sdf."""
+    """Builds state tensor [512, 100, 7] = normalized xyz + normal + normalized local sdf."""
     state_points = np.zeros((512, 100, 7), dtype=np.float32)
     state_points[:, :, 0:3] = np.asarray(face_pc_512x100x3, dtype=np.float32)
     state_points[:, :, 3:6] = np.broadcast_to(
         np.asarray(face_normal_512x3, dtype=np.float32)[:, None, :],
         (512, 100, 3),
     )
-    sdf = np.asarray(node_sdf_512, dtype=np.float32).reshape(512, 1, 1) / float(SDF_FEATURE_SCALE)
+    scale = float(max(reference_scale, 1e-6))
+    sdf = np.asarray(point_sdf_512x100, dtype=np.float32).reshape(512, 100, 1) / scale
     state_points[:, :, 6:7] = sdf
     return state_points
 
 
-def build_normalized_node_sdf_512x1(node_sdf_512: np.ndarray) -> np.ndarray:
+def build_normalized_node_sdf_512x1(node_sdf_512: np.ndarray, reference_scale: float) -> np.ndarray:
     """Converts raw residual thickness to normalized [512, 1] node supervision."""
-    return (np.asarray(node_sdf_512, dtype=np.float32).reshape(512, 1) / float(SDF_FEATURE_SCALE)).astype(np.float32)
+    scale = float(max(reference_scale, 1e-6))
+    return (np.asarray(node_sdf_512, dtype=np.float32).reshape(512, 1) / scale).astype(np.float32)
+
+
+def build_normalized_point_sdf_512x100(point_sdf_512x100: np.ndarray, reference_scale: float) -> np.ndarray:
+    """Converts raw local residual thickness to normalized [512, 100] supervision."""
+    scale = float(max(reference_scale, 1e-6))
+    return (np.asarray(point_sdf_512x100, dtype=np.float32).reshape(512, 100) / scale).astype(np.float32)
+
+
+def compute_reference_frame(
+    face_pc_512x100x3: np.ndarray,
+    node_mask_512: np.ndarray,
+) -> Tuple[np.ndarray, float, np.ndarray]:
+    """Computes one part-level normalization frame shared across the full rollout."""
+    face_pc = np.asarray(face_pc_512x100x3, dtype=np.float32)
+    valid_nodes = np.asarray(node_mask_512, dtype=np.int16).reshape(-1) == 0
+    valid_points = face_pc[valid_nodes].reshape(-1, 3)
+    if valid_points.size == 0:
+        return np.zeros((3,), dtype=np.float32), 1.0, np.ones((3,), dtype=np.float32)
+
+    bbox_min = valid_points.min(axis=0)
+    bbox_max = valid_points.max(axis=0)
+    center = ((bbox_min + bbox_max) * 0.5).astype(np.float32)
+    extent = np.maximum(bbox_max - bbox_min, 1e-6).astype(np.float32)
+    scale = float(max(np.linalg.norm(extent), 1e-6))
+    return center, scale, extent
+
+
+def normalize_face_points(
+    face_pc_512x100x3: np.ndarray,
+    center_xyz: np.ndarray,
+    reference_scale: float,
+) -> np.ndarray:
+    """Normalizes grouped point clouds using one fixed part-level frame."""
+    scale = float(max(reference_scale, 1e-6))
+    return ((np.asarray(face_pc_512x100x3, dtype=np.float32) - center_xyz.reshape(1, 1, 3)) / scale).astype(np.float32)
+
+
+def normalize_face_area(face_area_512x1: np.ndarray, reference_scale: float) -> np.ndarray:
+    """Normalizes face area by the squared part reference scale."""
+    scale_sq = float(max(reference_scale, 1e-6)) ** 2
+    return (np.asarray(face_area_512x1, dtype=np.float32) / scale_sq).astype(np.float32)
+
+
+def extract_point_coordinates(points_array) -> List[np.ndarray]:
+    """Extracts raw xyz coordinates from NX point objects for later interpolation."""
+    coords_per_face: List[np.ndarray] = []
+    for face_points in points_array:
+        coords = []
+        for point in face_points:
+            try:
+                coords.append(
+                    [
+                        float(point.Coordinates.X),
+                        float(point.Coordinates.Y),
+                        float(point.Coordinates.Z),
+                    ]
+                )
+            except Exception:
+                continue
+        coords_per_face.append(np.asarray(coords, dtype=np.float32))
+    return coords_per_face
+
+
+def build_group_face_normals_512(
+    groups_face: List[List[int]],
+    origin_face_normals: List[np.ndarray],
+    max_nodes: int = 512,
+) -> np.ndarray:
+    """Aggregates original per-face normals into compressed graph-node normals."""
+    out = np.zeros((max_nodes, 3), dtype=np.float32)
+    for group_idx, face_indices in enumerate(groups_face[:max_nodes]):
+        vectors = []
+        for face_idx in face_indices:
+            if 0 <= int(face_idx) < len(origin_face_normals):
+                vectors.append(np.asarray(origin_face_normals[int(face_idx)], dtype=np.float32))
+        if not vectors:
+            out[group_idx] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            continue
+        mean_normal = np.mean(np.stack(vectors, axis=0), axis=0)
+        norm = float(np.linalg.norm(mean_normal))
+        out[group_idx] = (mean_normal / norm) if norm > 1e-9 else np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    return out
+
+
+def build_group_point_sdf_512x100(
+    group_points_512x100x3: np.ndarray,
+    groups_face: List[List[int]],
+    measurement_point_coords_per_face: List[np.ndarray],
+    measurement_point_sdf_per_face: List[np.ndarray],
+    fallback_node_sdf_512: np.ndarray,
+) -> np.ndarray:
+    """Interpolates face-level measurement points onto the fixed 512x100 grouped point cloud."""
+    grouped_point_sdf = np.zeros((512, 100), dtype=np.float32)
+    fallback_node_sdf = np.asarray(fallback_node_sdf_512, dtype=np.float32).reshape(-1)
+
+    for group_idx, face_indices in enumerate(groups_face[:512]):
+        query_points = np.asarray(group_points_512x100x3[group_idx], dtype=np.float32)
+        ref_points = []
+        ref_values = []
+        for face_idx in face_indices:
+            if 0 <= int(face_idx) < len(measurement_point_coords_per_face):
+                coords = np.asarray(measurement_point_coords_per_face[int(face_idx)], dtype=np.float32)
+                values = np.asarray(measurement_point_sdf_per_face[int(face_idx)], dtype=np.float32).reshape(-1)
+                count = min(len(coords), len(values))
+                if count > 0:
+                    ref_points.append(coords[:count])
+                    ref_values.append(values[:count])
+
+        if ref_points:
+            ref_points_concat = np.concatenate(ref_points, axis=0)
+            ref_values_concat = np.concatenate(ref_values, axis=0)
+            diff = query_points[:, None, :] - ref_points_concat[None, :, :]
+            nearest = np.argmin(np.sum(diff * diff, axis=-1), axis=1)
+            grouped_point_sdf[group_idx] = ref_values_concat[nearest]
+        else:
+            fallback = float(fallback_node_sdf[group_idx]) if group_idx < len(fallback_node_sdf) else 0.0
+            grouped_point_sdf[group_idx] = fallback
+
+    return grouped_point_sdf
 
 
 def build_finish_ready_mask_512(
@@ -473,16 +602,373 @@ def build_global_process_state(
     prev_macro_class_id: int,
     rough_rows_emitted: int,
     finish_rows_emitted: int,
+    bbox_extent_xyz: np.ndarray,
+    reference_scale: float,
 ) -> np.ndarray:
-    """Builds a compact global process-history vector."""
-    out = np.zeros((9,), dtype=np.float32)
+    """Builds a compact global context vector with process history and part scale."""
+    out = np.zeros((13,), dtype=np.float32)
     if 0 <= int(prev_macro_class_id) < 7:
         out[int(prev_macro_class_id)] = 1.0
     total = max(rough_rows_emitted + finish_rows_emitted, 1)
     out[7] = float(rough_rows_emitted / total)
     out[8] = float(finish_rows_emitted / total)
+    ref_scale = float(max(reference_scale, 1e-6))
+    out[9:12] = np.asarray(bbox_extent_xyz, dtype=np.float32).reshape(3) / ref_scale
+    out[12] = float(np.log1p(ref_scale))
     return out
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Action-first candidate generation: (macro_class, target_node, tool)
+# → axis is derived deterministically from the action, not chosen first.
+# ──────────────────────────────────────────────────────────────────────
+
+MACRO_CLASS_TO_OPTYPE = {
+    "3_axis_rough": "3D Adaptive Roughing",
+    "3_axis_finish": "Area Mill",
+    "3p2_axis_rough": "3D Adaptive Roughing",
+    "3p2_axis_finish": "Area Mill",
+    "5_axis_point_finish": "Point Mill",
+    "5_axis_flank_finish": "Swarf Mill",
+}
+
+
+def derive_axis_direction(
+    macro_class_name: str,
+    target_face_normal: np.ndarray,
+) -> Tuple[float, float, float]:
+    """Derives tool axis from macro class and target face geometry.
+
+    3-axis      → always (0, 0, 1)
+    3+2-axis    → target face normal (upper hemisphere)
+    5-axis      → target face normal as initial orientation hint
+    """
+    if macro_class_name in {"3_axis_rough", "3_axis_finish"}:
+        return (0.0, 0.0, 1.0)
+    n = _normalize_vector(tuple(float(x) for x in target_face_normal))
+    if n == (0.0, 0.0, 0.0):
+        return (0.0, 0.0, 1.0)
+    if n[2] < 0:
+        n = (-n[0], -n[1], -n[2])
+    return n
+
+
+def sample_valid_tools_for_macro(
+    macro_class_name: str,
+    max_tools: int = 3,
+) -> List[Tuple[str, float]]:
+    """Returns valid tools for a macro class, sampled for size diversity."""
+    macro_id = MACRO_CLASS_TO_ID.get(macro_class_name, -1)
+    if macro_id < 0:
+        return []
+    mask = build_tool_choice_mask_for_macro_class(macro_id)
+    valid = [TOOL_LIBRARY[i] for i, m in enumerate(mask) if m == 0]
+    if not valid:
+        return []
+    if len(valid) <= max_tools:
+        return list(valid)
+    indices = np.linspace(0, len(valid) - 1, max_tools, dtype=int)
+    return [valid[int(i)] for i in indices]
+
+
+def select_target_node_candidates(
+    state_node_sdf_512: np.ndarray,
+    rough_done_mask_512: np.ndarray,
+    finish_ready_mask_512: np.ndarray,
+    node_mask_512: np.ndarray,
+    face_normal_512x3: np.ndarray,
+    max_rough_targets: int = 5,
+    max_finish_targets: int = 5,
+    normal_dedup_tol_deg: float = 10.0,
+) -> Dict[str, List[int]]:
+    """Selects candidate target nodes for roughing and finishing.
+
+    Roughing:  nodes with highest residual, not yet rough-done,
+               deduplicated by normal direction (avoids redundant 3+2 axes).
+    Finishing: finish-ready nodes, deduplicated similarly.
+    """
+    valid = np.asarray(node_mask_512, dtype=np.int16).reshape(-1) == 0
+    sdf = np.asarray(state_node_sdf_512, dtype=np.float32).reshape(-1)
+    normals = np.asarray(face_normal_512x3, dtype=np.float32)
+
+    def _pick_diverse(eligible_mask, max_count):
+        idx = np.where(eligible_mask)[0]
+        if len(idx) == 0:
+            return []
+        order = np.argsort(-sdf[idx])
+        selected, used_n = [], []
+        for i in order:
+            nid = int(idx[i])
+            n = _normalize_vector(tuple(normals[nid]))
+            if n[2] < 0:
+                n = (-n[0], -n[1], -n[2])
+            if any(_angle_between_vectors_deg(n, u) <= normal_dedup_tol_deg for u in used_n):
+                continue
+            selected.append(nid)
+            used_n.append(n)
+            if len(selected) >= max_count:
+                break
+        return selected
+
+    rough_elig = valid & (np.asarray(rough_done_mask_512, dtype=np.int16).reshape(-1) == 0) & (sdf > 0)
+    finish_elig = valid & (np.asarray(finish_ready_mask_512, dtype=np.int16).reshape(-1) == 1)
+    return {
+        "rough": _pick_diverse(rough_elig, max_rough_targets),
+        "finish": _pick_diverse(finish_elig, max_finish_targets),
+    }
+
+
+def generate_action_candidates(
+    state_node_sdf_512: np.ndarray,
+    rough_done_mask_512: np.ndarray,
+    finish_ready_mask_512: np.ndarray,
+    node_mask_512: np.ndarray,
+    face_normal_512x3: np.ndarray,
+    max_rough_targets: int = 5,
+    max_finish_targets: int = 5,
+    max_tools_per_class: int = 2,
+) -> List[Dict[str, Any]]:
+    """Generates action candidates as (macro_class, target_node, tool) with derived axis.
+
+    Unlike the old axis-first approach, the axis is derived deterministically
+    from the macro class and target node's face normal.
+    """
+    targets = select_target_node_candidates(
+        state_node_sdf_512, rough_done_mask_512, finish_ready_mask_512,
+        node_mask_512, face_normal_512x3,
+        max_rough_targets=max_rough_targets,
+        max_finish_targets=max_finish_targets,
+    )
+    normals = np.asarray(face_normal_512x3, dtype=np.float32)
+    candidates: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    def _add(macro, node_id, tk, td, axis):
+        key = (macro, node_id, tk, td)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append({
+            "macro_class_name": macro,
+            "target_node_id": int(node_id),
+            "tool_kind": tk,
+            "tool_diameter": td,
+            "optype": MACRO_CLASS_TO_OPTYPE[macro],
+            "axis_dir": axis,
+            "path_type": "FollowPart",
+        })
+
+    # ── Roughing ──
+    if targets["rough"]:
+        # 3-axis rough: axis=Z always, target = most Z-aligned node (operation is global)
+        z_scores = [float(normals[nid][2]) for nid in targets["rough"]]
+        best_z_node = targets["rough"][int(np.argmax(z_scores))]
+        for tk, td in sample_valid_tools_for_macro("3_axis_rough", max_tools_per_class):
+            _add("3_axis_rough", best_z_node, tk, td, (0.0, 0.0, 1.0))
+
+        # 3+2 rough: each target node → distinct axis from its normal
+        for node_id in targets["rough"]:
+            axis = derive_axis_direction("3p2_axis_rough", normals[node_id])
+            if is_three_axis_tool_orientation(axis, tol_deg=5.0):
+                continue
+            for tk, td in sample_valid_tools_for_macro("3p2_axis_rough", max_tools_per_class):
+                _add("3p2_axis_rough", node_id, tk, td, axis)
+
+    # ── Finishing ──
+    for node_id in targets["finish"]:
+        normal = normals[node_id]
+
+        for tk, td in sample_valid_tools_for_macro("3_axis_finish", max_tools_per_class):
+            _add("3_axis_finish", node_id, tk, td, (0.0, 0.0, 1.0))
+
+        axis_3p2 = derive_axis_direction("3p2_axis_finish", normal)
+        if not is_three_axis_tool_orientation(axis_3p2, tol_deg=5.0):
+            for tk, td in sample_valid_tools_for_macro("3p2_axis_finish", max_tools_per_class):
+                _add("3p2_axis_finish", node_id, tk, td, axis_3p2)
+
+        axis_5 = derive_axis_direction("5_axis_point_finish", normal)
+        for tk, td in sample_valid_tools_for_macro("5_axis_point_finish", max_tools_per_class):
+            _add("5_axis_point_finish", node_id, tk, td, axis_5)
+
+        for tk, td in sample_valid_tools_for_macro("5_axis_flank_finish", max_tools_per_class):
+            _add("5_axis_flank_finish", node_id, tk, td, axis_5)
+
+    return candidates
+
+
+def simulate_single_action(
+    session, work_part, prt_file_path,
+    origin_body, origin_faces, groups_face, face_areas,
+    points_array, norm_vecs_array, lines_array,
+    flat_tools, ball_tools,
+    action: Dict[str, Any],
+    surface_finish_tol: float = 0.01,
+    group_reference_points_512x100x3: np.ndarray | None = None,
+    measurement_point_coords: List[np.ndarray] | None = None,
+) -> Dict[str, Any]:
+    """Simulates one action and returns transition data.
+
+    The NX operation is applied permanently — the caller must manage
+    undo marks if rollback is needed.  Internal measurement geometry
+    is cleaned up via its own undo marks.
+    """
+    optype = action["optype"]
+    tool_kind = action["tool_kind"]
+    tool_diameter = float(action["tool_diameter"])
+    axis_dir = tuple(action["axis_dir"])
+
+    # Visibility for this axis
+    visible_set: set = set()
+    visible_512 = np.zeros((512,), dtype=np.int16)
+    try:
+        view_vec = NXOpen.Vector3d(float(axis_dir[0]), float(axis_dir[1]), float(axis_dir[2]))
+        vis_tags = cam_utils.identify_visible_faces(origin_body, view_vec)
+        visible_set = set(vis_tags)
+        vis_orig = np.array([1 if f.Tag in visible_set else 0 for f in origin_faces], dtype=np.int16)
+        vis_red = reduce_visibility_by_groups(vis_orig, groups_face)
+        visible_512 = pad_visibility(vis_red, 512)
+    except Exception:
+        pass
+
+    capture_pw = (group_reference_points_512x100x3 is not None
+                  and measurement_point_coords is not None)
+    op_list: list = []
+    ct_list: list = []
+
+    # ── Measure BEFORE ──
+    m_bef = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "sim_meas_bef")
+    obj_b, _, _ = geometry.create_geometry(session, work_part, prt_file_path, [], origin_body, True, False)
+    pw_before = None
+    try:
+        if capture_pw:
+            dev_before, pw_raw_bef, vol_before = cam_utils.measure_ipw_state_detailed(
+                session, work_part, obj_b, flat_tools[0],
+                points_array, norm_vecs_array, lines_array,
+            )
+            dev_bef_red = reduce_scalar_by_groups(np.asarray(dev_before, dtype=np.float32), groups_face, weights=face_areas)
+            pw_before = build_group_point_sdf_512x100(
+                group_reference_points_512x100x3, groups_face,
+                measurement_point_coords, pw_raw_bef,
+                pad_1d_float(dev_bef_red, 512),
+            )
+        else:
+            dev_before, vol_before = cam_utils.measure_ipw_state(
+                session, work_part, obj_b, flat_tools[0],
+                points_array, norm_vecs_array, lines_array,
+            )
+            dev_bef_red = reduce_scalar_by_groups(np.asarray(dev_before, dtype=np.float32), groups_face, weights=face_areas)
+    except Exception as exc:
+        session.UndoToMark(m_bef, "sim_meas_bef")
+        session.DeleteUndoMark(m_bef, "sim_meas_bef")
+        return {"ok": False, "error": f"measure_before: {repr(exc)}"}
+    session.UndoToMark(m_bef, "sim_meas_bef")
+    session.DeleteUndoMark(m_bef, "sim_meas_bef")
+
+    dev_bef_red_512 = pad_1d_float(dev_bef_red, 512)
+    result: Dict[str, Any] = {
+        "ok": True, "error": None,
+        "optype": optype, "tool_kind": tool_kind, "tool_diameter": tool_diameter,
+        "axis_dir": axis_dir, "path_type": action.get("path_type", "FollowPart"),
+        "volume_before": float(vol_before),
+        "dev_before_red_512": dev_bef_red_512,
+        "visible_512": visible_512,
+    }
+    if pw_before is not None:
+        result["point_sdf_before_512x100"] = pw_before.astype(np.float32)
+
+    # ── Apply NX operation ──
+    def _select_finish_faces():
+        idx_list = cam_utils.classify_faces_for_operation(
+            session, work_part, None, "Area Mill", origin_faces, dev_before,
+        )
+        return [
+            origin_faces[i] for i in idx_list
+            if float(dev_before[i]) > surface_finish_tol
+            and origin_faces[i].Tag in visible_set
+        ]
+
+    try:
+        obj_op, _, _ = geometry.create_geometry(session, work_part, prt_file_path, [], origin_body, True, False)
+        tool = resolve_tool_name(tool_kind, tool_diameter, flat_tools, ball_tools)
+
+        if optype == "3D Adaptive Roughing":
+            operations.create_3d_adaptive_roughing(
+                session, work_part, tool, obj_op, op_list, ct_list,
+                tool_orientation=axis_dir,
+            )
+        elif optype in {"Area Mill", "Cavity Mill"}:
+            sel = _select_finish_faces()
+            if not sel:
+                ct_list.append(0.0)
+            else:
+                operations.create_surface_contour(
+                    session, work_part, tool, obj_op, sel, op_list, ct_list,
+                    tool_orientation=axis_dir,
+                )
+        elif optype == "Swarf Mill":
+            sel = _select_finish_faces()
+            if not sel:
+                ct_list.append(0.0)
+            else:
+                operations.create_swarf_milling(
+                    session, work_part, tool, obj_op, sel, op_list, ct_list,
+                )
+        elif optype == "Point Mill":
+            sel = _select_finish_faces()
+            if not sel:
+                ct_list.append(0.0)
+            else:
+                operations.create_point_milling(
+                    session, work_part, tool, obj_op, sel, op_list, ct_list,
+                )
+        else:
+            raise ValueError(f"Unknown optype: {optype}")
+    except Exception as exc:
+        result["ok"] = False
+        result["error"] = f"apply: {repr(exc)}"
+        result["volume_after"] = float(vol_before)
+        result["removed_volume"] = 0.0
+        result["cycle_time"] = 0.0
+        result["dev_after_red_512"] = dev_bef_red_512.copy()
+        return result
+
+    # ── Measure AFTER ──
+    m_aft = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "sim_meas_aft")
+    obj_a, _, _ = geometry.create_geometry(session, work_part, prt_file_path, [], origin_body, True, False)
+    try:
+        if capture_pw:
+            dev_after, pw_raw_aft, vol_after = cam_utils.measure_ipw_state_detailed(
+                session, work_part, obj_a, flat_tools[0],
+                points_array, norm_vecs_array, lines_array,
+            )
+            dev_aft_red = reduce_scalar_by_groups(np.asarray(dev_after, dtype=np.float32), groups_face, weights=face_areas)
+            result["point_sdf_after_512x100"] = build_group_point_sdf_512x100(
+                group_reference_points_512x100x3, groups_face,
+                measurement_point_coords, pw_raw_aft,
+                pad_1d_float(dev_aft_red, 512),
+            ).astype(np.float32)
+        else:
+            dev_after, vol_after = cam_utils.measure_ipw_state(
+                session, work_part, obj_a, flat_tools[0],
+                points_array, norm_vecs_array, lines_array,
+            )
+            dev_aft_red = reduce_scalar_by_groups(np.asarray(dev_after, dtype=np.float32), groups_face, weights=face_areas)
+    except Exception as exc:
+        vol_after = vol_before
+        dev_aft_red = np.asarray(dev_bef_red, dtype=np.float32)
+        result["ok"] = False
+        result["error"] = f"measure_after: {repr(exc)}"
+    session.UndoToMark(m_aft, "sim_meas_aft")
+    session.DeleteUndoMark(m_aft, "sim_meas_aft")
+
+    result["volume_after"] = float(vol_after)
+    result["removed_volume"] = max(float(vol_before) - float(vol_after), 0.0)
+    result["cycle_time"] = float(ct_list[-1]) if ct_list else 0.0
+    result["dev_after_red_512"] = pad_1d_float(dev_aft_red, 512)
+    return result
+
+
+# ── Legacy axis-first functions (kept for reference) ──────────────────
 
 def select_axis_candidates(
     origin_faces,
@@ -721,7 +1207,11 @@ def evaluate_action_with_lookahead(
             flat_tools,
         )
         _ = next_state_volume
-        next_done_mask, _ = compute_done_mask_from_dev_red(next_state_dev, finish_tol)
+        next_done_mask, _ = compute_done_mask_from_dev_red(
+            next_state_dev,
+            finish_tol,
+            node_mask_512=node_mask_512,
+        )
         rough_next = np.asarray(rough_done_mask_512, dtype=np.int16).copy()
         if action["optype"] == "3D Adaptive Roughing":
             before = np.asarray(first_step.get("dev_before_red_512", next_state_dev), dtype=np.float32)
@@ -832,6 +1322,9 @@ def simulate_rollout_for_axis(
     face_areas, points_array, norm_vecs_array, lines_array, flat_tools, ball_tools,
     axis_dir, seq, out_dir_for_this_rollout, surface_finish_tol: float = 0.01,
     pre_visible_tags=None, pre_visible_512=None,
+    capture_pointwise: bool = False,
+    group_reference_points_512x100x3: np.ndarray | None = None,
+    measurement_point_coords: List[np.ndarray] | None = None,
 ):
     """Simulates one selected axis from the current state and returns rollout metrics."""
     _ensure_dir(out_dir_for_this_rollout)
@@ -878,11 +1371,33 @@ def simulate_rollout_for_axis(
         }
         m0 = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, f"rollout_measure_before_{si}")
         obj_blank_b, _, _ = geometry.create_geometry(session, work_part, prt_file_path, [], origin_body, True, False)
-        dev_before, _ = cam_utils.measure_ipw_state(session, work_part, obj_blank_b, flat_tools[0], points_array, norm_vecs_array, lines_array)
+        point_sdf_before_512x100 = None
+        if capture_pointwise and group_reference_points_512x100x3 is not None and measurement_point_coords is not None:
+            dev_before, pointwise_before, _ = cam_utils.measure_ipw_state_detailed(
+                session,
+                work_part,
+                obj_blank_b,
+                flat_tools[0],
+                points_array,
+                norm_vecs_array,
+                lines_array,
+            )
+            dev_before_red_tmp = reduce_scalar_by_groups(np.asarray(dev_before, dtype=np.float32), groups_face, weights=face_areas)
+            point_sdf_before_512x100 = build_group_point_sdf_512x100(
+                group_points_512x100x3=group_reference_points_512x100x3,
+                groups_face=groups_face,
+                measurement_point_coords_per_face=measurement_point_coords,
+                measurement_point_sdf_per_face=pointwise_before,
+                fallback_node_sdf_512=pad_1d_float(dev_before_red_tmp, 512),
+            )
+        else:
+            dev_before, _ = cam_utils.measure_ipw_state(session, work_part, obj_blank_b, flat_tools[0], points_array, norm_vecs_array, lines_array)
         dev_before_red = reduce_scalar_by_groups(np.asarray(dev_before, dtype=np.float32), groups_face, weights=face_areas)
         session.UndoToMark(m0, f"rollout_measure_before_{si}")
         session.DeleteUndoMark(m0, f"rollout_measure_before_{si}")
         step_rec["dev_before_red_512"] = pad_1d_float(dev_before_red, 512)
+        if point_sdf_before_512x100 is not None:
+            step_rec["point_sdf_before_512x100"] = point_sdf_before_512x100.astype(np.float32)
 
         apply_mark = session.SetUndoMark(NXOpen.Session.MarkVisibility.Visible, f"rollout_apply_{si}")
         try:
@@ -988,11 +1503,42 @@ def simulate_rollout_for_axis(
         m1 = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, f"rollout_measure_after_{si}")
         obj_blank_a, _, _ = geometry.create_geometry(session, work_part, prt_file_path, [], origin_body, True, False)
         try:
-            dev_after, vol_after = cam_utils.measure_ipw_state(session, work_part, obj_blank_a, flat_tools[0], points_array, norm_vecs_array, lines_array, savepath=stl_file_list)
+            point_sdf_after_512x100 = None
+            if capture_pointwise and group_reference_points_512x100x3 is not None and measurement_point_coords is not None:
+                dev_after, pointwise_after, vol_after = cam_utils.measure_ipw_state_detailed(
+                    session,
+                    work_part,
+                    obj_blank_a,
+                    flat_tools[0],
+                    points_array,
+                    norm_vecs_array,
+                    lines_array,
+                    savepath=stl_file_list,
+                )
+                dev_after_red_tmp = reduce_scalar_by_groups(np.asarray(dev_after, dtype=np.float32), groups_face, weights=face_areas)
+                point_sdf_after_512x100 = build_group_point_sdf_512x100(
+                    group_points_512x100x3=group_reference_points_512x100x3,
+                    groups_face=groups_face,
+                    measurement_point_coords_per_face=measurement_point_coords,
+                    measurement_point_sdf_per_face=pointwise_after,
+                    fallback_node_sdf_512=pad_1d_float(dev_after_red_tmp, 512),
+                )
+            else:
+                dev_after, vol_after = cam_utils.measure_ipw_state(
+                    session,
+                    work_part,
+                    obj_blank_a,
+                    flat_tools[0],
+                    points_array,
+                    norm_vecs_array,
+                    lines_array,
+                    savepath=stl_file_list,
+                )
             dev_after_red = reduce_scalar_by_groups(np.asarray(dev_after, dtype=np.float32), groups_face, weights=face_areas)
         except Exception as e:
             vol_after = vol_cur
             dev_after_red = reduce_scalar_by_groups(np.asarray(dev_before, dtype=np.float32), groups_face, weights=face_areas)
+            point_sdf_after_512x100 = None
             step_rec["ok"] = False
             step_rec["error"] = f"measure_error: {repr(e)}"
         session.UndoToMark(m1, f"rollout_measure_after_{si}")
@@ -1005,6 +1551,8 @@ def simulate_rollout_for_axis(
         step_rec["removed_volume"] = float(removed)
         step_rec["cycle_time"] = float(cyc)
         step_rec["dev_after_red_512"] = pad_1d_float(dev_after_red, 512)
+        if point_sdf_after_512x100 is not None:
+            step_rec["point_sdf_after_512x100"] = point_sdf_after_512x100.astype(np.float32)
         steps.append(step_rec)
         vol_cur = float(vol_after)
         last_dev_after_red_512 = np.asarray(step_rec["dev_after_red_512"], dtype=np.float32)
@@ -1050,9 +1598,8 @@ def _to_safe_float(x, default=0.0) -> float:
 # ----------------------------
 def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, global_parquet_dir: str = None):
     """Collects one full dataset episode for a single part file."""
-    rng = random.Random(seed)
     session, work_part = cam_session.create_session(input_file_dir=prt_file_path)
-    theUfSession = NXOpen.UF.UFSession.GetUFSession()
+    theUfSession = NXOpen.UF.UFSession.GetUFSession()  # noqa: kept for legacy helpers
 
     origin_body = max(work_part.Bodies, key=get_body_volume)
     origin_faces = origin_body.GetFaces()
@@ -1081,8 +1628,8 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     K = G_new.number_of_nodes()
     centrality = pad_1d_int(np.array([G_new.degree(n) for n in G_new.nodes()], dtype=np.int16), 512)
     spatial_pos = pad_2d_int(build_graph_distance_matrix(G_new).astype(np.int16), 512)
-    face_area = pad_face_area(np.asarray(areas_new, dtype=np.float32), 512)
-    face_pc = pad_face_pc(np.asarray(points_new, dtype=np.float32), 512)
+    face_area_raw_512 = pad_face_area(np.asarray(areas_new, dtype=np.float32), 512)
+    face_pc_raw_512 = pad_face_pc(np.asarray(points_new, dtype=np.float32), 512)
 
     points_array, norm_vecs_array, lines_array = [], [], []
     for face in origin_faces:
@@ -1101,49 +1648,15 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     for d in [8.0, 6.0, 4.0]:
         cam_utils.create_cam_tool(session, work_part, tool_diameter=d, tool_type=mill_tool_types[1], tool_list=ball_tools)
 
-    use_swarf_test_sequence = os.getenv("USE_SWARF_TEST_SEQUENCE", "0") == "1"
-    use_point_test_sequence = os.getenv("USE_POINT_TEST_SEQUENCE", "0") == "1"
-    if use_point_test_sequence:
-        seq = build_point_test_operation_sequence()
-    elif use_swarf_test_sequence:
-        seq = build_swarf_test_operation_sequence()
-    else:
-        seq = build_default_operation_sequence()
     part_name = os.path.splitext(os.path.basename(prt_file_path))[0]
     out_dir = create_run_output_dir(out_root, part_name, seed)
-
     run_name = os.path.basename(out_dir)
 
-    _json_dump(os.path.join(out_dir, "meta.json"), {
-        "prt_file_path": os.path.abspath(prt_file_path),
-        "part_name": part_name, "seed": int(seed), "K_nodes_compressed": int(K),
-        "num_faces": int(len(origin_faces)), "sequence": seq,
-        "note": {
-            "mode": "process_skeleton_dataset",
-            "row_unit": "one_executed_nx_operation",
-            "planner_schema": "graph_sdf_process_planner",
-            "node_process_state_channels": ["rough_done", "finish_ready"],
-            "global_process_state_channels": ["prev_macro_onehot_7", "rough_ratio", "finish_ratio"],
-            "action_selection": "limited_action_lookahead",
-            "default_lookahead_depth": int(os.getenv("ACTION_LOOKAHEAD_DEPTH", "2")),
-            "current_macro_classes_present": [
-                "3_axis_rough",
-                "3_axis_finish",
-                "3p2_axis_rough",
-                "3p2_axis_finish",
-                "5_axis_flank_finish",
-                "5_axis_point_finish",
-            ],
-        }
-    })
-    _np_save(os.path.join(out_dir, "embed_centrality.npy"), centrality)
-    _np_save(os.path.join(out_dir, "embed_spatial_pos.npy"), spatial_pos)
-    _np_save(os.path.join(out_dir, "embed_face_area.npy"), face_area)
-    _np_save(os.path.join(out_dir, "embed_face_pc.npy"), face_pc)
-
-    NUM_DECISION_STEPS = 5
-    ACTIONS_PER_STEP = 1
+    NUM_DECISION_STEPS = int(os.getenv("NUM_DECISION_STEPS", "8"))
     SURFACE_FINISH_TOL = 0.01
+    MAX_ROUGH_TARGETS = int(os.getenv("MAX_ROUGH_TARGETS", "5"))
+    MAX_FINISH_TARGETS = int(os.getenv("MAX_FINISH_TARGETS", "5"))
+    MAX_TOOLS_PER_CLASS = int(os.getenv("MAX_TOOLS_PER_CLASS", "2"))
 
     face_normals_list = []
     if norm_vecs_array:
@@ -1165,42 +1678,263 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 if n_norm > 1e-9: mean_normal = mean_normal / n_norm
                 else: mean_normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
             face_normals_list.append(mean_normal)
-    face_normal_512 = np.zeros((512, 3), dtype=np.float32)
-    m = min(len(face_normals_list), 512)
-    if m > 0:
-        face_normal_512[:m] = np.array(face_normals_list[:m], dtype=np.float32)
+    face_normal_512 = build_group_face_normals_512(groups_face, face_normals_list, max_nodes=512)
 
     node_mask_512 = build_node_mask_512(K)
-    point_mask_512x100 = build_point_mask_512x100(K, points_per_node=face_pc.shape[1] if face_pc.ndim == 3 else 100)
+    point_mask_512x100 = build_point_mask_512x100(K, points_per_node=face_pc_raw_512.shape[1] if face_pc_raw_512.ndim == 3 else 100)
+    measurement_point_coords = extract_point_coordinates(points_array)
+    normalization_center_xyz, normalization_scale, bbox_extent_xyz = compute_reference_frame(
+        face_pc_raw_512,
+        node_mask_512,
+    )
+    face_pc = normalize_face_points(face_pc_raw_512, normalization_center_xyz, normalization_scale)
+    face_area = normalize_face_area(face_area_raw_512, normalization_scale)
 
-    used_axis_dirs: List[Tuple[float, float, float]] = []
-    USED_AXIS_ANGLE_TOL_DEG = 3.0
+    _json_dump(os.path.join(out_dir, "meta.json"), {
+        "prt_file_path": os.path.abspath(prt_file_path),
+        "part_name": part_name, "seed": int(seed), "K_nodes_compressed": int(K),
+        "num_faces": int(len(origin_faces)),
+        "note": {
+            "mode": "process_skeleton_dataset",
+            "row_unit": "one_executed_nx_operation",
+            "planner_schema": "graph_sdf_process_planner",
+            "candidate_strategy": "action_first_multi_transition",
+            "decision_order": "macro_target_tool_then_axis_derived",
+            "node_process_state_channels": ["rough_done", "finish_ready"],
+            "global_process_state_channels": [
+                "prev_macro_onehot_7",
+                "rough_ratio",
+                "finish_ratio",
+                "bbox_extent_over_scale_xyz",
+                "log_ref_scale",
+            ],
+            "macro_classes_present": list(MACRO_CLASS_TO_ID.keys()),
+            "normalization": {
+                "center_xyz": normalization_center_xyz.tolist(),
+                "reference_scale": float(normalization_scale),
+                "bbox_extent_xyz": bbox_extent_xyz.tolist(),
+            },
+        },
+    })
+    _np_save(os.path.join(out_dir, "embed_centrality.npy"), centrality)
+    _np_save(os.path.join(out_dir, "embed_spatial_pos.npy"), spatial_pos)
+    _np_save(os.path.join(out_dir, "embed_face_area.npy"), face_area)
+    _np_save(os.path.join(out_dir, "embed_face_pc.npy"), face_pc)
+
     rough_done_cumulative_512 = np.zeros((512,), dtype=np.int16)
     prev_macro_class_id = -1
     rough_rows_emitted = 0
     finish_rows_emitted = 0
     parquet_rows: List[Dict[str, Any]] = []
     episode_record = {
-        "part_name": part_name, "seed": int(seed), "num_decision_steps": int(NUM_DECISION_STEPS),
-        "actions_per_step": int(ACTIONS_PER_STEP), "surface_finish_tol": float(SURFACE_FINISH_TOL),
-        "row_unit": "one_executed_nx_operation", "steps": [],
+        "part_name": part_name, "seed": int(seed),
+        "num_decision_steps": int(NUM_DECISION_STEPS),
+        "surface_finish_tol": float(SURFACE_FINISH_TOL),
+        "row_unit": "one_executed_nx_operation",
+        "steps": [],
     }
+
+    def _build_parquet_row(
+        action: Dict[str, Any],
+        result: Dict[str, Any],
+        state_node_sdf_raw: np.ndarray,
+        target_node_id: int,
+        decision_step: int,
+        candidate_index: int,
+        is_chosen: int,
+    ) -> Dict[str, Any] | None:
+        """Assembles one parquet row from a simulated action result."""
+        macro_class_name = action["macro_class_name"]
+        macro_class_id = int(MACRO_CLASS_TO_ID[macro_class_name])
+        tool_kind = action["tool_kind"]
+        tool_diameter = float(action["tool_diameter"])
+        tool_choice_name = tool_choice_key(tool_kind, tool_diameter)
+        tool_choice_id = int(TOOL_CHOICE_TO_ID.get(tool_choice_name, -1))
+        tool_choice_valid = int(tool_choice_id >= 0)
+        axis_visible_512 = np.asarray(result["visible_512"], dtype=np.int16)
+
+        next_node_sdf_raw = np.asarray(result["dev_after_red_512"], dtype=np.float32)
+        delta_node_sdf = np.maximum(state_node_sdf_raw - next_node_sdf_raw, 0.0)
+
+        state_done_mask_512, state_done_ratio = compute_done_mask_from_dev_red(
+            state_node_sdf_raw, SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
+        )
+        next_done_mask_512, next_done_ratio = compute_done_mask_from_dev_red(
+            next_node_sdf_raw, SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
+        )
+        rough_done_mask = rough_done_cumulative_512.copy()
+        finish_ready_mask = build_finish_ready_mask_512(
+            node_sdf_512=state_node_sdf_raw,
+            rough_done_mask_512=rough_done_mask,
+            node_mask_512=node_mask_512,
+            done_tol=SURFACE_FINISH_TOL,
+            ready_tol=FINISH_READY_TOL,
+        )
+
+        # target_node_mask: 0 = valid candidate, 1 = invalid
+        if is_local_operation(action["optype"]):
+            valid_target_mask = (
+                (axis_visible_512 == 1)
+                & (state_done_mask_512 == 0)
+                & (rough_done_mask == 1)
+                & (finish_ready_mask == 1)
+                & (node_mask_512 == 0)
+            ).astype(np.int16)
+        else:
+            valid_target_mask = (
+                (axis_visible_512 == 1) & (node_mask_512 == 0)
+            ).astype(np.int16)
+        target_node_mask_512 = (valid_target_mask == 0).astype(np.int16)
+
+        # macro class mask
+        macro_class_mask_7 = build_macro_class_mask_7(
+            state_done_mask_512=state_done_mask_512,
+            rough_done_mask_512=rough_done_mask,
+            finish_ready_mask_512=finish_ready_mask,
+            axis_visible_512=axis_visible_512,
+            node_mask_512=node_mask_512,
+        )
+        macro_class_mask_7[macro_class_id] = 0
+
+        # tool choice mask
+        tool_choice_mask = np.asarray(
+            build_tool_choice_mask_for_macro_class(macro_class_id), dtype=np.int16,
+        )
+        if 0 <= tool_choice_id < len(TOOL_LIBRARY):
+            tool_choice_mask[tool_choice_id] = 0
+
+        # strategy id and mask (derived deterministically from macro class)
+        strategy_id = int(strategy_id_from_macro_class_id(macro_class_id))
+        strategy_mask = np.asarray(
+            build_strategy_mask_for_macro_class(macro_class_id), dtype=np.int16,
+        )
+
+        node_process_state = np.stack(
+            [rough_done_mask.astype(np.float32), finish_ready_mask.astype(np.float32)],
+            axis=-1,
+        )
+
+        state_point_sdf_raw = np.asarray(
+            result.get(
+                "point_sdf_before_512x100",
+                np.broadcast_to(state_node_sdf_raw.reshape(512, 1), (512, 100)),
+            ),
+            dtype=np.float32,
+        )
+        next_point_sdf_raw = np.asarray(
+            result.get(
+                "point_sdf_after_512x100",
+                np.broadcast_to(next_node_sdf_raw.reshape(512, 1), (512, 100)),
+            ),
+            dtype=np.float32,
+        )
+
+        state_points_tensor = build_state_points_tensor(
+            face_pc, face_normal_512, state_point_sdf_raw, normalization_scale,
+        )
+        # Note: shape must be [512] (not [512, 1]) to match dataset.py expectations.
+        next_node_sdf_norm = build_normalized_node_sdf_512x1(next_node_sdf_raw, normalization_scale).reshape(512)
+        next_point_sdf_norm = build_normalized_point_sdf_512x100(next_point_sdf_raw, normalization_scale)
+
+        global_process_state = build_global_process_state(
+            prev_macro_class_id=prev_macro_class_id,
+            rough_rows_emitted=rough_rows_emitted,
+            finish_rows_emitted=finish_rows_emitted,
+            bbox_extent_xyz=bbox_extent_xyz,
+            reference_scale=normalization_scale,
+        )
+
+        removed_volume = float(result.get("removed_volume", 0.0) or 0.0)
+        vol_before = float(result.get("volume_before", 0.0) or 0.0)
+        axis_dir = tuple(action["axis_dir"])
+
+        return {
+            "part_name": part_name,
+            "prt_file_path": os.path.abspath(prt_file_path),
+            "graph_nx_json": json.dumps(graph_json),
+            "seed": int(seed),
+            "decision_step": int(decision_step),
+            "candidate_index": int(candidate_index),
+            "is_chosen": int(is_chosen),
+
+            "macro_class_id": int(macro_class_id),
+            "macro_class_name": macro_class_name,
+            "tool_choice_id": int(tool_choice_id if tool_choice_id >= 0 else 0),
+            "tool_choice_name": tool_choice_name,
+            "strategy_id": int(strategy_id),
+            "strategy_valid": 1,
+            "target_node_id": int(target_node_id),
+            "target_node_valid": int(target_node_id >= 0),
+            "tool_choice_valid": int(tool_choice_valid),
+
+            "state_points": _to_serializable_list(state_points_tensor.astype(np.float32)),
+            "node_process_state": _to_serializable_list(node_process_state.astype(np.float32)),
+            "global_process_state": _to_serializable_list(global_process_state.astype(np.float32)),
+            "next_node_sdf": _to_serializable_list(next_node_sdf_norm.astype(np.float32)),
+            "next_point_sdf": _to_serializable_list(next_point_sdf_norm.astype(np.float32)),
+            "node_mask": _to_serializable_list(node_mask_512.astype(np.int16)),
+            "point_mask": _to_serializable_list(point_mask_512x100.astype(np.int16)),
+            "macro_class_mask": _to_serializable_list(macro_class_mask_7.astype(np.int16)),
+            "tool_choice_mask": _to_serializable_list(tool_choice_mask.astype(np.int16)),
+            "strategy_mask": _to_serializable_list(strategy_mask.astype(np.int16)),
+            "target_node_mask": _to_serializable_list(target_node_mask_512.astype(np.int16)),
+
+            "centrality_512": _to_serializable_list(np.asarray(centrality, dtype=np.int16)),
+            "spatial_pos_512x512": _to_serializable_list(np.asarray(spatial_pos, dtype=np.int16)),
+            "face_area_512x1": _to_serializable_list(np.asarray(face_area, dtype=np.float32)),
+
+            "axis_visible_512": _to_serializable_list(axis_visible_512.astype(np.int16)),
+            "state_node_sdf_raw_512": _to_serializable_list(state_node_sdf_raw.astype(np.float32)),
+            "next_node_sdf_raw_512": _to_serializable_list(next_node_sdf_raw.astype(np.float32)),
+            "state_point_sdf_raw_512x100": _to_serializable_list(state_point_sdf_raw.astype(np.float32)),
+            "next_point_sdf_raw_512x100": _to_serializable_list(next_point_sdf_raw.astype(np.float32)),
+            "state_done_mask_512": _to_serializable_list(state_done_mask_512.astype(np.int16)),
+            "next_done_mask_512": _to_serializable_list(next_done_mask_512.astype(np.int16)),
+            "rough_done_mask_512": _to_serializable_list(rough_done_mask.astype(np.int16)),
+            "finish_ready_mask_512": _to_serializable_list(finish_ready_mask.astype(np.int16)),
+            "state_done_ratio": _to_safe_float(state_done_ratio),
+            "next_done_ratio": _to_safe_float(next_done_ratio),
+
+            "axis_dir": list(map(float, axis_dir)),
+            "operation_name": str(action["optype"]),
+            "path_type": str(action.get("path_type", "FollowPart")),
+            "tool_type_name": tool_kind,
+            "tool_diameter": _to_safe_float(tool_diameter),
+            "state_volume": _to_safe_float(vol_before),
+            "next_state_volume": _to_safe_float(result.get("volume_after", vol_before)),
+            "out_removed_volume": _to_safe_float(removed_volume),
+            "out_removed_ratio": _to_safe_float(removed_volume / max(vol_before, 1e-9)),
+            "out_cycle_time": _to_safe_float(result.get("cycle_time", 0.0)),
+            "out_ok": bool(result.get("ok", True)),
+            "normalization_center_xyz": _to_serializable_list(normalization_center_xyz.astype(np.float32)),
+            "normalization_scale": _to_safe_float(normalization_scale),
+            "bbox_extent_xyz": _to_serializable_list(bbox_extent_xyz.astype(np.float32)),
+
+            "info_json": json.dumps({
+                "surface_finish_tol": float(SURFACE_FINISH_TOL),
+                "candidate_strategy": "action_first_multi_transition",
+                "normalization": "part_bbox_center_and_diagonal",
+                "rough_done_delta_eps": float(ROUGH_DONE_DELTA_EPS),
+                "finish_ready_tol": float(FINISH_READY_TOL),
+                "row_unit": "one_executed_nx_operation",
+            }, ensure_ascii=False),
+        }
 
     try:
         for t in range(NUM_DECISION_STEPS):
-            base_mark = session.SetUndoMark(NXOpen.Session.MarkVisibility.Visible, f"BASE_STATE_t{t:02d}")
             K_groups = len(groups_face)
             state_volume, state_dev_red_512 = measure_current_state(
                 session, work_part, prt_file_path, origin_body, origin_faces, groups_face,
                 face_areas, points_array, norm_vecs_array, lines_array, flat_tools,
             )
-            state_done_mask_512, all_done = compute_done_mask_from_dev_red_with_K(state_dev_red_512, SURFACE_FINISH_TOL, K_groups)
-
+            state_done_mask_512, all_done = compute_done_mask_from_dev_red_with_K(
+                state_dev_red_512, SURFACE_FINISH_TOL, K_groups,
+            )
             if all_done:
-                episode_record["steps"].append({"t": int(t), "stopped": True, "reason": "all_faces_done_before_action", "state_volume": float(state_volume)})
-                session.UndoToMark(base_mark, f"ROLLBACK_STOP_t{t:02d}")
-                try: session.DeleteUndoMark(base_mark, f"BASE_STATE_t{t:02d}")
-                except Exception: pass
+                episode_record["steps"].append({
+                    "t": int(t), "stopped": True,
+                    "reason": "all_faces_done", "state_volume": float(state_volume),
+                })
                 break
 
             state_done_ratio = float(state_done_mask_512[:K_groups].mean()) if K_groups > 0 else 1.0
@@ -1211,323 +1945,202 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 done_tol=SURFACE_FINISH_TOL,
                 ready_tol=FINISH_READY_TOL,
             )
-            candidate_actions = generate_limited_action_candidates(
-                origin_body=origin_body,
-                origin_faces=origin_faces,
-                groups_face=groups_face,
-                face_areas=face_areas,
-                state_dev_red_512=state_dev_red_512,
-                state_done_mask_512=state_done_mask_512,
+
+            # ── Generate action-first candidates ──────────────────────
+            candidates = generate_action_candidates(
+                state_node_sdf_512=state_dev_red_512,
                 rough_done_mask_512=rough_done_cumulative_512,
                 finish_ready_mask_512=finish_ready_current_512,
                 node_mask_512=node_mask_512,
-                theUfSession=theUfSession,
-                max_axis_candidates=int(os.getenv("MAX_AXIS_CANDIDATES", "4")),
+                face_normal_512x3=face_normal_512,
+                max_rough_targets=MAX_ROUGH_TARGETS,
+                max_finish_targets=MAX_FINISH_TARGETS,
+                max_tools_per_class=MAX_TOOLS_PER_CLASS,
             )
-
-            if not candidate_actions:
+            if not candidates:
                 episode_record["steps"].append({
-                    "t": int(t),
-                    "stopped": True,
-                    "reason": "no_action_candidates",
-                    "used_axis_dirs": [tuple(map(float, d)) for d in used_axis_dirs],
+                    "t": int(t), "stopped": True, "reason": "no_candidates",
                 })
-                session.UndoToMark(base_mark, f"ROLLBACK_STOP_t{t:02d}")
-                try: session.DeleteUndoMark(base_mark, f"BASE_STATE_t{t:02d}")
-                except Exception: pass
                 break
-
-            lookahead_depth = int(os.getenv("ACTION_LOOKAHEAD_DEPTH", "2"))
-            max_action_candidates = int(os.getenv("MAX_ACTION_CANDIDATES", "12"))
-            scored_candidates: List[Tuple[float, Dict[str, Any]]] = []
-            for action in candidate_actions[: max(1, max_action_candidates)]:
-                score = evaluate_action_with_lookahead(
-                    session=session,
-                    work_part=work_part,
-                    prt_file_path=prt_file_path,
-                    origin_body=origin_body,
-                    origin_faces=origin_faces,
-                    groups_face=groups_face,
-                    face_areas=face_areas,
-                    points_array=points_array,
-                    norm_vecs_array=norm_vecs_array,
-                    lines_array=lines_array,
-                    flat_tools=flat_tools,
-                    ball_tools=ball_tools,
-                    action=action,
-                    rough_done_mask_512=rough_done_cumulative_512,
-                    node_mask_512=node_mask_512,
-                    theUfSession=theUfSession,
-                    finish_tol=SURFACE_FINISH_TOL,
-                    lookahead_depth=lookahead_depth,
-                    max_next_candidates=int(os.getenv("MAX_NEXT_ACTION_CANDIDATES", "4")),
-                )
-                scored_candidates.append((float(score), action))
-
-            if not scored_candidates:
-                episode_record["steps"].append({
-                    "t": int(t),
-                    "stopped": True,
-                    "reason": "no_scored_candidates",
-                    "used_axis_dirs": [tuple(map(float, d)) for d in used_axis_dirs],
-                })
-                session.UndoToMark(base_mark, f"ROLLBACK_STOP_t{t:02d}")
-                try: session.DeleteUndoMark(base_mark, f"BASE_STATE_t{t:02d}")
-                except Exception: pass
-                break
-
-            best_score, chosen_action = max(scored_candidates, key=lambda x: x[0])
-            chosen_axis = {
-                "dir": tuple(chosen_action["axis_dir"]),
-                "source": "lookahead_candidate",
-                "score": float(best_score),
-                "optype": chosen_action["optype"],
-            }
-            chosen_axis_dir = tuple(chosen_action["axis_dir"])
-            chosen_summary = simulate_rollout_for_axis(
-                session=session, work_part=work_part, prt_file_path=prt_file_path, origin_body=origin_body,
-                origin_faces=origin_faces, groups_face=groups_face, face_areas=face_areas,
-                points_array=points_array, norm_vecs_array=norm_vecs_array, lines_array=lines_array,
-                flat_tools=flat_tools, ball_tools=ball_tools, axis_dir=chosen_axis_dir, seq=[{
-                    "optype": chosen_action["optype"],
-                    "tool_kind": chosen_action["tool_kind"],
-                    "tool_diameter": float(chosen_action["tool_diameter"]),
-                    "path_type": chosen_action["path_type"],
-                }],
-                out_dir_for_this_rollout=os.path.join(out_dir, "chosen_apply", f"t{t:02d}"),
-                surface_finish_tol=SURFACE_FINISH_TOL,
-            )
-            used_axis_dirs.append(_normalize_vector(chosen_axis_dir))
-            try: session.DeleteUndoMark(base_mark, f"BASE_STATE_t{t:02d}")
-            except Exception: pass
-
-            next_volume, next_dev_red_512 = measure_current_state(
-                session, work_part, prt_file_path, origin_body, origin_faces, groups_face,
-                face_areas, points_array, norm_vecs_array, lines_array, flat_tools,
-            )
-            done_after_mask_512, done_after_ratio = compute_done_mask_from_dev_red(next_dev_red_512, SURFACE_FINISH_TOL)
-            new_done = (done_after_mask_512.astype(np.int16) - state_done_mask_512.astype(np.int16))
-            new_done = np.clip(new_done, 0, 1).astype(np.int16)
-            new_done_count = int(new_done.sum())
-
-            out_removed_volume = float(chosen_summary.get("total_removed_volume", max(float(state_volume) - float(next_volume), 0.0)))
-            out_cycle_time = float(chosen_summary.get("total_cycle_time", 0.0))
-            out_removed_ratio = float(out_removed_volume / max(float(state_volume), 1e-9))
-            axis_visible_512 = np.asarray(chosen_summary.get("visible_512", np.zeros((512,), dtype=np.int16)), dtype=np.int16)
-            axis_source_id = int(0 if chosen_axis["source"] == "predefined" else 1)
 
             print(
-                f"[DEBUG] t={t}, Axis: {tuple(f'{x:.2f}' for x in chosen_axis_dir)} "
-                f"| Vol: {out_removed_volume:.2f}, Done: {new_done_count}, Time: {out_cycle_time:.1f}s",
+                f"[INFO] t={t}: {len(candidates)} candidates "
+                f"(rough_ratio={state_done_ratio:.2f})",
                 flush=True,
             )
 
-            for seq_op_index, step_rec in enumerate(chosen_summary.get("steps", [])):
-                state_node_sdf_raw = np.asarray(
-                    step_rec.get("dev_before_red_512", state_dev_red_512),
-                    dtype=np.float32,
+            # ── Simulate each candidate with undo/rollback ─────────────
+            # Each candidate gets its own transition row recorded.
+            # We also track scores to pick the best action to commit.
+            scored: List[Tuple[float, int, Dict[str, Any], Dict[str, Any]]] = []
+            # (score, candidate_index, action, result)
+
+            for ci, action in enumerate(candidates):
+                cand_mark = session.SetUndoMark(
+                    NXOpen.Session.MarkVisibility.Invisible, f"cand_t{t:02d}_c{ci:03d}",
                 )
-                next_node_sdf_raw = np.asarray(
-                    step_rec.get("dev_after_red_512", state_node_sdf_raw),
-                    dtype=np.float32,
-                )
-                removed_volume_step = float(step_rec.get("removed_volume", 0.0) or 0.0)
-                delta_node_sdf = np.maximum(state_node_sdf_raw - next_node_sdf_raw, 0.0)
-                has_effect = bool(removed_volume_step > 1e-6 or float(delta_node_sdf.max()) > 1e-6)
-                if not has_effect:
+                try:
+                    result = simulate_single_action(
+                        session=session, work_part=work_part,
+                        prt_file_path=prt_file_path,
+                        origin_body=origin_body, origin_faces=origin_faces,
+                        groups_face=groups_face, face_areas=face_areas,
+                        points_array=points_array, norm_vecs_array=norm_vecs_array,
+                        lines_array=lines_array, flat_tools=flat_tools, ball_tools=ball_tools,
+                        action=action,
+                        surface_finish_tol=SURFACE_FINISH_TOL,
+                        # No pointwise capture during candidate sweep (speed)
+                    )
+                finally:
+                    session.UndoToMark(cand_mark, f"cand_t{t:02d}_c{ci:03d}")
+                    session.DeleteUndoMark(cand_mark, f"cand_t{t:02d}_c{ci:03d}")
+
+                if not result.get("ok", False):
                     continue
 
-                macro_class_name = infer_macro_class_name(step_rec["optype"], chosen_axis_dir)
-                macro_class_id = int(MACRO_CLASS_TO_ID[macro_class_name])
-                tool_kind = str(step_rec["tool_kind"])
-                tool_diameter = float(step_rec["tool_diameter"])
-                tool_choice_name = tool_choice_key(tool_kind, tool_diameter)
-                tool_choice_id = int(TOOL_CHOICE_TO_ID.get(tool_choice_name, -1))
-                tool_choice_valid = int(tool_choice_id >= 0)
-
-                state_done_mask_step_512, state_done_ratio_step = compute_done_mask_from_dev_red(
-                    state_node_sdf_raw,
-                    SURFACE_FINISH_TOL,
+                removed = float(result.get("removed_volume", 0.0) or 0.0)
+                delta = np.maximum(
+                    state_dev_red_512 - np.asarray(result["dev_after_red_512"], dtype=np.float32),
+                    0.0,
                 )
-                next_done_mask_step_512, next_done_ratio_step = compute_done_mask_from_dev_red(
-                    next_node_sdf_raw,
-                    SURFACE_FINISH_TOL,
+                if removed <= 1e-6 and float(delta.max()) <= 1e-6:
+                    continue  # no material removed
+
+                # Determine target_node_id from the action (action-first: already known)
+                target_node_id = int(action["target_node_id"])
+
+                # Score: prioritise material removal, penalise cycle time
+                vol_before = float(result.get("volume_before", 1.0) or 1.0)
+                removed_ratio = removed / max(vol_before, 1e-9)
+                next_done_mask, next_done_ratio = compute_done_mask_from_dev_red(
+                    np.asarray(result["dev_after_red_512"], dtype=np.float32),
+                    SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
                 )
-                rough_done_mask_step_512 = rough_done_cumulative_512.copy()
-                finish_ready_mask_step_512 = build_finish_ready_mask_512(
-                    node_sdf_512=state_node_sdf_raw,
-                    rough_done_mask_512=rough_done_mask_step_512,
-                    node_mask_512=node_mask_512,
-                    done_tol=SURFACE_FINISH_TOL,
-                    ready_tol=FINISH_READY_TOL,
+                cur_done_ratio = float(
+                    compute_done_mask_from_dev_red(
+                        state_dev_red_512, SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
+                    )[1]
                 )
-                node_process_state = np.stack(
-                    [
-                        rough_done_mask_step_512.astype(np.float32),
-                        finish_ready_mask_step_512.astype(np.float32),
-                    ],
-                    axis=-1,
+                done_gain = max(float(next_done_ratio) - cur_done_ratio, 0.0)
+                cycle_time = float(result.get("cycle_time", 0.0) or 0.0)
+                action_score = 4.0 * removed_ratio + 2.0 * done_gain - 0.002 * cycle_time
+                scored.append((action_score, ci, action, result))
+
+                row = _build_parquet_row(
+                    action=action,
+                    result=result,
+                    state_node_sdf_raw=state_dev_red_512,
+                    target_node_id=target_node_id,
+                    decision_step=t,
+                    candidate_index=ci,
+                    is_chosen=0,  # will update the chosen one below
                 )
-                state_points_tensor = build_state_points_tensor(face_pc, face_normal_512, state_node_sdf_raw)
-                next_node_sdf = build_normalized_node_sdf_512x1(next_node_sdf_raw)
+                parquet_rows.append(row)
 
-                target_node_valid = 1
-                if is_local_operation(step_rec["optype"]):
-                    valid_target_mask_512 = (
-                        (axis_visible_512 == 1)
-                        & (state_done_mask_step_512 == 0)
-                        & (rough_done_mask_step_512 == 1)
-                        & (finish_ready_mask_step_512 == 1)
-                        & (node_mask_512 == 0)
-                    ).astype(np.int16)
-                    target_node_id = infer_target_node_id(
-                        state_node_sdf_512=state_node_sdf_raw,
-                        next_node_sdf_512=next_node_sdf_raw,
-                        valid_mask_512=valid_target_mask_512,
-                    )
-                    if target_node_id < 0:
-                        continue
-                else:
-                    valid_target_mask_512 = (
-                        (axis_visible_512 == 1)
-                        & (node_mask_512 == 0)
-                    ).astype(np.int16)
-                    target_node_id = infer_axis_face_id_from_normal(
-                        face_normal_512x3=face_normal_512,
-                        axis_dir=chosen_axis_dir,
-                        valid_mask_512=valid_target_mask_512,
-                    )
-                    if target_node_id < 0:
-                        continue
-
-                target_node_mask_512 = (valid_target_mask_512 == 0).astype(np.int16)
-                macro_class_mask_7 = build_macro_class_mask_7(
-                    state_done_mask_512=state_done_mask_step_512,
-                    rough_done_mask_512=rough_done_mask_step_512,
-                    finish_ready_mask_512=finish_ready_mask_step_512,
-                    axis_visible_512=axis_visible_512,
-                    node_mask_512=node_mask_512,
-                )
-                macro_class_mask_7[macro_class_id] = 0
-
-                tool_choice_mask = np.asarray(
-                    build_tool_choice_mask_for_macro_class(macro_class_id),
-                    dtype=np.int16,
-                )
-                if 0 <= tool_choice_id < len(TOOL_LIBRARY):
-                    tool_choice_mask[tool_choice_id] = 0
-
-                global_process_state = build_global_process_state(
-                    prev_macro_class_id=prev_macro_class_id,
-                    rough_rows_emitted=rough_rows_emitted,
-                    finish_rows_emitted=finish_rows_emitted,
-                )
-
-                parquet_rows.append({
-                    "part_name": part_name,
-                    "prt_file_path": os.path.abspath(prt_file_path),
-                    "graph_nx_json": json.dumps(graph_json),
-                    "seed": int(seed),
-                    "decision_step": int(t),
-                    "sequence_op_index": int(seq_op_index),
-
-                    "macro_class_id": int(macro_class_id),
-                    "macro_class_name": macro_class_name,
-                    "tool_choice_id": int(tool_choice_id if tool_choice_id >= 0 else 0),
-                    "tool_choice_name": tool_choice_name,
-                    "target_node_id": int(target_node_id),
-                    "target_node_valid": int(target_node_valid),
-                    "tool_choice_valid": int(tool_choice_valid),
-
-                    "state_points": _to_serializable_list(state_points_tensor.astype(np.float32)),
-                    "node_process_state": _to_serializable_list(node_process_state.astype(np.float32)),
-                    "global_process_state": _to_serializable_list(global_process_state.astype(np.float32)),
-                    "next_node_sdf": _to_serializable_list(next_node_sdf.astype(np.float32)),
-                    "node_mask": _to_serializable_list(node_mask_512.astype(np.int16)),
-                    "point_mask": _to_serializable_list(point_mask_512x100.astype(np.int16)),
-                    "macro_class_mask": _to_serializable_list(macro_class_mask_7.astype(np.int16)),
-                    "tool_choice_mask": _to_serializable_list(tool_choice_mask.astype(np.int16)),
-                    "target_node_mask": _to_serializable_list(target_node_mask_512.astype(np.int16)),
-
-                    "centrality_512": _to_serializable_list(np.asarray(centrality, dtype=np.int16)),
-                    "spatial_pos_512x512": _to_serializable_list(np.asarray(spatial_pos, dtype=np.int16)),
-                    "face_area_512x1": _to_serializable_list(np.asarray(face_area, dtype=np.float32)),
-
-                    "axis_visible_512": _to_serializable_list(axis_visible_512.astype(np.int16)),
-                    "state_node_sdf_raw_512": _to_serializable_list(state_node_sdf_raw.astype(np.float32)),
-                    "next_node_sdf_raw_512": _to_serializable_list(next_node_sdf_raw.astype(np.float32)),
-                    "state_done_mask_512": _to_serializable_list(state_done_mask_step_512.astype(np.int16)),
-                    "next_done_mask_512": _to_serializable_list(next_done_mask_step_512.astype(np.int16)),
-                    "rough_done_mask_512": _to_serializable_list(rough_done_mask_step_512.astype(np.int16)),
-                    "finish_ready_mask_512": _to_serializable_list(finish_ready_mask_step_512.astype(np.int16)),
-                    "state_done_ratio": _to_safe_float(state_done_ratio_step),
-                    "next_done_ratio": _to_safe_float(next_done_ratio_step),
-
-                    "axis_dir": list(map(float, chosen_axis_dir)),
-                    "axis_source": int(axis_source_id),
-                    "axis_select_score": _to_safe_float(chosen_axis.get("score", 0.0)),
-                    "operation_name": str(step_rec["optype"]),
-                    "path_type": str(step_rec["path_type"]),
-                    "tool_type_name": tool_kind,
-                    "tool_diameter": _to_safe_float(tool_diameter),
-                    "state_volume": _to_safe_float(step_rec.get("volume_before", state_volume)),
-                    "next_state_volume": _to_safe_float(step_rec.get("volume_after", next_volume)),
-                    "out_removed_volume": _to_safe_float(removed_volume_step),
-                    "out_removed_ratio": _to_safe_float(
-                        removed_volume_step / max(float(step_rec.get("volume_before", state_volume) or 0.0), 1e-9)
-                    ),
-                    "out_cycle_time": _to_safe_float(step_rec.get("cycle_time", 0.0)),
-                    "out_ok": bool(step_rec.get("ok", True)),
-
-                    "info_json": json.dumps({
-                        "surface_finish_tol": float(SURFACE_FINISH_TOL),
-                        "axis_policy": "limited_action_lookahead",
-                        "used_axis_exclusion_tol_deg": float(USED_AXIS_ANGLE_TOL_DEG),
-                        "sdf_feature_scale": float(SDF_FEATURE_SCALE),
-                        "rough_done_delta_eps": float(ROUGH_DONE_DELTA_EPS),
-                        "finish_ready_tol": float(FINISH_READY_TOL),
-                        "row_unit": "one_executed_nx_operation",
-                    }, ensure_ascii=False),
+            if not scored:
+                episode_record["steps"].append({
+                    "t": int(t), "stopped": True, "reason": "no_effective_candidates",
                 })
+                break
 
-                prev_macro_class_id = macro_class_id
-                if macro_class_name in {"3_axis_rough", "3p2_axis_rough"}:
-                    rough_rows_emitted += 1
-                elif macro_class_name in {
-                    "3_axis_finish",
-                    "3p2_axis_finish",
-                    "5_axis_point_finish",
-                    "5_axis_flank_finish",
-                }:
-                    finish_rows_emitted += 1
+            # ── Commit best action (permanently, with pointwise capture) ──
+            best_score, best_ci, best_action, _prev_result = max(scored, key=lambda x: x[0])
 
-                if macro_class_name in {"3_axis_rough", "3p2_axis_rough"}:
-                    rough_impacted = (
-                        (delta_node_sdf > float(ROUGH_DONE_DELTA_EPS))
-                        & (node_mask_512 == 0)
-                    ).astype(np.int16)
-                    rough_done_cumulative_512 = np.maximum(
-                        rough_done_cumulative_512,
-                        rough_impacted,
-                    )
+            # Mark the already-recorded row for the best candidate as chosen
+            for row in reversed(parquet_rows):
+                if (row["decision_step"] == t
+                        and row["candidate_index"] == best_ci):
+                    row["is_chosen"] = 1
+                    break
+
+            # Re-run best action permanently with full pointwise SDF capture
+            best_result = simulate_single_action(
+                session=session, work_part=work_part,
+                prt_file_path=prt_file_path,
+                origin_body=origin_body, origin_faces=origin_faces,
+                groups_face=groups_face, face_areas=face_areas,
+                points_array=points_array, norm_vecs_array=norm_vecs_array,
+                lines_array=lines_array, flat_tools=flat_tools, ball_tools=ball_tools,
+                action=best_action,
+                surface_finish_tol=SURFACE_FINISH_TOL,
+                group_reference_points_512x100x3=face_pc_raw_512,
+                measurement_point_coords=measurement_point_coords,
+            )
+
+            # Update the chosen row with the richer pointwise data
+            next_node_sdf_raw_best = np.asarray(
+                best_result.get("dev_after_red_512", state_dev_red_512), dtype=np.float32,
+            )
+            # Shape must be [512] (not [512, 1]) to match dataset.py expectations.
+            next_node_sdf_norm = build_normalized_node_sdf_512x1(next_node_sdf_raw_best, normalization_scale).reshape(512)
+            next_point_sdf_raw_best = np.asarray(
+                best_result.get(
+                    "point_sdf_after_512x100",
+                    np.broadcast_to(next_node_sdf_raw_best.reshape(512, 1), (512, 100)),
+                ),
+                dtype=np.float32,
+            )
+            next_point_sdf_norm = build_normalized_point_sdf_512x100(next_point_sdf_raw_best, normalization_scale)
+            for row in reversed(parquet_rows):
+                if row["decision_step"] == t and row["candidate_index"] == best_ci:
+                    row["next_node_sdf"] = _to_serializable_list(next_node_sdf_norm.astype(np.float32))
+                    row["next_point_sdf"] = _to_serializable_list(next_point_sdf_norm.astype(np.float32))
+                    row["next_node_sdf_raw_512"] = _to_serializable_list(next_node_sdf_raw_best.astype(np.float32))
+                    row["next_point_sdf_raw_512x100"] = _to_serializable_list(next_point_sdf_raw_best.astype(np.float32))
+                    row["out_ok"] = bool(best_result.get("ok", True))
+                    break
+
+            # ── Update cumulative process state ───────────────────────
+            macro_class_name = best_action["macro_class_name"]
+            macro_class_id = int(MACRO_CLASS_TO_ID[macro_class_name])
+            delta_best = np.maximum(state_dev_red_512 - next_node_sdf_raw_best, 0.0)
+
+            prev_macro_class_id = macro_class_id
+            if macro_class_name in {"3_axis_rough", "3p2_axis_rough"}:
+                rough_rows_emitted += 1
+                rough_impacted = (
+                    (delta_best > float(ROUGH_DONE_DELTA_EPS))
+                    & (node_mask_512 == 0)
+                ).astype(np.int16)
+                rough_done_cumulative_512 = np.maximum(
+                    rough_done_cumulative_512, rough_impacted,
+                )
+            else:
+                finish_rows_emitted += 1
+
+            next_volume = float(best_result.get("volume_after", state_volume))
+            done_after_mask, done_after_ratio = compute_done_mask_from_dev_red(
+                next_node_sdf_raw_best, SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
+            )
+            new_done_count = int(
+                np.clip(
+                    done_after_mask.astype(np.int16) - state_done_mask_512.astype(np.int16),
+                    0, 1,
+                ).sum()
+            )
+            print(
+                f"[INFO] t={t} committed: {macro_class_name} "
+                f"tool={best_action['tool_kind']} {best_action['tool_diameter']}mm "
+                f"target={best_action['target_node_id']} "
+                f"removed={best_result.get('removed_volume', 0.0):.2f} "
+                f"new_done={new_done_count}",
+                flush=True,
+            )
 
             episode_record["steps"].append({
                 "t": int(t),
                 "state_volume_before": float(state_volume),
                 "state_done_ratio_before": float(state_done_ratio),
-                "chosen_axis": {
-                    "dir": tuple(map(float, chosen_axis_dir)),
-                    "source": chosen_axis["source"],
-                    "score": float(chosen_axis.get("score", 0.0)),
-                },
-                "chosen_apply_summary": {
-                    "total_removed_volume": float(chosen_summary.get("total_removed_volume", 0.0)),
-                    "total_cycle_time": float(chosen_summary.get("total_cycle_time", 0.0)),
-                    "num_steps_done": int(chosen_summary.get("num_steps_done", 0)),
-                },
+                "num_candidates": int(len(candidates)),
+                "num_effective": int(len(scored)),
+                "chosen_candidate_index": int(best_ci),
+                "chosen_macro": macro_class_name,
+                "chosen_tool": f"{best_action['tool_kind']}_{best_action['tool_diameter']}",
+                "chosen_target_node": int(best_action["target_node_id"]),
+                "chosen_axis_dir": list(map(float, best_action["axis_dir"])),
+                "chosen_score": float(best_score),
                 "state_volume_after": float(next_volume),
                 "state_done_ratio_after": float(done_after_ratio),
-                "used_axis_dirs": [tuple(map(float, d)) for d in used_axis_dirs],
             })
 
     finally:

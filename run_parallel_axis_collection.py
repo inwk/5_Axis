@@ -47,6 +47,7 @@ def process_file_safe(file_info: tuple[str, str]) -> None:
     start_time = time.time()
 
     try:
+        log_path = os.path.join(output_dir, f"{part_name}_seed{CURRENT_SEED}.log")
         cmd = [
             PYTHON_EXE,
             WORKER_SCRIPT,
@@ -57,8 +58,12 @@ def process_file_safe(file_info: tuple[str, str]) -> None:
             "--seed",
             str(CURRENT_SEED),
         ]
-        subprocess.run(cmd, check=True, capture_output=True)
-        print(f"[Done] {part_name} finished in {time.time() - start_time:.1f}s")
+        with open(log_path, "w", encoding="utf-8") as log_f:
+            result = subprocess.run(cmd, check=False, stdout=log_f, stderr=log_f)
+        if result.returncode != 0:
+            print(f"[Error] {part_name} failed (rc={result.returncode}), see {log_path}")
+        else:
+            print(f"[Done] {part_name} finished in {time.time() - start_time:.1f}s")
     except subprocess.CalledProcessError:
         print(f"[Error] Script failed for {part_name}")
     except Exception as exc:

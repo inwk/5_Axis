@@ -5,6 +5,8 @@ This note captures the dataset contract for the current planner-only model.
 ## Row Definition
 
 Each training row represents exactly one executed NX operation.
+Decision decoding order is `macro process + target node + tool choice`.
+Tool axis is derived from the selected target-face normal.
 
 ## Required Supervision
 

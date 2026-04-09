@@ -40,6 +40,7 @@ class ProcessPlannerHead(nn.Module):
         )
         self.macro_class_head = nn.Linear(hidden, config.macro_class_count)
         self.tool_choice_head = nn.Linear(hidden, config.tool_choice_count)
+        self.strategy_head = nn.Linear(hidden, config.strategy_count)
 
         self.node_selector = nn.Sequential(
             nn.Linear(hidden * 2, hidden),
@@ -55,8 +56,9 @@ class ProcessPlannerHead(nn.Module):
         target_node_mask: Optional[torch.Tensor] = None,
         macro_class_mask: Optional[torch.Tensor] = None,
         tool_choice_mask: Optional[torch.Tensor] = None,
+        strategy_mask: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
-        """Produces macro class, target node, and tool choice logits."""
+        """Produces macro class, target node, tool choice, and strategy logits."""
 
         pooled_state = _masked_mean_pool(state_embedding, node_mask)
         global_hidden = self.global_trunk(pooled_state)
@@ -80,14 +82,18 @@ class ProcessPlannerHead(nn.Module):
 
         macro_class_logits = self.macro_class_head(global_hidden)
         tool_choice_logits = self.tool_choice_head(global_hidden)
+        strategy_logits = self.strategy_head(global_hidden)
         if macro_class_mask is not None:
             macro_class_logits = macro_class_logits.masked_fill(macro_class_mask, -1e9)
         if tool_choice_mask is not None:
             tool_choice_logits = tool_choice_logits.masked_fill(tool_choice_mask, -1e9)
+        if strategy_mask is not None:
+            strategy_logits = strategy_logits.masked_fill(strategy_mask, -1e9)
 
         return {
             "macro_class_logits": macro_class_logits,
             "tool_choice_logits": tool_choice_logits,
+            "strategy_logits": strategy_logits,
             "target_node_logits": target_node_logits,
             "global_feature": global_hidden,
         }

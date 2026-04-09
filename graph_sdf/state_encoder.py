@@ -25,18 +25,29 @@ class StateEncoder(nn.Module):
             if config.node_process_feature_dim > 0
             else None
         )
+        self.face_area_projection = (
+            nn.Linear(config.face_area_feature_dim, config.hidden_dim)
+            if config.face_area_feature_dim > 0
+            else None
+        )
         self.node_index_embedding = nn.Embedding(config.num_nodes, config.hidden_dim)
+        self.centrality_embedding = nn.Embedding(config.centrality_vocab_size + 1, config.hidden_dim)
+        self.centrality_vocab_size = config.centrality_vocab_size
         self.graph_encoder = GraphTransformerEncoder(
             hidden_dim=config.hidden_dim,
             num_heads=config.transformer_heads,
             num_layers=config.transformer_layers,
             dropout=config.transformer_dropout,
+            max_spatial_pos=config.max_spatial_pos,
         )
 
     def forward(
         self,
         node_point_features: torch.Tensor,
         node_process_state: Optional[torch.Tensor] = None,
+        node_centrality: Optional[torch.Tensor] = None,
+        spatial_pos: Optional[torch.Tensor] = None,
+        face_area: Optional[torch.Tensor] = None,
         node_mask: Optional[torch.Tensor] = None,
         point_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -52,9 +63,20 @@ class StateEncoder(nn.Module):
                     self.node_process_projection.in_features,
                 )
             node_features = node_features + self.node_process_projection(node_process_state)
+        if self.face_area_projection is not None:
+            if face_area is None:
+                face_area = node_features.new_zeros(
+                    batch_size,
+                    node_count,
+                    self.face_area_projection.in_features,
+                )
+            node_features = node_features + self.face_area_projection(face_area)
+        if node_centrality is not None:
+            clipped = node_centrality.long().clamp(min=0, max=self.centrality_vocab_size)
+            node_features = node_features + self.centrality_embedding(clipped)
 
         node_index = torch.arange(node_count, device=node_point_features.device).unsqueeze(0)
         node_index = node_index.expand(batch_size, node_count)
         node_features = node_features + self.node_index_embedding(node_index)
 
-        return self.graph_encoder(node_features, node_mask=node_mask)
+        return self.graph_encoder(node_features, node_mask=node_mask, spatial_pos=spatial_pos)

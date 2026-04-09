@@ -21,6 +21,10 @@ class TrainConfig:
     macro_class_loss_weight: float = 1.0
     target_node_loss_weight: float = 1.0
     tool_choice_loss_weight: float = 1.0
+    strategy_loss_weight: float = 0.25
+    transition_loss_weight: float = 1.0
+    point_sdf_loss_weight: float = 1.0
+    changed_mask_loss_weight: float = 0.25
 
 
 def run_training(
@@ -43,6 +47,10 @@ def run_training(
                 macro_class_loss_weight=config.macro_class_loss_weight,
                 target_node_loss_weight=config.target_node_loss_weight,
                 tool_choice_loss_weight=config.tool_choice_loss_weight,
+                strategy_loss_weight=config.strategy_loss_weight,
+                transition_loss_weight=config.transition_loss_weight,
+                point_sdf_loss_weight=config.point_sdf_loss_weight,
+                changed_mask_loss_weight=config.changed_mask_loss_weight,
             )
             for batch in train_loader
         ]
@@ -54,13 +62,17 @@ def run_training(
                 macro_class_loss_weight=config.macro_class_loss_weight,
                 target_node_loss_weight=config.target_node_loss_weight,
                 tool_choice_loss_weight=config.tool_choice_loss_weight,
+                strategy_loss_weight=config.strategy_loss_weight,
+                transition_loss_weight=config.transition_loss_weight,
+                point_sdf_loss_weight=config.point_sdf_loss_weight,
+                changed_mask_loss_weight=config.changed_mask_loss_weight,
             )
             for batch in val_loader
         ]
 
         train_loss = sum(train_losses) / max(len(train_losses), 1)
         val_loss = sum(val_losses) / max(len(val_losses), 1)
-        print(f"[Planner][Epoch {epoch + 1}] train={train_loss:.6f} val={val_loss:.6f}")
+        print(f"[Planner+Transition][Epoch {epoch + 1}] train={train_loss:.6f} val={val_loss:.6f}")
 
 
 def build_model(device: torch.device) -> GraphSdfPlanningModel:

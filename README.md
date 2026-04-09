@@ -2,6 +2,32 @@
 
 This workspace is now organized around a clean **Graph-SDF process skeleton planning core**.
 
+## Quick Start (Clone -> Setup)
+
+Use the bundled bootstrap scripts to prepare the conda environment automatically.
+
+1. Open PowerShell at repository root.
+2. Run:
+   - `powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1`
+   - or simply run `.\setup.bat`
+3. If you need a clean rebuild:
+   - `powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1 -Recreate`
+   - or `.\setup.bat -Recreate`
+
+Environment definition is in:
+
+- `environment.yml` (conda env name: `ai_cam_5axis`)
+
+Manual verify only:
+
+- `powershell -ExecutionPolicy Bypass -File .\scripts\verify_env.ps1`
+
+Important NX note:
+
+- `NXOpen` cannot be installed by pip/conda alone.
+- NX runtime + valid license must be installed/configured on the target PC.
+- The scripts verify whether `NXOpen` is discoverable, but they do not install Siemens NX.
+
 ## Active Core
 
 - `graph_sdf/`: main model package

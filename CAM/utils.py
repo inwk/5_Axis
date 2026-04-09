@@ -604,6 +604,52 @@ def get_ipw_property(session=None, work_part=None, object_blank=None, tool_name=
     return deviation_list, volume
 
 
+def get_ipw_property_detailed(
+    session=None,
+    work_part=None,
+    object_blank=None,
+    tool_name=None,
+    points_array=None,
+    norm_vecs_array=None,
+    lines_array=None,
+    savepath=None,
+):
+    """Builds a temporary operation and measures current IPW at both face and point levels."""
+    if session is None:
+        session = NXOpen.Session.GetSession()
+    if work_part is None:
+        work_part = session.Parts.Work
+
+    session.ApplicationSwitchImmediate("UG_APP_MANUFACTURING")
+    work_part = session.Parts.Work
+    session.CAMSession.PathDisplay.SetIpwResolution(NXOpen.CAM.PathDisplay.IpwResolutionType.Fine)
+
+    markId = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "before_detailed")
+
+    nCGroup = work_part.CAMSetup.CAMGroupCollection.FindObject("NC_PROGRAM")
+    method = work_part.CAMSetup.CAMGroupCollection.FindObject("METHOD")
+    tool = work_part.CAMSetup.CAMGroupCollection.FindObject(tool_name)
+    operation = work_part.CAMSetup.CAMOperationCollection.Create(
+        nCGroup,
+        method,
+        tool,
+        object_blank,
+        "mill_contour",
+        "AREA_MILL",
+        NXOpen.CAM.OperationCollection.UseDefaultName.TrueValue,
+        "AREA_MILL",
+    )
+
+    ipw = operation.GetInputIpw()
+    volume = ipw.Volume / 1000
+    deviation_list, _ = get_deviation_per_face(ipw, points_array, norm_vecs_array, lines_array)
+    pointwise_list, _ = get_pointwise_deviation_per_face(ipw, points_array, norm_vecs_array, lines_array)
+
+    assert volume != 0.0, "volume 0"
+    session.UndoToMark(markId, "before_detailed")
+    return deviation_list, pointwise_list, volume
+
+
 def CAMFilter(dec_input_list,dec_output_list, cycle_time_list, volume_diff_list):
     """Performs: camfilter."""
     indices_to_remove = [index for index, value in enumerate(volume_diff_list) if value <= 0.0]
@@ -768,6 +814,29 @@ def measure_ipw_state(
     )
 
 
+def measure_ipw_state_detailed(
+    session=None,
+    work_part=None,
+    object_blank=None,
+    tool_name=None,
+    points_array=None,
+    norm_vecs_array=None,
+    lines_array=None,
+    savepath=None,
+):
+    """Measures IPW volume and both face-level and point-level deviations for the current setup."""
+    return get_ipw_property_detailed(
+        session=session,
+        work_part=work_part,
+        object_blank=object_blank,
+        tool_name=tool_name,
+        points_array=points_array,
+        norm_vecs_array=norm_vecs_array,
+        lines_array=lines_array,
+        savepath=savepath,
+    )
+
+
 def identify_visible_faces(body, direction):
     """Returns tags of faces visible from the given view direction."""
     return identify_exterior_faces(body, direction)
@@ -776,5 +845,4 @@ def identify_visible_faces(body, direction):
 def get_face_point_cloud(faces):
     """Returns area and 100-point cloud samples per face."""
     return getPointCloud(faces)
-
 
