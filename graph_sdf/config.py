@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from .schema import STRATEGY_TO_ID, TOOL_LIBRARY
+from .schema import MACRO_CLASS_TO_ID, TOOL_LIBRARY
 
 
 @dataclass(frozen=True)
@@ -13,7 +13,7 @@ class GraphSdfModelConfig:
     points_per_node: int = 100
     point_feature_dim: int = 7
     node_process_feature_dim: int = 2
-    global_process_feature_dim: int = 13
+    global_process_feature_dim: int = 11
     face_area_feature_dim: int = 1
     hidden_dim: int = 64
     transformer_heads: int = 8
@@ -22,9 +22,8 @@ class GraphSdfModelConfig:
     action_embedding_dim: int = 64
     action_dropout: float = 0.1
     transition_decoder_layers: int = 3
-    macro_class_count: int = 7
+    macro_class_count: int = len(MACRO_CLASS_TO_ID)
     tool_choice_count: int = len(TOOL_LIBRARY)
-    strategy_count: int = len(STRATEGY_TO_ID)
     centrality_vocab_size: int = 1024
     max_spatial_pos: int = 255
     sdf_channel_index: int = 6
@@ -53,8 +52,6 @@ class GraphSdfModelConfig:
             raise ValueError("macro_class_count must be greater than 1")
         if self.tool_choice_count <= 0:
             raise ValueError("tool_choice_count must be positive")
-        if self.strategy_count <= 0:
-            raise ValueError("strategy_count must be positive")
         if self.centrality_vocab_size <= 0:
             raise ValueError("centrality_vocab_size must be positive")
         if self.max_spatial_pos <= 0:

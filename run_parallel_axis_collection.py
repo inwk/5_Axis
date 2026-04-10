@@ -14,8 +14,8 @@ PYTHON_EXE = sys.executable
 WORKER_SCRIPT = "collect_axis_dataset.py"
 
 # Shared network paths for distributed collection machines.
-SHARED_INPUT_DIR = r"\\165.132.180.130\04_媛쒕퀎?대뜑\22. ?듯빀怨쇱젙 ?ㅼ씤??prt_dataset"
-SHARED_OUTPUT_DIR = r"\\165.132.180.130\04_媛쒕퀎?대뜑\22. ?듯빀怨쇱젙 ?ㅼ씤??axis_dataset_out"
+SHARED_INPUT_DIR = r"Y:\04_개별폴더\22. 통합과정 오인욱\prt_dataset"
+SHARED_OUTPUT_DIR = r"Y:\04_개별폴더\22. 통합과정 오인욱\sdf_dataset_out"
 CURRENT_SEED = 0
 
 
@@ -79,7 +79,7 @@ def process_file_safe(file_info: tuple[str, str]) -> None:
 def main() -> None:
     """Parses arguments and executes multiprocessing workers."""
     parser = argparse.ArgumentParser(description="Parallel axis dataset collector runner")
-    parser.add_argument("--cores", type=int, default=8, help="Number of local CPU cores to use")
+    parser.add_argument("--cores", type=int, default=1, help="Number of local CPU cores to use")
     args = parser.parse_args()
 
     print(f"Using Python: {PYTHON_EXE}")

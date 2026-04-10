@@ -12,7 +12,7 @@ class ActionEmbedding(nn.Module):
     """Builds an action context from discrete process choices and anchor-face state."""
 
     def __init__(self, config: GraphSdfModelConfig) -> None:
-        """Initializes embeddings for macro class, tool choice, and target-face context."""
+        """Initializes embeddings for macro class, tool choice, and action-face context."""
         super().__init__()
         self.sdf_channel_index = config.sdf_channel_index
         self.node_process_feature_dim = config.node_process_feature_dim
@@ -20,7 +20,6 @@ class ActionEmbedding(nn.Module):
 
         self.macro_embedding = nn.Embedding(config.macro_class_count, action_dim)
         self.tool_embedding = nn.Embedding(config.tool_choice_count, action_dim)
-        self.strategy_embedding = nn.Embedding(config.strategy_count, action_dim)
         self.target_projection = nn.Sequential(
             nn.Linear(config.hidden_dim + 3 + 4 + config.node_process_feature_dim, config.hidden_dim),
             nn.GELU(),
@@ -32,7 +31,7 @@ class ActionEmbedding(nn.Module):
             nn.Linear(config.hidden_dim, action_dim),
         )
         self.fuse = nn.Sequential(
-            nn.Linear(action_dim * 5, config.hidden_dim),
+            nn.Linear(action_dim * 4, config.hidden_dim),
             nn.GELU(),
             nn.Dropout(config.action_dropout),
             nn.Linear(config.hidden_dim, config.hidden_dim),
@@ -58,8 +57,7 @@ class ActionEmbedding(nn.Module):
         state_points: torch.Tensor,
         macro_class_id: torch.Tensor,
         tool_choice_id: torch.Tensor,
-        strategy_id: torch.Tensor,
-        target_node_id: torch.Tensor,
+        action_face_id: torch.Tensor,
         axis_visible: Optional[torch.Tensor] = None,
         node_process_state: Optional[torch.Tensor] = None,
         node_mask: Optional[torch.Tensor] = None,
@@ -73,9 +71,9 @@ class ActionEmbedding(nn.Module):
                 self.node_process_feature_dim,
             )
 
-        target_node_embedding = self._gather_node_features(node_embeddings, target_node_id)
-        target_normals = self._gather_node_features(state_points[..., 3:6].mean(dim=2), target_node_id)
-        target_process_state = self._gather_node_features(node_process_state, target_node_id)
+        target_node_embedding = self._gather_node_features(node_embeddings, action_face_id)
+        target_normals = self._gather_node_features(state_points[..., 3:6].mean(dim=2), action_face_id)
+        target_process_state = self._gather_node_features(node_process_state, action_face_id)
 
         per_node_sdf = state_points[..., self.sdf_channel_index]
         current_node_sdf = per_node_sdf.mean(dim=2)
@@ -88,11 +86,10 @@ class ActionEmbedding(nn.Module):
             ],
             dim=-1,
         )
-        target_sdf_stats = self._gather_node_features(sdf_stats, target_node_id)
+        target_sdf_stats = self._gather_node_features(sdf_stats, action_face_id)
 
         macro_feature = self.macro_embedding(macro_class_id)
         tool_feature = self.tool_embedding(tool_choice_id)
-        strategy_feature = self.strategy_embedding(strategy_id)
 
         valid_nodes = torch.ones_like(current_node_sdf, dtype=torch.bool)
         if node_mask is not None:
@@ -129,7 +126,7 @@ class ActionEmbedding(nn.Module):
             )
         )
         action_context = self.fuse(
-            torch.cat([macro_feature, tool_feature, strategy_feature, target_feature, region_feature], dim=-1)
+            torch.cat([macro_feature, tool_feature, target_feature, region_feature], dim=-1)
         )
         return {
             "action_context": action_context,
@@ -200,8 +197,7 @@ class ShapeTransitionHead(nn.Module):
         state_points: torch.Tensor,
         macro_class_id: torch.Tensor,
         tool_choice_id: torch.Tensor,
-        strategy_id: torch.Tensor,
-        target_node_id: torch.Tensor,
+        action_face_id: torch.Tensor,
         axis_visible: Optional[torch.Tensor] = None,
         node_process_state: Optional[torch.Tensor] = None,
         node_mask: Optional[torch.Tensor] = None,
@@ -213,8 +209,7 @@ class ShapeTransitionHead(nn.Module):
             state_points=state_points,
             macro_class_id=macro_class_id,
             tool_choice_id=tool_choice_id,
-            strategy_id=strategy_id,
-            target_node_id=target_node_id,
+            action_face_id=action_face_id,
             axis_visible=axis_visible,
             node_process_state=node_process_state,
             node_mask=node_mask,

@@ -14,14 +14,12 @@ from networkx.readwrite import json_graph
 import pandas as pd
 import NXOpen
 
-from graph_face_compression import compress_graph_by_area, reduce_visibility_by_groups
+from graph_face_compression import reduce_visibility_by_groups
 from graph_sdf.schema import (
     MACRO_CLASS_TO_ID,
     TOOL_CHOICE_TO_ID,
     TOOL_LIBRARY,
-    build_strategy_mask_for_macro_class,
     build_tool_choice_mask_for_macro_class,
-    strategy_id_from_macro_class_id,
     tool_choice_key,
 )
 
@@ -31,6 +29,11 @@ from CAM import utils as cam_utils
 
 from CAM.measurements import get_body_volume, sample_convergent_face_points, sample_face_points
 
+
+def save_part(session, work_part, directory):
+    work_part = session.Parts.Work
+    savePart = work_part.SaveAs(directory)
+    savePart.Dispose()
 
 def serialize_graph_to_node_link(G: nxg.Graph) -> dict:
     """Serializes a NetworkX graph into node-link JSON format."""
@@ -241,11 +244,8 @@ def select_single_axis_direction(
         if best_face_idx is None or best_area <= 0.0:
             continue
 
-        try:
-            _, _, direction_data, _, _, _, _ = theUfSession.Modeling.AskFaceData(origin_faces[best_face_idx].Tag)
-            direction = _normalize_vector((float(direction_data[0]), float(direction_data[1]), float(direction_data[2])))
-        except Exception:
-            continue
+        _, _, direction_data, _, _, _, _ = theUfSession.Modeling.AskFaceData(origin_faces[best_face_idx].Tag)
+        direction = _normalize_vector((float(direction_data[0]), float(direction_data[1]), float(direction_data[2])))
 
         if direction == (0.0, 0.0, 0.0):
             continue
@@ -296,7 +296,7 @@ def build_point_test_operation_sequence():
 
 SDF_FEATURE_SCALE = 10.0
 ROUGH_DONE_DELTA_EPS = 1e-5
-FINISH_READY_TOL = 0.05
+FINISH_READY_TOL = float(os.getenv("FINISH_READY_TOL", "1.0"))
 
 
 def build_node_mask_512(num_valid_nodes: int, max_nodes: int = 512) -> np.ndarray:
@@ -306,10 +306,20 @@ def build_node_mask_512(num_valid_nodes: int, max_nodes: int = 512) -> np.ndarra
     return mask
 
 
-def build_point_mask_512x100(num_valid_nodes: int, points_per_node: int = 100, max_nodes: int = 512) -> np.ndarray:
+def build_point_mask_512x100(
+    face_pc_raw_512x100x3: np.ndarray,
+    num_valid_nodes: int,
+    max_nodes: int = 512,
+) -> np.ndarray:
     """Builds a point padding mask aligned with fixed 512x100 node-point slots."""
+    points = np.asarray(face_pc_raw_512x100x3, dtype=np.float32)
+    points_per_node = int(points.shape[1])
     mask = np.ones((max_nodes, points_per_node), dtype=np.int16)
-    mask[: min(num_valid_nodes, max_nodes), :] = 0
+    valid_nodes = min(num_valid_nodes, max_nodes)
+    if valid_nodes <= 0:
+        return mask
+    point_valid = np.any(np.abs(points[:valid_nodes]) > 1e-12, axis=-1).astype(np.int16)
+    mask[:valid_nodes, :] = (point_valid == 0).astype(np.int16)
     return mask
 
 
@@ -385,16 +395,13 @@ def extract_point_coordinates(points_array) -> List[np.ndarray]:
     for face_points in points_array:
         coords = []
         for point in face_points:
-            try:
-                coords.append(
-                    [
-                        float(point.Coordinates.X),
-                        float(point.Coordinates.Y),
-                        float(point.Coordinates.Z),
-                    ]
-                )
-            except Exception:
-                continue
+            coords.append(
+                [
+                    float(point.Coordinates.X),
+                    float(point.Coordinates.Y),
+                    float(point.Coordinates.Z),
+                ]
+            )
         coords_per_face.append(np.asarray(coords, dtype=np.float32))
     return coords_per_face
 
@@ -490,15 +497,14 @@ def is_three_axis_tool_orientation(axis_dir: Tuple[float, float, float], tol_deg
 
 def infer_macro_class_name(optype: str, axis_dir: Tuple[float, float, float]) -> str:
     """Maps one executed NX operation to the planner macro class vocabulary."""
-    is_three_axis = is_three_axis_tool_orientation(axis_dir)
     if optype == "3D Adaptive Roughing":
-        return "3_axis_rough" if is_three_axis else "3p2_axis_rough"
+        return "indexed_rough"
     if optype in {"Cavity Mill", "Area Mill"}:
-        return "3_axis_finish" if is_three_axis else "3p2_axis_finish"
+        return "indexed_finish"
     if optype == "Swarf Mill":
-        return "5_axis_flank_finish"
+        return "flank_finish"
     if optype == "Point Mill":
-        return "5_axis_point_finish"
+        return "point_finish"
     raise ValueError(f"Unsupported optype for macro class mapping: {optype}")
 
 
@@ -563,18 +569,14 @@ def infer_axis_face_id_from_normal(
     return best_idx
 
 
-def build_macro_class_mask_7(
+def build_macro_class_mask_5(
     state_done_mask_512: np.ndarray,
     rough_done_mask_512: np.ndarray,
     finish_ready_mask_512: np.ndarray,
-    axis_visible_512: np.ndarray,
     node_mask_512: np.ndarray,
 ) -> np.ndarray:
     """Builds an invalid-mask for macro classes (1=invalid, 0=valid)."""
-    active = (
-        (np.asarray(axis_visible_512, dtype=np.int16) == 1)
-        & (np.asarray(node_mask_512, dtype=np.int16) == 0)
-    )
+    active = np.asarray(node_mask_512, dtype=np.int16) == 0
     state_not_done = (np.asarray(state_done_mask_512, dtype=np.int16) == 0)
     rough_done = (np.asarray(rough_done_mask_512, dtype=np.int16) == 1)
     finish_ready = (np.asarray(finish_ready_mask_512, dtype=np.int16) == 1)
@@ -585,13 +587,11 @@ def build_macro_class_mask_7(
 
     mask = np.ones((len(MACRO_CLASS_TO_ID),), dtype=np.int16)
     if rough_possible:
-        mask[MACRO_CLASS_TO_ID["3_axis_rough"]] = 0
-        mask[MACRO_CLASS_TO_ID["3p2_axis_rough"]] = 0
+        mask[MACRO_CLASS_TO_ID["indexed_rough"]] = 0
     if finish_possible:
-        mask[MACRO_CLASS_TO_ID["3_axis_finish"]] = 0
-        mask[MACRO_CLASS_TO_ID["3p2_axis_finish"]] = 0
-        mask[MACRO_CLASS_TO_ID["5_axis_point_finish"]] = 0
-        mask[MACRO_CLASS_TO_ID["5_axis_flank_finish"]] = 0
+        mask[MACRO_CLASS_TO_ID["indexed_finish"]] = 0
+        mask[MACRO_CLASS_TO_ID["point_finish"]] = 0
+        mask[MACRO_CLASS_TO_ID["flank_finish"]] = 0
     if all_done or (not rough_possible and not finish_possible):
         mask[MACRO_CLASS_TO_ID["stop"]] = 0
 
@@ -606,15 +606,15 @@ def build_global_process_state(
     reference_scale: float,
 ) -> np.ndarray:
     """Builds a compact global context vector with process history and part scale."""
-    out = np.zeros((13,), dtype=np.float32)
-    if 0 <= int(prev_macro_class_id) < 7:
+    out = np.zeros((11,), dtype=np.float32)
+    if 0 <= int(prev_macro_class_id) < len(MACRO_CLASS_TO_ID):
         out[int(prev_macro_class_id)] = 1.0
     total = max(rough_rows_emitted + finish_rows_emitted, 1)
-    out[7] = float(rough_rows_emitted / total)
-    out[8] = float(finish_rows_emitted / total)
+    out[5] = float(rough_rows_emitted / total)
+    out[6] = float(finish_rows_emitted / total)
     ref_scale = float(max(reference_scale, 1e-6))
-    out[9:12] = np.asarray(bbox_extent_xyz, dtype=np.float32).reshape(3) / ref_scale
-    out[12] = float(np.log1p(ref_scale))
+    out[7:10] = np.asarray(bbox_extent_xyz, dtype=np.float32).reshape(3) / ref_scale
+    out[10] = float(np.log1p(ref_scale))
     return out
 
 
@@ -624,12 +624,10 @@ def build_global_process_state(
 # ──────────────────────────────────────────────────────────────────────
 
 MACRO_CLASS_TO_OPTYPE = {
-    "3_axis_rough": "3D Adaptive Roughing",
-    "3_axis_finish": "Area Mill",
-    "3p2_axis_rough": "3D Adaptive Roughing",
-    "3p2_axis_finish": "Area Mill",
-    "5_axis_point_finish": "Point Mill",
-    "5_axis_flank_finish": "Swarf Mill",
+    "indexed_rough": "3D Adaptive Roughing",
+    "indexed_finish": "Area Mill",
+    "point_finish": "Point Mill",
+    "flank_finish": "Swarf Mill",
 }
 
 
@@ -639,12 +637,8 @@ def derive_axis_direction(
 ) -> Tuple[float, float, float]:
     """Derives tool axis from macro class and target face geometry.
 
-    3-axis      → always (0, 0, 1)
-    3+2-axis    → target face normal (upper hemisphere)
-    5-axis      → target face normal as initial orientation hint
+    Indexed / 5-axis finishing → selected face normal (upper hemisphere)
     """
-    if macro_class_name in {"3_axis_rough", "3_axis_finish"}:
-        return (0.0, 0.0, 1.0)
     n = _normalize_vector(tuple(float(x) for x in target_face_normal))
     if n == (0.0, 0.0, 0.0):
         return (0.0, 0.0, 1.0)
@@ -657,7 +651,7 @@ def sample_valid_tools_for_macro(
     macro_class_name: str,
     max_tools: int = 3,
 ) -> List[Tuple[str, float]]:
-    """Returns valid tools for a macro class, sampled for size diversity."""
+    """Returns process-aware tool candidates for a macro class."""
     macro_id = MACRO_CLASS_TO_ID.get(macro_class_name, -1)
     if macro_id < 0:
         return []
@@ -665,13 +659,144 @@ def sample_valid_tools_for_macro(
     valid = [TOOL_LIBRARY[i] for i, m in enumerate(mask) if m == 0]
     if not valid:
         return []
-    if len(valid) <= max_tools:
-        return list(valid)
-    indices = np.linspace(0, len(valid) - 1, max_tools, dtype=int)
-    return [valid[int(i)] for i in indices]
+
+    def _sort_tools(tools: List[Tuple[str, float]], descending: bool) -> List[Tuple[str, float]]:
+        return sorted(tools, key=lambda item: float(item[1]), reverse=descending)
+
+    def _pick_spread(ordered_tools: List[Tuple[str, float]], count: int) -> List[Tuple[str, float]]:
+        count = max(1, int(count))
+        if len(ordered_tools) <= count:
+            return ordered_tools
+        if count == 1:
+            return [ordered_tools[0]]
+
+        sampled: List[Tuple[str, float]] = []
+        used_idx: set[int] = set()
+        for raw_idx in np.linspace(0, len(ordered_tools) - 1, num=count):
+            idx = int(round(float(raw_idx)))
+            idx = max(0, min(idx, len(ordered_tools) - 1))
+            while idx in used_idx and idx + 1 < len(ordered_tools):
+                idx += 1
+            while idx in used_idx and idx - 1 >= 0:
+                idx -= 1
+            if idx in used_idx:
+                continue
+            used_idx.add(idx)
+            sampled.append(ordered_tools[idx])
+        if len(sampled) < count:
+            for idx, tool in enumerate(ordered_tools):
+                if idx in used_idx:
+                    continue
+                sampled.append(tool)
+                if len(sampled) >= count:
+                    break
+        return sampled
+
+    if macro_class_name == "indexed_rough":
+        # Roughing should bias toward large cutters, but still expose size diversity.
+        ordered = _sort_tools(valid, descending=True)
+    elif macro_class_name in {"indexed_finish", "point_finish"}:
+        # Finishing should start from smaller tools, while keeping a spread.
+        ordered = _sort_tools(valid, descending=False)
+    elif macro_class_name == "flank_finish":
+        # Flank milling usually prefers larger flat tools.
+        ordered = _sort_tools(valid, descending=True)
+    else:
+        ordered = list(valid)
+
+    return _pick_spread(ordered, max_tools)
 
 
-def select_target_node_candidates(
+def create_geometry_for_state(
+    session,
+    work_part,
+    prt_file_path: str,
+    workpiece_name_chain: List[str] | None,
+    origin_body,
+    commit_to_chain: bool,
+):
+    """Creates a workpiece geometry tied to an IPW source chain.
+
+    When `commit_to_chain=True`, the provided chain is advanced by appending a
+    new workpiece source. Callers may pass either the persistent global chain
+    or a local copy used only for temporary candidate rollout.
+    """
+    if workpiece_name_chain is None:
+        temp_chain: List[str] = []
+        return geometry.create_geometry(
+            session, work_part, prt_file_path, temp_chain, origin_body, True, False,
+        )
+
+    if len(workpiece_name_chain) == 0:
+        return geometry.create_geometry(
+            session, work_part, prt_file_path, workpiece_name_chain, origin_body, True, False,
+        )
+
+    return geometry.create_geometry(
+        session, work_part, prt_file_path, workpiece_name_chain, origin_body, commit_to_chain, False,
+    )
+
+
+def restore_workpiece_chain(workpiece_name_chain: List[str], snapshot: List[str]) -> None:
+    """Restores the Python-side IPW source chain after an NX undo rollback."""
+    workpiece_name_chain[:] = list(snapshot)
+
+
+def create_operation_geometry_for_depth(
+    session,
+    work_part,
+    prt_file_path: str,
+    workpiece_name_chain: List[str],
+    origin_body,
+    operation_depth: int,
+    base_object_blank,
+):
+    """Returns the CAM geometry for the next operation in a scenario.
+
+    The first operation must be created on the original WORKPIECE geometry,
+    matching the legacy data generator. Later operations create workpiece_1,
+    workpiece_2, ... sourced from the previous IPW.
+    """
+    if int(operation_depth) <= 0:
+        if base_object_blank is None:
+            obj_blank, _, _ = geometry.create_geometry(
+                session, work_part, prt_file_path, workpiece_name_chain, origin_body, True, False,
+            )
+            return obj_blank
+        return base_object_blank
+    obj_blank, _, _ = geometry.create_geometry(
+        session, work_part, prt_file_path, workpiece_name_chain, origin_body, True, False,
+    )
+    return obj_blank
+
+
+def create_measure_geometry_for_depth(
+    session,
+    work_part,
+    prt_file_path: str,
+    workpiece_name_chain: List[str],
+    origin_body,
+    state_depth: int,
+    base_object_blank,
+):
+    """Returns a CAM geometry for measuring the current scenario state."""
+    if int(state_depth) <= 0:
+        if base_object_blank is None:
+            obj_blank, _, _ = geometry.create_geometry(
+                session, work_part, prt_file_path, workpiece_name_chain, origin_body, True, False,
+            )
+            return obj_blank
+        return base_object_blank
+    # Special case after the first operation: create_geometry needs add_list=True
+    # so the temporary geometry uses the WORKPIECE IPW instead of AutoBlock.
+    add_list = len(workpiece_name_chain) == 1
+    obj_blank, _, _ = geometry.create_geometry(
+        session, work_part, prt_file_path, workpiece_name_chain, origin_body, add_list, False,
+    )
+    return obj_blank
+
+
+def select_action_face_candidates(
     state_node_sdf_512: np.ndarray,
     rough_done_mask_512: np.ndarray,
     finish_ready_mask_512: np.ndarray,
@@ -681,11 +806,10 @@ def select_target_node_candidates(
     max_finish_targets: int = 5,
     normal_dedup_tol_deg: float = 10.0,
 ) -> Dict[str, List[int]]:
-    """Selects candidate target nodes for roughing and finishing.
+    """Selects candidate raw faces for indexed roughing and finishing.
 
-    Roughing:  nodes with highest residual, not yet rough-done,
-               deduplicated by normal direction (avoids redundant 3+2 axes).
-    Finishing: finish-ready nodes, deduplicated similarly.
+    Indexed roughing: residual-heavy faces that are not rough-done yet.
+    Finishing: finish-ready faces with remaining material.
     """
     valid = np.asarray(node_mask_512, dtype=np.int16).reshape(-1) == 0
     sdf = np.asarray(state_node_sdf_512, dtype=np.float32).reshape(-1)
@@ -713,7 +837,7 @@ def select_target_node_candidates(
     rough_elig = valid & (np.asarray(rough_done_mask_512, dtype=np.int16).reshape(-1) == 0) & (sdf > 0)
     finish_elig = valid & (np.asarray(finish_ready_mask_512, dtype=np.int16).reshape(-1) == 1)
     return {
-        "rough": _pick_diverse(rough_elig, max_rough_targets),
+        "indexed_rough": _pick_diverse(rough_elig, max_rough_targets),
         "finish": _pick_diverse(finish_elig, max_finish_targets),
     }
 
@@ -726,14 +850,15 @@ def generate_action_candidates(
     face_normal_512x3: np.ndarray,
     max_rough_targets: int = 5,
     max_finish_targets: int = 5,
-    max_tools_per_class: int = 2,
+    max_tools_per_class: int = 7,
 ) -> List[Dict[str, Any]]:
-    """Generates action candidates as (macro_class, target_node, tool) with derived axis.
+    """Generates action candidates as (macro_class, action_face, tool).
 
-    Unlike the old axis-first approach, the axis is derived deterministically
-    from the macro class and target node's face normal.
+    The selected raw face acts as:
+    - anchor face for indexed roughing
+    - target face for indexed/point/flank finishing
     """
-    targets = select_target_node_candidates(
+    targets = select_action_face_candidates(
         state_node_sdf_512, rough_done_mask_512, finish_ready_mask_512,
         node_mask_512, face_normal_512x3,
         max_rough_targets=max_rough_targets,
@@ -743,14 +868,16 @@ def generate_action_candidates(
     candidates: List[Dict[str, Any]] = []
     seen: set = set()
 
-    def _add(macro, node_id, tk, td, axis):
-        key = (macro, node_id, tk, td)
+    def _add(macro, face_id, tk, td, axis):
+        key = (macro, face_id, tk, td)
         if key in seen:
             return
         seen.add(key)
         candidates.append({
             "macro_class_name": macro,
-            "target_node_id": int(node_id),
+            "action_face_id": int(face_id),
+            "anchor_face_id": int(face_id) if macro == "indexed_rough" else -1,
+            "target_face_id": -1 if macro == "indexed_rough" else int(face_id),
             "tool_kind": tk,
             "tool_diameter": td,
             "optype": MACRO_CLASS_TO_OPTYPE[macro],
@@ -758,40 +885,22 @@ def generate_action_candidates(
             "path_type": "FollowPart",
         })
 
-    # ── Roughing ──
-    if targets["rough"]:
-        # 3-axis rough: axis=Z always, target = most Z-aligned node (operation is global)
-        z_scores = [float(normals[nid][2]) for nid in targets["rough"]]
-        best_z_node = targets["rough"][int(np.argmax(z_scores))]
-        for tk, td in sample_valid_tools_for_macro("3_axis_rough", max_tools_per_class):
-            _add("3_axis_rough", best_z_node, tk, td, (0.0, 0.0, 1.0))
+    if targets["indexed_rough"]:
+        for face_id in targets["indexed_rough"]:
+            axis = derive_axis_direction("indexed_rough", normals[face_id])
+            for tk, td in sample_valid_tools_for_macro("indexed_rough", max_tools_per_class):
+                _add("indexed_rough", face_id, tk, td, axis)
 
-        # 3+2 rough: each target node → distinct axis from its normal
-        for node_id in targets["rough"]:
-            axis = derive_axis_direction("3p2_axis_rough", normals[node_id])
-            if is_three_axis_tool_orientation(axis, tol_deg=5.0):
-                continue
-            for tk, td in sample_valid_tools_for_macro("3p2_axis_rough", max_tools_per_class):
-                _add("3p2_axis_rough", node_id, tk, td, axis)
+    for face_id in targets["finish"]:
+        axis = derive_axis_direction("indexed_finish", normals[face_id])
+        for tk, td in sample_valid_tools_for_macro("indexed_finish", max_tools_per_class):
+            _add("indexed_finish", face_id, tk, td, axis)
 
-    # ── Finishing ──
-    for node_id in targets["finish"]:
-        normal = normals[node_id]
+        for tk, td in sample_valid_tools_for_macro("point_finish", max_tools_per_class):
+            _add("point_finish", face_id, tk, td, axis)
 
-        for tk, td in sample_valid_tools_for_macro("3_axis_finish", max_tools_per_class):
-            _add("3_axis_finish", node_id, tk, td, (0.0, 0.0, 1.0))
-
-        axis_3p2 = derive_axis_direction("3p2_axis_finish", normal)
-        if not is_three_axis_tool_orientation(axis_3p2, tol_deg=5.0):
-            for tk, td in sample_valid_tools_for_macro("3p2_axis_finish", max_tools_per_class):
-                _add("3p2_axis_finish", node_id, tk, td, axis_3p2)
-
-        axis_5 = derive_axis_direction("5_axis_point_finish", normal)
-        for tk, td in sample_valid_tools_for_macro("5_axis_point_finish", max_tools_per_class):
-            _add("5_axis_point_finish", node_id, tk, td, axis_5)
-
-        for tk, td in sample_valid_tools_for_macro("5_axis_flank_finish", max_tools_per_class):
-            _add("5_axis_flank_finish", node_id, tk, td, axis_5)
+        for tk, td in sample_valid_tools_for_macro("flank_finish", max_tools_per_class):
+            _add("flank_finish", face_id, tk, td, axis)
 
     return candidates
 
@@ -805,6 +914,10 @@ def simulate_single_action(
     surface_finish_tol: float = 0.01,
     group_reference_points_512x100x3: np.ndarray | None = None,
     measurement_point_coords: List[np.ndarray] | None = None,
+    workpiece_name_chain: List[str] | None = None,
+    commit_to_chain: bool = False,
+    operation_depth: int = 0,
+    base_object_blank=None,
 ) -> Dict[str, Any]:
     """Simulates one action and returns transition data.
 
@@ -816,30 +929,35 @@ def simulate_single_action(
     tool_kind = action["tool_kind"]
     tool_diameter = float(action["tool_diameter"])
     axis_dir = tuple(action["axis_dir"])
+    action_face_id = int(action["action_face_id"])
 
     # Visibility for this axis
     visible_set: set = set()
     visible_512 = np.zeros((512,), dtype=np.int16)
-    try:
-        view_vec = NXOpen.Vector3d(float(axis_dir[0]), float(axis_dir[1]), float(axis_dir[2]))
-        vis_tags = cam_utils.identify_visible_faces(origin_body, view_vec)
-        visible_set = set(vis_tags)
-        vis_orig = np.array([1 if f.Tag in visible_set else 0 for f in origin_faces], dtype=np.int16)
-        vis_red = reduce_visibility_by_groups(vis_orig, groups_face)
-        visible_512 = pad_visibility(vis_red, 512)
-    except Exception:
-        pass
+    view_vec = NXOpen.Vector3d(float(axis_dir[0]), float(axis_dir[1]), float(axis_dir[2]))
+    vis_tags = cam_utils.identify_visible_faces(origin_body, view_vec)
+    visible_set = set(vis_tags)
+    vis_orig = np.array([1 if f.Tag in visible_set else 0 for f in origin_faces], dtype=np.int16)
+    vis_red = reduce_visibility_by_groups(vis_orig, groups_face)
+    visible_512 = pad_visibility(vis_red, 512)
 
     capture_pw = (group_reference_points_512x100x3 is not None
                   and measurement_point_coords is not None)
     op_list: list = []
     ct_list: list = []
+    state_chain = workpiece_name_chain
+    if state_chain is None:
+        state_chain = []
 
     # ── Measure BEFORE ──
     m_bef = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "sim_meas_bef")
-    obj_b, _, _ = geometry.create_geometry(session, work_part, prt_file_path, [], origin_body, True, False)
+    m_bef_chain_snapshot = list(state_chain)
     pw_before = None
     try:
+        obj_b = create_measure_geometry_for_depth(
+            session, work_part, prt_file_path, state_chain, origin_body,
+            int(operation_depth), base_object_blank,
+        )
         if capture_pw:
             dev_before, pw_raw_bef, vol_before = cam_utils.measure_ipw_state_detailed(
                 session, work_part, obj_b, flat_tools[0],
@@ -857,12 +975,10 @@ def simulate_single_action(
                 points_array, norm_vecs_array, lines_array,
             )
             dev_bef_red = reduce_scalar_by_groups(np.asarray(dev_before, dtype=np.float32), groups_face, weights=face_areas)
-    except Exception as exc:
+    finally:
         session.UndoToMark(m_bef, "sim_meas_bef")
         session.DeleteUndoMark(m_bef, "sim_meas_bef")
-        return {"ok": False, "error": f"measure_before: {repr(exc)}"}
-    session.UndoToMark(m_bef, "sim_meas_bef")
-    session.DeleteUndoMark(m_bef, "sim_meas_bef")
+        restore_workpiece_chain(state_chain, m_bef_chain_snapshot)
 
     dev_bef_red_512 = pad_1d_float(dev_bef_red, 512)
     result: Dict[str, Any] = {
@@ -877,65 +993,63 @@ def simulate_single_action(
         result["point_sdf_before_512x100"] = pw_before.astype(np.float32)
 
     # ── Apply NX operation ──
-    def _select_finish_faces():
-        idx_list = cam_utils.classify_faces_for_operation(
-            session, work_part, None, "Area Mill", origin_faces, dev_before,
+    def _select_local_target_faces():
+        if not (0 <= action_face_id < len(origin_faces)):
+            return []
+        if float(dev_before[action_face_id]) <= surface_finish_tol:
+            return []
+        face_obj = origin_faces[action_face_id]
+        if face_obj.Tag not in visible_set:
+            return []
+        return [face_obj]
+
+    obj_op = create_operation_geometry_for_depth(
+        session, work_part, prt_file_path, state_chain, origin_body,
+        int(operation_depth), base_object_blank,
+    )
+    tool = resolve_tool_name(tool_kind, tool_diameter, flat_tools, ball_tools)
+
+    if optype == "3D Adaptive Roughing":
+        operations.create_3d_adaptive_roughing(
+            session, work_part, tool, obj_op, op_list, ct_list,
+            tool_orientation=axis_dir,
         )
-        return [
-            origin_faces[i] for i in idx_list
-            if float(dev_before[i]) > surface_finish_tol
-            and origin_faces[i].Tag in visible_set
-        ]
-
-    try:
-        obj_op, _, _ = geometry.create_geometry(session, work_part, prt_file_path, [], origin_body, True, False)
-        tool = resolve_tool_name(tool_kind, tool_diameter, flat_tools, ball_tools)
-
-        if optype == "3D Adaptive Roughing":
-            operations.create_3d_adaptive_roughing(
-                session, work_part, tool, obj_op, op_list, ct_list,
+    elif optype in {"Area Mill", "Cavity Mill"}:
+        sel = _select_local_target_faces()
+        if not sel:
+            ct_list.append(0.0)
+        else:
+            operations.create_surface_contour(
+                session, work_part, tool, obj_op, sel, op_list, ct_list,
                 tool_orientation=axis_dir,
             )
-        elif optype in {"Area Mill", "Cavity Mill"}:
-            sel = _select_finish_faces()
-            if not sel:
-                ct_list.append(0.0)
-            else:
-                operations.create_surface_contour(
-                    session, work_part, tool, obj_op, sel, op_list, ct_list,
-                    tool_orientation=axis_dir,
-                )
-        elif optype == "Swarf Mill":
-            sel = _select_finish_faces()
-            if not sel:
-                ct_list.append(0.0)
-            else:
-                operations.create_swarf_milling(
-                    session, work_part, tool, obj_op, sel, op_list, ct_list,
-                )
-        elif optype == "Point Mill":
-            sel = _select_finish_faces()
-            if not sel:
-                ct_list.append(0.0)
-            else:
-                operations.create_point_milling(
-                    session, work_part, tool, obj_op, sel, op_list, ct_list,
-                )
+    elif optype == "Swarf Mill":
+        sel = _select_local_target_faces()
+        if not sel:
+            ct_list.append(0.0)
         else:
-            raise ValueError(f"Unknown optype: {optype}")
-    except Exception as exc:
-        result["ok"] = False
-        result["error"] = f"apply: {repr(exc)}"
-        result["volume_after"] = float(vol_before)
-        result["removed_volume"] = 0.0
-        result["cycle_time"] = 0.0
-        result["dev_after_red_512"] = dev_bef_red_512.copy()
-        return result
+            operations.create_swarf_milling(
+                session, work_part, tool, obj_op, sel, op_list, ct_list,
+            )
+    elif optype == "Point Mill":
+        sel = _select_local_target_faces()
+        if not sel:
+            ct_list.append(0.0)
+        else:
+            operations.create_point_milling(
+                session, work_part, tool, obj_op, sel, op_list, ct_list,
+            )
+    else:
+        raise ValueError(f"Unknown optype: {optype}")
 
     # ── Measure AFTER ──
     m_aft = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "sim_meas_aft")
-    obj_a, _, _ = geometry.create_geometry(session, work_part, prt_file_path, [], origin_body, True, False)
+    m_aft_chain_snapshot = list(state_chain)
     try:
+        obj_a = create_measure_geometry_for_depth(
+            session, work_part, prt_file_path, state_chain, origin_body,
+            int(operation_depth) + 1, base_object_blank,
+        )
         if capture_pw:
             dev_after, pw_raw_aft, vol_after = cam_utils.measure_ipw_state_detailed(
                 session, work_part, obj_a, flat_tools[0],
@@ -953,13 +1067,10 @@ def simulate_single_action(
                 points_array, norm_vecs_array, lines_array,
             )
             dev_aft_red = reduce_scalar_by_groups(np.asarray(dev_after, dtype=np.float32), groups_face, weights=face_areas)
-    except Exception as exc:
-        vol_after = vol_before
-        dev_aft_red = np.asarray(dev_bef_red, dtype=np.float32)
-        result["ok"] = False
-        result["error"] = f"measure_after: {repr(exc)}"
-    session.UndoToMark(m_aft, "sim_meas_aft")
-    session.DeleteUndoMark(m_aft, "sim_meas_aft")
+    finally:
+        session.UndoToMark(m_aft, "sim_meas_aft")
+        session.DeleteUndoMark(m_aft, "sim_meas_aft")
+        restore_workpiece_chain(state_chain, m_aft_chain_snapshot)
 
     result["volume_after"] = float(vol_after)
     result["removed_volume"] = max(float(vol_before) - float(vol_after), 0.0)
@@ -999,13 +1110,10 @@ def select_axis_candidates(
                 best_face_idx = fi
         if best_face_idx is None:
             continue
-        try:
-            _, _, direction_data, _, _, _, _ = theUfSession.Modeling.AskFaceData(origin_faces[best_face_idx].Tag)
-            direction = _normalize_vector(
-                (float(direction_data[0]), float(direction_data[1]), float(direction_data[2]))
-            )
-        except Exception:
-            continue
+        _, _, direction_data, _, _, _, _ = theUfSession.Modeling.AskFaceData(origin_faces[best_face_idx].Tag)
+        direction = _normalize_vector(
+            (float(direction_data[0]), float(direction_data[1]), float(direction_data[2]))
+        )
         if direction == (0.0, 0.0, 0.0):
             continue
         if direction[2] < 0:
@@ -1029,15 +1137,12 @@ def compute_axis_visible_mask_512(
     axis_dir: Tuple[float, float, float],
 ) -> np.ndarray:
     """Computes reduced/padded visibility mask for a given axis direction."""
-    try:
-        view_vector = NXOpen.Vector3d(float(axis_dir[0]), float(axis_dir[1]), float(axis_dir[2]))
-        visible_tags = cam_utils.identify_visible_faces(origin_body, view_vector)
-        visible_set = set(visible_tags)
-        visible_orig = np.array([1 if f.Tag in visible_set else 0 for f in origin_faces], dtype=np.int16)
-        visible_reduced = reduce_visibility_by_groups(visible_orig, groups_face)
-        return pad_visibility(visible_reduced, 512)
-    except Exception:
-        return np.zeros((512,), dtype=np.int16)
+    view_vector = NXOpen.Vector3d(float(axis_dir[0]), float(axis_dir[1]), float(axis_dir[2]))
+    visible_tags = cam_utils.identify_visible_faces(origin_body, view_vector)
+    visible_set = set(visible_tags)
+    visible_orig = np.array([1 if f.Tag in visible_set else 0 for f in origin_faces], dtype=np.int16)
+    visible_reduced = reduce_visibility_by_groups(visible_orig, groups_face)
+    return pad_visibility(visible_reduced, 512)
 
 
 def generate_limited_action_candidates(
@@ -1288,33 +1393,37 @@ def force_close_part_by_path(target_path: str) -> None:
     """Performs: force close part by path."""
     session = NXOpen.Session.GetSession()
     for part in list(session.Parts):
-        try:
-            if part.FullPath and part.FullPath.lower() == target_path.lower():
-                NXOpen.UF.UFSession.GetUFSession().Part.Close(part.Tag, 0, 1)
-        except Exception:
-            pass
+        if part.FullPath and part.FullPath.lower() == target_path.lower():
+            NXOpen.UF.UFSession.GetUFSession().Part.Close(part.Tag, 0, 1)
     gc.collect()
 
 def measure_current_state(
     session, work_part, prt_file_path, origin_body, origin_faces, groups_face,
     face_areas, points_array, norm_vecs_array, lines_array, flat_tools,
+    workpiece_name_chain: List[str] | None = None,
+    state_depth: int = 0,
+    base_object_blank=None,
 ) -> Tuple[float, np.ndarray]:
     """Measures current IPW state volume and reduced deviation features."""
+    if workpiece_name_chain is None:
+        workpiece_name_chain = []
     m = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "measure_state")
+    chain_snapshot = list(workpiece_name_chain)
     try:
-        obj_blank, _, _ = geometry.create_geometry(session, work_part, prt_file_path, [], origin_body, True, False)
+        obj_blank = create_measure_geometry_for_depth(
+            session, work_part, prt_file_path, workpiece_name_chain, origin_body,
+            int(state_depth), base_object_blank,
+        )
         dev, vol = cam_utils.measure_ipw_state(
             session, work_part, obj_blank, flat_tools[0],
             points_array, norm_vecs_array, lines_array
         )
         dev_red = reduce_scalar_by_groups(np.asarray(dev, dtype=np.float32), groups_face, weights=face_areas)
         dev_red_512 = pad_1d_float(dev_red, 512)
-    except Exception:
-        vol = 0.0
-        dev_red_512 = np.zeros((512,), dtype=np.float32)
     finally:
         session.UndoToMark(m, "measure_state")
         session.DeleteUndoMark(m, "measure_state")
+        restore_workpiece_chain(workpiece_name_chain, chain_snapshot)
     return float(vol), dev_red_512
 
 def simulate_rollout_for_axis(
@@ -1334,15 +1443,12 @@ def simulate_rollout_for_axis(
     else:
         visible_set = set()
         visible_512 = np.zeros((512,), dtype=np.int16)
-        try:
-            view_vector = NXOpen.Vector3d(float(axis_dir[0]), float(axis_dir[1]), float(axis_dir[2]))
-            visible_tags = cam_utils.identify_visible_faces(origin_body, view_vector)
-            visible_set = set(visible_tags)
-            visible_orig = np.array([1 if f.Tag in visible_set else 0 for f in origin_faces], dtype=int)
-            visible_reduced = reduce_visibility_by_groups(visible_orig, groups_face)
-            visible_512 = pad_visibility(visible_reduced, 512)
-        except Exception:
-            pass
+        view_vector = NXOpen.Vector3d(float(axis_dir[0]), float(axis_dir[1]), float(axis_dir[2]))
+        visible_tags = cam_utils.identify_visible_faces(origin_body, view_vector)
+        visible_set = set(visible_tags)
+        visible_orig = np.array([1 if f.Tag in visible_set else 0 for f in origin_faces], dtype=int)
+        visible_reduced = reduce_visibility_by_groups(visible_orig, groups_face)
+        visible_512 = pad_visibility(visible_reduced, 512)
 
     operation_list, cycle_time_list, stl_file_list = [], [], []
     mark0 = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "rollout_start_measure")
@@ -1415,12 +1521,10 @@ def simulate_rollout_for_axis(
                 face_idx_list = cam_utils.classify_faces_for_operation(session, work_part, None, "Area Mill", origin_faces, dev_before)
                 selected_faces = []
                 for i in face_idx_list:
-                    try:
-                        if float(dev_before[i]) <= float(surface_finish_tol): continue
-                    except: pass
-                    try:
-                        if origin_faces[i].Tag not in visible_set: continue
-                    except: pass
+                    if float(dev_before[i]) <= float(surface_finish_tol):
+                        continue
+                    if origin_faces[i].Tag not in visible_set:
+                        continue
                     selected_faces.append(origin_faces[i])
                 if len(selected_faces) == 0:
                     cycle_time_list.append(0.0)
@@ -1431,16 +1535,10 @@ def simulate_rollout_for_axis(
                 face_idx_list = cam_utils.classify_faces_for_operation(session, work_part, None, "Area Mill", origin_faces, dev_before)
                 selected_faces = []
                 for i in face_idx_list:
-                    try:
-                        if float(dev_before[i]) <= float(surface_finish_tol):
-                            continue
-                    except Exception:
-                        pass
-                    try:
-                        if origin_faces[i].Tag not in visible_set:
-                            continue
-                    except Exception:
-                        pass
+                    if float(dev_before[i]) <= float(surface_finish_tol):
+                        continue
+                    if origin_faces[i].Tag not in visible_set:
+                        continue
                     selected_faces.append(origin_faces[i])
                 if len(selected_faces) == 0:
                     cycle_time_list.append(0.0)
@@ -1459,16 +1557,10 @@ def simulate_rollout_for_axis(
                 face_idx_list = cam_utils.classify_faces_for_operation(session, work_part, None, "Area Mill", origin_faces, dev_before)
                 selected_faces = []
                 for i in face_idx_list:
-                    try:
-                        if float(dev_before[i]) <= float(surface_finish_tol):
-                            continue
-                    except Exception:
-                        pass
-                    try:
-                        if origin_faces[i].Tag not in visible_set:
-                            continue
-                    except Exception:
-                        pass
+                    if float(dev_before[i]) <= float(surface_finish_tol):
+                        continue
+                    if origin_faces[i].Tag not in visible_set:
+                        continue
                     selected_faces.append(origin_faces[i])
                 if len(selected_faces) == 0:
                     cycle_time_list.append(0.0)
@@ -1485,24 +1577,16 @@ def simulate_rollout_for_axis(
                     )
             else:
                 raise ValueError(f"unknown optype: {st['optype']}")
-        except Exception as e:
-            step_rec["ok"] = False
-            step_rec["error"] = f"apply_error: {repr(e)}"
+        except Exception:
             session.UndoToMark(apply_mark, f"rollout_apply_rollback_{si}")
             session.DeleteUndoMark(apply_mark, f"rollout_apply_{si}")
-            step_rec["volume_before"] = float(vol_cur)
-            step_rec["volume_after"] = float(vol_cur)
-            step_rec["removed_volume"] = 0.0
-            step_rec["cycle_time"] = 0.0
-            step_rec["dev_after_red_512"] = np.asarray(step_rec["dev_before_red_512"], dtype=np.float32)
-            steps.append(step_rec)
-            break
+            raise
         else:
             session.DeleteUndoMark(apply_mark, f"rollout_apply_{si}")
 
         m1 = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, f"rollout_measure_after_{si}")
-        obj_blank_a, _, _ = geometry.create_geometry(session, work_part, prt_file_path, [], origin_body, True, False)
         try:
+            obj_blank_a, _, _ = geometry.create_geometry(session, work_part, prt_file_path, [], origin_body, True, False)
             point_sdf_after_512x100 = None
             if capture_pointwise and group_reference_points_512x100x3 is not None and measurement_point_coords is not None:
                 dev_after, pointwise_after, vol_after = cam_utils.measure_ipw_state_detailed(
@@ -1535,14 +1619,9 @@ def simulate_rollout_for_axis(
                     savepath=stl_file_list,
                 )
             dev_after_red = reduce_scalar_by_groups(np.asarray(dev_after, dtype=np.float32), groups_face, weights=face_areas)
-        except Exception as e:
-            vol_after = vol_cur
-            dev_after_red = reduce_scalar_by_groups(np.asarray(dev_before, dtype=np.float32), groups_face, weights=face_areas)
-            point_sdf_after_512x100 = None
-            step_rec["ok"] = False
-            step_rec["error"] = f"measure_error: {repr(e)}"
-        session.UndoToMark(m1, f"rollout_measure_after_{si}")
-        session.DeleteUndoMark(m1, f"rollout_measure_after_{si}")
+        finally:
+            session.UndoToMark(m1, f"rollout_measure_after_{si}")
+            session.DeleteUndoMark(m1, f"rollout_measure_after_{si}")
 
         removed = max(float(vol_cur) - float(vol_after), 0.0)
         cyc = float(cycle_time_list[-1]) if cycle_time_list else 0.0
@@ -1589,10 +1668,7 @@ def _to_serializable_list(x):
 
 def _to_safe_float(x, default=0.0) -> float:
     """Performs: safe float."""
-    try:
-        return float(x)
-    except Exception:
-        return float(default)
+    return float(x)
 
 # ----------------------------
 # ----------------------------
@@ -1608,28 +1684,26 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     graph, _, face_areas, _ = cam_utils.get_encoder_input_data(origin_faces, origin_faces_tag)
     face_areas = np.asarray(face_areas, dtype=np.float32)
     _, points_array_origin = cam_utils.get_face_point_cloud(origin_faces)
-    visible_init = np.zeros(len(origin_faces), dtype=int)
+    raw_face_count = int(len(origin_faces))
+    if raw_face_count > 512:
+        force_close_part_by_path(prt_file_path)
+        raise ValueError(
+            f"Raw-face schema requires <=512 faces, but {prt_file_path} has {raw_face_count} faces."
+        )
 
-    tag_to_face_idx = {tag: i for i, tag in enumerate(origin_faces_tag)}
-    G_new, areas_new, points_new, _, _, groups_internal, node_labels = compress_graph_by_area(
-        graph, face_areas=face_areas, face_points=[np.asarray(p, dtype=np.float32) for p in points_array_origin],
-        face_visible=visible_init, max_nodes=512, area_threshold=100.0, target_points_per_node=100, seed=42,
+    graph_dense = nxg.relabel_nodes(
+        graph,
+        {tag: idx for idx, tag in enumerate(origin_faces_tag)},
+        copy=True,
     )
-    graph_json = serialize_graph_to_node_link(G_new)
+    graph_json = serialize_graph_to_node_link(graph_dense)
+    groups_face = [[idx] for idx in range(raw_face_count)]
 
-    groups_face = []
-    for grp in groups_internal:
-        idxs = []
-        for internal_idx in grp:
-            tag = node_labels[internal_idx]
-            idxs.append(tag_to_face_idx[tag])
-        groups_face.append(idxs)
-
-    K = G_new.number_of_nodes()
-    centrality = pad_1d_int(np.array([G_new.degree(n) for n in G_new.nodes()], dtype=np.int16), 512)
-    spatial_pos = pad_2d_int(build_graph_distance_matrix(G_new).astype(np.int16), 512)
-    face_area_raw_512 = pad_face_area(np.asarray(areas_new, dtype=np.float32), 512)
-    face_pc_raw_512 = pad_face_pc(np.asarray(points_new, dtype=np.float32), 512)
+    K = raw_face_count
+    centrality = pad_1d_int(np.array([graph_dense.degree(n) for n in range(raw_face_count)], dtype=np.int16), 512)
+    spatial_pos = pad_2d_int(build_graph_distance_matrix(graph_dense).astype(np.int16), 512)
+    face_area_raw_512 = pad_face_area(face_areas.astype(np.float32), 512)
+    face_pc_raw_512 = pad_face_pc(np.asarray(points_array_origin, dtype=np.float32), 512)
 
     points_array, norm_vecs_array, lines_array = [], [], []
     for face in origin_faces:
@@ -1656,7 +1730,9 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     SURFACE_FINISH_TOL = 0.01
     MAX_ROUGH_TARGETS = int(os.getenv("MAX_ROUGH_TARGETS", "5"))
     MAX_FINISH_TARGETS = int(os.getenv("MAX_FINISH_TARGETS", "5"))
-    MAX_TOOLS_PER_CLASS = int(os.getenv("MAX_TOOLS_PER_CLASS", "2"))
+    MAX_TOOLS_PER_CLASS = int(os.getenv("MAX_TOOLS_PER_CLASS", "7"))
+    BEAM_WIDTH = max(1, int(os.getenv("BEAM_WIDTH", "3")))
+    SAMPLED_BRANCHES = max(0, int(os.getenv("SAMPLED_BRANCHES", "1")))
 
     face_normals_list = []
     if norm_vecs_array:
@@ -1681,7 +1757,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     face_normal_512 = build_group_face_normals_512(groups_face, face_normals_list, max_nodes=512)
 
     node_mask_512 = build_node_mask_512(K)
-    point_mask_512x100 = build_point_mask_512x100(K, points_per_node=face_pc_raw_512.shape[1] if face_pc_raw_512.ndim == 3 else 100)
+    point_mask_512x100 = build_point_mask_512x100(face_pc_raw_512, K)
     measurement_point_coords = extract_point_coordinates(points_array)
     normalization_center_xyz, normalization_scale, bbox_extent_xyz = compute_reference_frame(
         face_pc_raw_512,
@@ -1689,20 +1765,28 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     )
     face_pc = normalize_face_points(face_pc_raw_512, normalization_center_xyz, normalization_scale)
     face_area = normalize_face_area(face_area_raw_512, normalization_scale)
+    workpiece_name_chain: List[str] = []
+    base_object_blank, _, _ = geometry.create_geometry(
+        session, work_part, prt_file_path, workpiece_name_chain, origin_body, True, False,
+    )
 
     _json_dump(os.path.join(out_dir, "meta.json"), {
         "prt_file_path": os.path.abspath(prt_file_path),
-        "part_name": part_name, "seed": int(seed), "K_nodes_compressed": int(K),
+        "part_name": part_name, "seed": int(seed), "K_raw_faces": int(K),
         "num_faces": int(len(origin_faces)),
         "note": {
             "mode": "process_skeleton_dataset",
             "row_unit": "one_executed_nx_operation",
             "planner_schema": "graph_sdf_process_planner",
-            "candidate_strategy": "action_first_multi_transition",
-            "decision_order": "macro_target_tool_then_axis_derived",
+            "candidate_strategy": "beam_sampled_action_transition",
+            "decision_order": "macro_face_tool_then_axis_derived",
+            "rollout": {
+                "beam_width": int(BEAM_WIDTH),
+                "sampled_branches": int(SAMPLED_BRANCHES),
+            },
             "node_process_state_channels": ["rough_done", "finish_ready"],
             "global_process_state_channels": [
-                "prev_macro_onehot_7",
+                "prev_macro_onehot_5",
                 "rough_ratio",
                 "finish_ratio",
                 "bbox_extent_over_scale_xyz",
@@ -1738,10 +1822,16 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         action: Dict[str, Any],
         result: Dict[str, Any],
         state_node_sdf_raw: np.ndarray,
+        rough_done_mask_for_row: np.ndarray,
+        prev_macro_class_id_for_row: int,
+        rough_rows_emitted_for_row: int,
+        finish_rows_emitted_for_row: int,
         target_node_id: int,
         decision_step: int,
         candidate_index: int,
         is_chosen: int,
+        scenario_id: str = "root",
+        parent_scenario_id: str = "",
     ) -> Dict[str, Any] | None:
         """Assembles one parquet row from a simulated action result."""
         macro_class_name = action["macro_class_name"]
@@ -1762,7 +1852,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         next_done_mask_512, next_done_ratio = compute_done_mask_from_dev_red(
             next_node_sdf_raw, SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
         )
-        rough_done_mask = rough_done_cumulative_512.copy()
+        rough_done_mask = np.asarray(rough_done_mask_for_row, dtype=np.int16).copy()
         finish_ready_mask = build_finish_ready_mask_512(
             node_sdf_512=state_node_sdf_raw,
             rough_done_mask_512=rough_done_mask,
@@ -1771,7 +1861,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             ready_tol=FINISH_READY_TOL,
         )
 
-        # target_node_mask: 0 = valid candidate, 1 = invalid
+        # action_face_mask: 0 = valid candidate, 1 = invalid
         if is_local_operation(action["optype"]):
             valid_target_mask = (
                 (axis_visible_512 == 1)
@@ -1782,19 +1872,18 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             ).astype(np.int16)
         else:
             valid_target_mask = (
-                (axis_visible_512 == 1) & (node_mask_512 == 0)
+                (state_done_mask_512 == 0) & (node_mask_512 == 0)
             ).astype(np.int16)
-        target_node_mask_512 = (valid_target_mask == 0).astype(np.int16)
+        action_face_mask_512 = (valid_target_mask == 0).astype(np.int16)
 
         # macro class mask
-        macro_class_mask_7 = build_macro_class_mask_7(
+        macro_class_mask = build_macro_class_mask_5(
             state_done_mask_512=state_done_mask_512,
             rough_done_mask_512=rough_done_mask,
             finish_ready_mask_512=finish_ready_mask,
-            axis_visible_512=axis_visible_512,
             node_mask_512=node_mask_512,
         )
-        macro_class_mask_7[macro_class_id] = 0
+        macro_class_mask[macro_class_id] = 0
 
         # tool choice mask
         tool_choice_mask = np.asarray(
@@ -1802,12 +1891,6 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         )
         if 0 <= tool_choice_id < len(TOOL_LIBRARY):
             tool_choice_mask[tool_choice_id] = 0
-
-        # strategy id and mask (derived deterministically from macro class)
-        strategy_id = int(strategy_id_from_macro_class_id(macro_class_id))
-        strategy_mask = np.asarray(
-            build_strategy_mask_for_macro_class(macro_class_id), dtype=np.int16,
-        )
 
         node_process_state = np.stack(
             [rough_done_mask.astype(np.float32), finish_ready_mask.astype(np.float32)],
@@ -1837,9 +1920,9 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         next_point_sdf_norm = build_normalized_point_sdf_512x100(next_point_sdf_raw, normalization_scale)
 
         global_process_state = build_global_process_state(
-            prev_macro_class_id=prev_macro_class_id,
-            rough_rows_emitted=rough_rows_emitted,
-            finish_rows_emitted=finish_rows_emitted,
+            prev_macro_class_id=prev_macro_class_id_for_row,
+            rough_rows_emitted=rough_rows_emitted_for_row,
+            finish_rows_emitted=finish_rows_emitted_for_row,
             bbox_extent_xyz=bbox_extent_xyz,
             reference_scale=normalization_scale,
         )
@@ -1856,15 +1939,17 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             "decision_step": int(decision_step),
             "candidate_index": int(candidate_index),
             "is_chosen": int(is_chosen),
+            "scenario_id": str(scenario_id),
+            "parent_scenario_id": str(parent_scenario_id),
 
             "macro_class_id": int(macro_class_id),
             "macro_class_name": macro_class_name,
             "tool_choice_id": int(tool_choice_id if tool_choice_id >= 0 else 0),
             "tool_choice_name": tool_choice_name,
-            "strategy_id": int(strategy_id),
-            "strategy_valid": 1,
-            "target_node_id": int(target_node_id),
-            "target_node_valid": int(target_node_id >= 0),
+            "action_face_id": int(target_node_id),
+            "action_face_valid": int(target_node_id >= 0),
+            "anchor_face_id": int(target_node_id) if macro_class_name == "indexed_rough" else -1,
+            "target_face_id": -1 if macro_class_name == "indexed_rough" else int(target_node_id),
             "tool_choice_valid": int(tool_choice_valid),
 
             "state_points": _to_serializable_list(state_points_tensor.astype(np.float32)),
@@ -1874,10 +1959,9 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             "next_point_sdf": _to_serializable_list(next_point_sdf_norm.astype(np.float32)),
             "node_mask": _to_serializable_list(node_mask_512.astype(np.int16)),
             "point_mask": _to_serializable_list(point_mask_512x100.astype(np.int16)),
-            "macro_class_mask": _to_serializable_list(macro_class_mask_7.astype(np.int16)),
+            "macro_class_mask": _to_serializable_list(macro_class_mask.astype(np.int16)),
             "tool_choice_mask": _to_serializable_list(tool_choice_mask.astype(np.int16)),
-            "strategy_mask": _to_serializable_list(strategy_mask.astype(np.int16)),
-            "target_node_mask": _to_serializable_list(target_node_mask_512.astype(np.int16)),
+            "action_face_mask": _to_serializable_list(action_face_mask_512.astype(np.int16)),
 
             "centrality_512": _to_serializable_list(np.asarray(centrality, dtype=np.int16)),
             "spatial_pos_512x512": _to_serializable_list(np.asarray(spatial_pos, dtype=np.int16)),
@@ -1912,7 +1996,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
 
             "info_json": json.dumps({
                 "surface_finish_tol": float(SURFACE_FINISH_TOL),
-                "candidate_strategy": "action_first_multi_transition",
+                "candidate_strategy": "beam_sampled_action_transition",
                 "normalization": "part_bbox_center_and_diagonal",
                 "rough_done_delta_eps": float(ROUGH_DONE_DELTA_EPS),
                 "finish_ready_tol": float(FINISH_READY_TOL),
@@ -1920,230 +2004,364 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             }, ensure_ascii=False),
         }
 
-    try:
-        for t in range(NUM_DECISION_STEPS):
-            K_groups = len(groups_face)
-            state_volume, state_dev_red_512 = measure_current_state(
-                session, work_part, prt_file_path, origin_body, origin_faces, groups_face,
-                face_areas, points_array, norm_vecs_array, lines_array, flat_tools,
-            )
-            state_done_mask_512, all_done = compute_done_mask_from_dev_red_with_K(
-                state_dev_red_512, SURFACE_FINISH_TOL, K_groups,
-            )
-            if all_done:
-                episode_record["steps"].append({
-                    "t": int(t), "stopped": True,
-                    "reason": "all_faces_done", "state_volume": float(state_volume),
-                })
-                break
+    rng = np.random.default_rng(int(seed))
 
-            state_done_ratio = float(state_done_mask_512[:K_groups].mean()) if K_groups > 0 else 1.0
-            finish_ready_current_512 = build_finish_ready_mask_512(
-                node_sdf_512=state_dev_red_512,
-                rough_done_mask_512=rough_done_cumulative_512,
-                node_mask_512=node_mask_512,
-                done_tol=SURFACE_FINISH_TOL,
-                ready_tol=FINISH_READY_TOL,
-            )
+    root_chain_snapshot = list(workpiece_name_chain)
+    beam_root_mark = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "beam_root")
 
-            # ── Generate action-first candidates ──────────────────────
-            candidates = generate_action_candidates(
-                state_node_sdf_512=state_dev_red_512,
-                rough_done_mask_512=rough_done_cumulative_512,
-                finish_ready_mask_512=finish_ready_current_512,
-                node_mask_512=node_mask_512,
-                face_normal_512x3=face_normal_512,
-                max_rough_targets=MAX_ROUGH_TARGETS,
-                max_finish_targets=MAX_FINISH_TARGETS,
-                max_tools_per_class=MAX_TOOLS_PER_CLASS,
-            )
-            if not candidates:
-                episode_record["steps"].append({
-                    "t": int(t), "stopped": True, "reason": "no_candidates",
-                })
-                break
+    def _restore_to_root() -> None:
+        """Restores NX and the Python-side IPW chain to the initial branch root."""
+        session.UndoToMark(beam_root_mark, "beam_root")
+        restore_workpiece_chain(workpiece_name_chain, root_chain_snapshot)
 
-            print(
-                f"[INFO] t={t}: {len(candidates)} candidates "
-                f"(rough_ratio={state_done_ratio:.2f})",
-                flush=True,
-            )
-
-            # ── Simulate each candidate with undo/rollback ─────────────
-            # Each candidate gets its own transition row recorded.
-            # We also track scores to pick the best action to commit.
-            scored: List[Tuple[float, int, Dict[str, Any], Dict[str, Any]]] = []
-            # (score, candidate_index, action, result)
-
-            for ci, action in enumerate(candidates):
-                cand_mark = session.SetUndoMark(
-                    NXOpen.Session.MarkVisibility.Invisible, f"cand_t{t:02d}_c{ci:03d}",
-                )
-                try:
-                    result = simulate_single_action(
-                        session=session, work_part=work_part,
-                        prt_file_path=prt_file_path,
-                        origin_body=origin_body, origin_faces=origin_faces,
-                        groups_face=groups_face, face_areas=face_areas,
-                        points_array=points_array, norm_vecs_array=norm_vecs_array,
-                        lines_array=lines_array, flat_tools=flat_tools, ball_tools=ball_tools,
-                        action=action,
-                        surface_finish_tol=SURFACE_FINISH_TOL,
-                        # No pointwise capture during candidate sweep (speed)
-                    )
-                finally:
-                    session.UndoToMark(cand_mark, f"cand_t{t:02d}_c{ci:03d}")
-                    session.DeleteUndoMark(cand_mark, f"cand_t{t:02d}_c{ci:03d}")
-
-                if not result.get("ok", False):
-                    continue
-
-                removed = float(result.get("removed_volume", 0.0) or 0.0)
-                delta = np.maximum(
-                    state_dev_red_512 - np.asarray(result["dev_after_red_512"], dtype=np.float32),
-                    0.0,
-                )
-                if removed <= 1e-6 and float(delta.max()) <= 1e-6:
-                    continue  # no material removed
-
-                # Determine target_node_id from the action (action-first: already known)
-                target_node_id = int(action["target_node_id"])
-
-                # Score: prioritise material removal, penalise cycle time
-                vol_before = float(result.get("volume_before", 1.0) or 1.0)
-                removed_ratio = removed / max(vol_before, 1e-9)
-                next_done_mask, next_done_ratio = compute_done_mask_from_dev_red(
-                    np.asarray(result["dev_after_red_512"], dtype=np.float32),
-                    SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
-                )
-                cur_done_ratio = float(
-                    compute_done_mask_from_dev_red(
-                        state_dev_red_512, SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
-                    )[1]
-                )
-                done_gain = max(float(next_done_ratio) - cur_done_ratio, 0.0)
-                cycle_time = float(result.get("cycle_time", 0.0) or 0.0)
-                action_score = 4.0 * removed_ratio + 2.0 * done_gain - 0.002 * cycle_time
-                scored.append((action_score, ci, action, result))
-
-                row = _build_parquet_row(
-                    action=action,
-                    result=result,
-                    state_node_sdf_raw=state_dev_red_512,
-                    target_node_id=target_node_id,
-                    decision_step=t,
-                    candidate_index=ci,
-                    is_chosen=0,  # will update the chosen one below
-                )
-                parquet_rows.append(row)
-
-            if not scored:
-                episode_record["steps"].append({
-                    "t": int(t), "stopped": True, "reason": "no_effective_candidates",
-                })
-                break
-
-            # ── Commit best action (permanently, with pointwise capture) ──
-            best_score, best_ci, best_action, _prev_result = max(scored, key=lambda x: x[0])
-
-            # Mark the already-recorded row for the best candidate as chosen
-            for row in reversed(parquet_rows):
-                if (row["decision_step"] == t
-                        and row["candidate_index"] == best_ci):
-                    row["is_chosen"] = 1
-                    break
-
-            # Re-run best action permanently with full pointwise SDF capture
-            best_result = simulate_single_action(
+    def _replay_history(history: List[Dict[str, Any]]) -> Tuple[bool, str | None]:
+        """Replays a scenario action sequence from the current root state."""
+        for hi, hist_action in enumerate(history):
+            result = simulate_single_action(
                 session=session, work_part=work_part,
                 prt_file_path=prt_file_path,
                 origin_body=origin_body, origin_faces=origin_faces,
                 groups_face=groups_face, face_areas=face_areas,
                 points_array=points_array, norm_vecs_array=norm_vecs_array,
                 lines_array=lines_array, flat_tools=flat_tools, ball_tools=ball_tools,
-                action=best_action,
+                action=hist_action,
                 surface_finish_tol=SURFACE_FINISH_TOL,
-                group_reference_points_512x100x3=face_pc_raw_512,
-                measurement_point_coords=measurement_point_coords,
+                workpiece_name_chain=workpiece_name_chain,
+                commit_to_chain=True,
+                operation_depth=hi,
+                base_object_blank=base_object_blank,
             )
+        return True, None
 
-            # Update the chosen row with the richer pointwise data
-            next_node_sdf_raw_best = np.asarray(
-                best_result.get("dev_after_red_512", state_dev_red_512), dtype=np.float32,
-            )
-            # Shape must be [512] (not [512, 1]) to match dataset.py expectations.
-            next_node_sdf_norm = build_normalized_node_sdf_512x1(next_node_sdf_raw_best, normalization_scale).reshape(512)
-            next_point_sdf_raw_best = np.asarray(
-                best_result.get(
-                    "point_sdf_after_512x100",
-                    np.broadcast_to(next_node_sdf_raw_best.reshape(512, 1), (512, 100)),
-                ),
-                dtype=np.float32,
-            )
-            next_point_sdf_norm = build_normalized_point_sdf_512x100(next_point_sdf_raw_best, normalization_scale)
-            for row in reversed(parquet_rows):
-                if row["decision_step"] == t and row["candidate_index"] == best_ci:
-                    row["next_node_sdf"] = _to_serializable_list(next_node_sdf_norm.astype(np.float32))
-                    row["next_point_sdf"] = _to_serializable_list(next_point_sdf_norm.astype(np.float32))
-                    row["next_node_sdf_raw_512"] = _to_serializable_list(next_node_sdf_raw_best.astype(np.float32))
-                    row["next_point_sdf_raw_512x100"] = _to_serializable_list(next_point_sdf_raw_best.astype(np.float32))
-                    row["out_ok"] = bool(best_result.get("ok", True))
-                    break
+    def _make_child_branch(
+        parent_branch: Dict[str, Any],
+        action: Dict[str, Any],
+        result: Dict[str, Any],
+        state_sdf: np.ndarray,
+        child_score: float,
+        child_id: str,
+    ) -> Dict[str, Any]:
+        rough_done_next = np.asarray(parent_branch["rough_done"], dtype=np.int16).copy()
+        rough_rows_next = int(parent_branch["rough_rows"])
+        finish_rows_next = int(parent_branch["finish_rows"])
+        macro_class_name = str(action["macro_class_name"])
+        macro_class_id = int(MACRO_CLASS_TO_ID[macro_class_name])
+        next_sdf = np.asarray(result["dev_after_red_512"], dtype=np.float32)
+        delta = np.maximum(np.asarray(state_sdf, dtype=np.float32) - next_sdf, 0.0)
 
-            # ── Update cumulative process state ───────────────────────
-            macro_class_name = best_action["macro_class_name"]
-            macro_class_id = int(MACRO_CLASS_TO_ID[macro_class_name])
-            delta_best = np.maximum(state_dev_red_512 - next_node_sdf_raw_best, 0.0)
+        if macro_class_name == "indexed_rough":
+            rough_rows_next += 1
+            rough_impacted = (
+                (delta > float(ROUGH_DONE_DELTA_EPS))
+                & (node_mask_512 == 0)
+            ).astype(np.int16)
+            rough_done_next = np.maximum(rough_done_next, rough_impacted)
+        else:
+            finish_rows_next += 1
 
-            prev_macro_class_id = macro_class_id
-            if macro_class_name in {"3_axis_rough", "3p2_axis_rough"}:
-                rough_rows_emitted += 1
-                rough_impacted = (
-                    (delta_best > float(ROUGH_DONE_DELTA_EPS))
-                    & (node_mask_512 == 0)
-                ).astype(np.int16)
-                rough_done_cumulative_512 = np.maximum(
-                    rough_done_cumulative_512, rough_impacted,
+        return {
+            "id": child_id,
+            "parent_id": str(parent_branch["id"]),
+            "history": list(parent_branch["history"]) + [dict(action)],
+            "rough_done": rough_done_next,
+            "prev_macro": macro_class_id,
+            "rough_rows": rough_rows_next,
+            "finish_rows": finish_rows_next,
+            "score": float(child_score),
+        }
+
+    def _select_next_children(children: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not children:
+            return []
+        ordered = sorted(children, key=lambda item: float(item["score"]), reverse=True)
+        selected_positions: List[int] = list(range(min(BEAM_WIDTH, len(ordered))))
+        remaining = [i for i in range(len(ordered)) if i not in set(selected_positions)]
+        if SAMPLED_BRANCHES > 0 and remaining:
+            sample_count = min(SAMPLED_BRANCHES, len(remaining))
+            sampled = rng.choice(np.asarray(remaining, dtype=np.int32), size=sample_count, replace=False)
+            selected_positions.extend(int(x) for x in sampled.tolist())
+        selected_positions = sorted(set(selected_positions), key=lambda idx: float(ordered[idx]["score"]), reverse=True)
+        return [ordered[idx] for idx in selected_positions]
+
+    try:
+        branches: List[Dict[str, Any]] = [{
+            "id": "s0",
+            "parent_id": "",
+            "history": [],
+            "rough_done": rough_done_cumulative_512.copy(),
+            "prev_macro": prev_macro_class_id,
+            "rough_rows": rough_rows_emitted,
+            "finish_rows": finish_rows_emitted,
+            "score": 0.0,
+        }]
+
+        for t in range(NUM_DECISION_STEPS):
+            depth_children: List[Dict[str, Any]] = []
+            depth_record: Dict[str, Any] = {
+                "t": int(t),
+                "num_input_branches": int(len(branches)),
+                "branch_records": [],
+            }
+
+            for bi, branch in enumerate(branches):
+                _restore_to_root()
+                replay_ok, replay_error = _replay_history(branch["history"])
+                if not replay_ok:
+                    depth_record["branch_records"].append({
+                        "scenario_id": str(branch["id"]),
+                        "stopped": True,
+                        "reason": "replay_failed",
+                        "error": replay_error,
+                    })
+                    continue
+
+                K_groups = len(groups_face)
+                state_volume, state_dev_red_512 = measure_current_state(
+                    session, work_part, prt_file_path, origin_body, origin_faces, groups_face,
+                    face_areas, points_array, norm_vecs_array, lines_array, flat_tools,
+                    workpiece_name_chain=workpiece_name_chain,
+                    state_depth=len(branch["history"]),
+                    base_object_blank=base_object_blank,
                 )
-            else:
-                finish_rows_emitted += 1
+                state_done_mask_512, all_done = compute_done_mask_from_dev_red_with_K(
+                    state_dev_red_512, SURFACE_FINISH_TOL, K_groups,
+                )
+                state_done_ratio = float(state_done_mask_512[:K_groups].mean()) if K_groups > 0 else 1.0
+                if all_done:
+                    depth_record["branch_records"].append({
+                        "scenario_id": str(branch["id"]),
+                        "stopped": True,
+                        "reason": "all_faces_done",
+                        "state_volume": float(state_volume),
+                        "state_done_ratio": float(state_done_ratio),
+                    })
+                    continue
 
-            next_volume = float(best_result.get("volume_after", state_volume))
-            done_after_mask, done_after_ratio = compute_done_mask_from_dev_red(
-                next_node_sdf_raw_best, SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
-            )
-            new_done_count = int(
-                np.clip(
-                    done_after_mask.astype(np.int16) - state_done_mask_512.astype(np.int16),
-                    0, 1,
-                ).sum()
-            )
+                finish_ready_current_512 = build_finish_ready_mask_512(
+                    node_sdf_512=state_dev_red_512,
+                    rough_done_mask_512=np.asarray(branch["rough_done"], dtype=np.int16),
+                    node_mask_512=node_mask_512,
+                    done_tol=SURFACE_FINISH_TOL,
+                    ready_tol=FINISH_READY_TOL,
+                )
+
+                candidates = generate_action_candidates(
+                    state_node_sdf_512=state_dev_red_512,
+                    rough_done_mask_512=np.asarray(branch["rough_done"], dtype=np.int16),
+                    finish_ready_mask_512=finish_ready_current_512,
+                    node_mask_512=node_mask_512,
+                    face_normal_512x3=face_normal_512,
+                    max_rough_targets=MAX_ROUGH_TARGETS,
+                    max_finish_targets=MAX_FINISH_TARGETS,
+                    max_tools_per_class=MAX_TOOLS_PER_CLASS,
+                )
+                candidate_tools = sorted({
+                    f"{c['tool_kind']}_{float(c['tool_diameter']):.1f}" for c in candidates
+                })
+                candidate_macros = sorted({str(c["macro_class_name"]) for c in candidates})
+                print(
+                    f"[INFO] t={t} branch={branch['id']}: {len(candidates)} candidates "
+                    f"(done={state_done_ratio:.2f}, macros={candidate_macros}, tools={candidate_tools})",
+                    flush=True,
+                )
+
+                if not candidates:
+                    depth_record["branch_records"].append({
+                        "scenario_id": str(branch["id"]),
+                        "stopped": True,
+                        "reason": "no_candidates",
+                        "state_volume": float(state_volume),
+                        "state_done_ratio": float(state_done_ratio),
+                    })
+                    continue
+
+                scored: List[Tuple[float, int, Dict[str, Any], Dict[str, Any], int, Dict[str, Any]]] = []
+                reject_stats = {"no_effect": 0}
+                reject_examples: List[str] = []
+
+                for ci, action in enumerate(candidates):
+                    cand_chain_snapshot = list(workpiece_name_chain)
+                    cand_mark = session.SetUndoMark(
+                        NXOpen.Session.MarkVisibility.Invisible,
+                        f"beam_t{t:02d}_b{bi:03d}_c{ci:03d}",
+                    )
+                    try:
+                        result = simulate_single_action(
+                            session=session, work_part=work_part,
+                            prt_file_path=prt_file_path,
+                            origin_body=origin_body, origin_faces=origin_faces,
+                            groups_face=groups_face, face_areas=face_areas,
+                            points_array=points_array, norm_vecs_array=norm_vecs_array,
+                            lines_array=lines_array, flat_tools=flat_tools, ball_tools=ball_tools,
+                            action=action,
+                            surface_finish_tol=SURFACE_FINISH_TOL,
+                            workpiece_name_chain=workpiece_name_chain,
+                            commit_to_chain=True,
+                            operation_depth=len(branch["history"]),
+                            base_object_blank=base_object_blank,
+                        )
+                    finally:
+                        session.UndoToMark(cand_mark, f"beam_t{t:02d}_b{bi:03d}_c{ci:03d}")
+                        session.DeleteUndoMark(cand_mark, f"beam_t{t:02d}_b{bi:03d}_c{ci:03d}")
+                        restore_workpiece_chain(workpiece_name_chain, cand_chain_snapshot)
+
+                    removed = float(result.get("removed_volume", 0.0) or 0.0)
+                    after_sdf = np.asarray(result["dev_after_red_512"], dtype=np.float32)
+                    delta = np.maximum(state_dev_red_512 - after_sdf, 0.0)
+                    max_delta = float(np.nanmax(delta)) if delta.size else 0.0
+                    max_abs_delta = float(np.nanmax(np.abs(after_sdf - state_dev_red_512))) if after_sdf.size else 0.0
+                    if removed <= 1e-6 and max_delta <= 1e-6:
+                        reject_stats["no_effect"] += 1
+                        if len(reject_examples) < 5:
+                            reject_examples.append(
+                                f"c{ci}:{action['macro_class_name']} "
+                                f"{action['tool_kind']}_{float(action['tool_diameter']):.1f} "
+                                f"face={action['action_face_id']} no_effect "
+                                f"vol={float(result.get('volume_before', 0.0) or 0.0):.6f}"
+                                f"->{float(result.get('volume_after', 0.0) or 0.0):.6f} "
+                                f"removed={removed:.6g} max_delta={max_delta:.6g} "
+                                f"max_abs_delta={max_abs_delta:.6g} "
+                                f"ct={float(result.get('cycle_time', 0.0) or 0.0):.6g}"
+                            )
+                        continue
+
+                    vol_before = float(result.get("volume_before", 1.0) or 1.0)
+                    removed_ratio = removed / max(vol_before, 1e-9)
+                    next_done_mask, next_done_ratio = compute_done_mask_from_dev_red(
+                        np.asarray(result["dev_after_red_512"], dtype=np.float32),
+                        SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
+                    )
+                    cur_done_ratio = float(
+                        compute_done_mask_from_dev_red(
+                            state_dev_red_512, SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
+                        )[1]
+                    )
+                    done_gain = max(float(next_done_ratio) - cur_done_ratio, 0.0)
+                    cycle_time = float(result.get("cycle_time", 0.0) or 0.0)
+                    action_score = 4.0 * removed_ratio + 2.0 * done_gain - 0.002 * cycle_time
+                    child_score = float(branch["score"]) + float(action_score)
+                    child_id = f"{branch['id']}.{t}.{ci}"
+                    child_branch = _make_child_branch(
+                        branch, action, result, state_dev_red_512, child_score, child_id,
+                    )
+
+                    row = _build_parquet_row(
+                        action=action,
+                        result=result,
+                        state_node_sdf_raw=state_dev_red_512,
+                        rough_done_mask_for_row=np.asarray(branch["rough_done"], dtype=np.int16),
+                        prev_macro_class_id_for_row=int(branch["prev_macro"]),
+                        rough_rows_emitted_for_row=int(branch["rough_rows"]),
+                        finish_rows_emitted_for_row=int(branch["finish_rows"]),
+                        target_node_id=int(action["action_face_id"]),
+                        decision_step=t,
+                        candidate_index=ci,
+                        is_chosen=0,
+                        scenario_id=child_id,
+                        parent_scenario_id=str(branch["id"]),
+                    )
+                    row_index = len(parquet_rows)
+                    parquet_rows.append(row)
+                    scored.append((child_score, ci, action, result, row_index, child_branch))
+
+                branch_record: Dict[str, Any] = {
+                    "scenario_id": str(branch["id"]),
+                    "state_volume_before": float(state_volume),
+                    "state_done_ratio_before": float(state_done_ratio),
+                    "num_candidates": int(len(candidates)),
+                    "num_effective": int(len(scored)),
+                    "candidate_tools": candidate_tools,
+                    "candidate_macros": candidate_macros,
+                    "reject_stats": reject_stats,
+                }
+                if reject_examples:
+                    branch_record["reject_examples"] = reject_examples
+                if not scored:
+                    print(
+                        f"[WARN] t={t} branch={branch['id']}: no effective candidates. "
+                        f"reject_stats={reject_stats} examples={reject_examples}",
+                        flush=True,
+                    )
+                    branch_record["stopped"] = True
+                    branch_record["reason"] = "no_effective_candidates"
+                else:
+                    best_for_branch = max(scored, key=lambda x: x[0])
+                    branch_record.update({
+                        "best_candidate_index": int(best_for_branch[1]),
+                        "best_macro": str(best_for_branch[2]["macro_class_name"]),
+                        "best_tool": f"{best_for_branch[2]['tool_kind']}_{best_for_branch[2]['tool_diameter']}",
+                        "best_action_face": int(best_for_branch[2]["action_face_id"]),
+                        "best_score": float(best_for_branch[0]),
+                    })
+                    for child_score, ci, action, result, row_index, child_branch in scored:
+                        depth_children.append({
+                            "score": float(child_score),
+                            "row_index": int(row_index),
+                            "branch": child_branch,
+                            "candidate_index": int(ci),
+                            "macro": str(action["macro_class_name"]),
+                            "tool": f"{action['tool_kind']}_{action['tool_diameter']}",
+                            "action_face": int(action["action_face_id"]),
+                            "state_volume_after": float(result.get("volume_after", state_volume)),
+                            "state_done_ratio_after": float(
+                                compute_done_mask_from_dev_red(
+                                    np.asarray(result["dev_after_red_512"], dtype=np.float32),
+                                    SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
+                                )[1]
+                            ),
+                        })
+
+                depth_record["branch_records"].append(branch_record)
+
+            if not depth_children:
+                depth_record.update({
+                    "stopped": True,
+                    "reason": "no_next_branches",
+                    "num_next_branches": 0,
+                })
+                episode_record["steps"].append(depth_record)
+                break
+
+            selected_children = _select_next_children(depth_children)
+            next_branches: List[Dict[str, Any]] = []
+            selected_records: List[Dict[str, Any]] = []
+            for child in selected_children:
+                row_index = int(child["row_index"])
+                if 0 <= row_index < len(parquet_rows):
+                    parquet_rows[row_index]["is_chosen"] = 1
+                next_branch = child["branch"]
+                next_branches.append(next_branch)
+                selected_records.append({
+                    "scenario_id": str(next_branch["id"]),
+                    "parent_scenario_id": str(next_branch["parent_id"]),
+                    "candidate_index": int(child["candidate_index"]),
+                    "macro": str(child["macro"]),
+                    "tool": str(child["tool"]),
+                    "action_face": int(child["action_face"]),
+                    "score": float(child["score"]),
+                    "state_volume_after": float(child["state_volume_after"]),
+                    "state_done_ratio_after": float(child["state_done_ratio_after"]),
+                })
+
             print(
-                f"[INFO] t={t} committed: {macro_class_name} "
-                f"tool={best_action['tool_kind']} {best_action['tool_diameter']}mm "
-                f"target={best_action['target_node_id']} "
-                f"removed={best_result.get('removed_volume', 0.0):.2f} "
-                f"new_done={new_done_count}",
+                f"[INFO] t={t}: selected {len(next_branches)} next branches "
+                f"from {len(depth_children)} effective transitions",
                 flush=True,
             )
-
-            episode_record["steps"].append({
-                "t": int(t),
-                "state_volume_before": float(state_volume),
-                "state_done_ratio_before": float(state_done_ratio),
-                "num_candidates": int(len(candidates)),
-                "num_effective": int(len(scored)),
-                "chosen_candidate_index": int(best_ci),
-                "chosen_macro": macro_class_name,
-                "chosen_tool": f"{best_action['tool_kind']}_{best_action['tool_diameter']}",
-                "chosen_target_node": int(best_action["target_node_id"]),
-                "chosen_axis_dir": list(map(float, best_action["axis_dir"])),
-                "chosen_score": float(best_score),
-                "state_volume_after": float(next_volume),
-                "state_done_ratio_after": float(done_after_ratio),
+            depth_record.update({
+                "num_effective_transitions": int(len(depth_children)),
+                "num_next_branches": int(len(next_branches)),
+                "beam_width": int(BEAM_WIDTH),
+                "sampled_branches": int(SAMPLED_BRANCHES),
+                "selected_branches": selected_records,
             })
+            episode_record["steps"].append(depth_record)
+            branches = next_branches
 
     finally:
+        _restore_to_root()
+        session.DeleteUndoMark(beam_root_mark, "beam_root")
+
         parquet_path = os.path.join(out_dir, f"{part_name}_seed{int(seed)}_process_skeleton_dataset.parquet")
         if parquet_rows:
             df = pd.DataFrame(parquet_rows)
@@ -2158,8 +2376,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 print(f"[INFO] Copied parquet to: {global_path}")
 
         _json_dump(os.path.join(out_dir, "episode_record.json"), episode_record)
-        try: force_close_part_by_path(prt_file_path)
-        except Exception: pass
+        force_close_part_by_path(prt_file_path)
 
     return {
         "out_dir": out_dir, "parquet_path": parquet_path,

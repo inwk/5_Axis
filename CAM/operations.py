@@ -131,6 +131,7 @@ def create_3d_adaptive_roughing(
     tool_orientation=None,
     feed_cut=1500.0,
     spindle_rpm=15000.0,
+    bottom_up_cutting=True,
 ):
     """Creates and solves a 3D Adaptive Roughing operation."""
     session.ApplicationSwitchImmediate("UG_APP_MANUFACTURING")
@@ -153,6 +154,8 @@ def create_3d_adaptive_roughing(
 
     planar_roughing_builder.FeedsBuilder.FeedCutBuilder.Value = float(feed_cut)
     planar_roughing_builder.FeedsBuilder.SpindleRpmBuilder.Value = float(spindle_rpm)
+    bottom_up_builder = planar_roughing_builder.GetCustomizableItemBuilder("Bottom Up Cutting")
+    bottom_up_builder.Value = 1 if bool(bottom_up_cutting) else 0
 
     if tool_orientation is not None:
         vector = NXOpen.Vector3d(float(tool_orientation[0]), float(tool_orientation[1]), float(tool_orientation[2]))
@@ -200,29 +203,17 @@ def create_swarf_milling(
     method = work_part.CAMSetup.CAMGroupCollection.FindObject("METHOD")
     tool = work_part.CAMSetup.CAMGroupCollection.FindObject(tool_name)
 
-    try:
-        operation = work_part.CAMSetup.CAMOperationCollection.CreateWithUserName(
-            nCGroup,
-            method,
-            tool,
-            object_blank,
-            "mill_multi-axis",
-            "CONTOUR_PROFILE",
-            NXOpen.CAM.OperationCollection.UseDefaultName.TrueValue,
-            "CONTOUR_PROFILE",
-            "Contour Profile",
-        )
-    except Exception:
-        operation = work_part.CAMSetup.CAMOperationCollection.Create(
-            nCGroup,
-            method,
-            tool,
-            object_blank,
-            "mill_multi-axis",
-            "CONTOUR_PROFILE",
-            NXOpen.CAM.OperationCollection.UseDefaultName.TrueValue,
-            "CONTOUR_PROFILE",
-        )
+    operation = work_part.CAMSetup.CAMOperationCollection.CreateWithUserName(
+        nCGroup,
+        method,
+        tool,
+        object_blank,
+        "mill_multi-axis",
+        "CONTOUR_PROFILE",
+        NXOpen.CAM.OperationCollection.UseDefaultName.TrueValue,
+        "CONTOUR_PROFILE",
+        "Contour Profile",
+    )
 
     swarf_builder = work_part.CAMSetup.CAMOperationCollection.CreateSurfaceContourBuilder(operation)
     swarf_builder.FeedsBuilder.FeedCutBuilder.Value = float(feed_cut)
@@ -284,29 +275,17 @@ def create_point_milling(
     method = work_part.CAMSetup.CAMGroupCollection.FindObject("METHOD")
     tool = work_part.CAMSetup.CAMGroupCollection.FindObject(tool_name)
 
-    try:
-        operation = work_part.CAMSetup.CAMOperationCollection.CreateWithUserName(
-            nCGroup,
-            method,
-            tool,
-            object_blank,
-            "mill_multi-axis",
-            "VARIABLE_CONTOUR",
-            NXOpen.CAM.OperationCollection.UseDefaultName.TrueValue,
-            "VARIABLE_CONTOUR_1",
-            "Variable Contour 1",
-        )
-    except Exception:
-        operation = work_part.CAMSetup.CAMOperationCollection.Create(
-            nCGroup,
-            method,
-            tool,
-            object_blank,
-            "mill_multi-axis",
-            "VARIABLE_CONTOUR",
-            NXOpen.CAM.OperationCollection.UseDefaultName.TrueValue,
-            "VARIABLE_CONTOUR_1",
-        )
+    operation = work_part.CAMSetup.CAMOperationCollection.CreateWithUserName(
+        nCGroup,
+        method,
+        tool,
+        object_blank,
+        "mill_multi-axis",
+        "VARIABLE_CONTOUR",
+        NXOpen.CAM.OperationCollection.UseDefaultName.TrueValue,
+        "VARIABLE_CONTOUR_1",
+        "Variable Contour 1",
+    )
 
     point_builder = work_part.CAMSetup.CAMOperationCollection.CreateSurfaceContourBuilder(operation)
     point_builder.FeedsBuilder.FeedCutBuilder.Value = float(feed_cut)
@@ -326,30 +305,21 @@ def create_point_milling(
     cut_collector.ReplaceRules([cut_face_rule], False)
 
     # Journal-equivalent point milling setup.
-    try:
-        point_builder.ProjectionVector.DpmProjType = (
-            NXOpen.CAM.ProjVecCiBuilder.DpmProjTypes.ProjVecNormToDrive
-        )
-    except Exception:
-        pass
-    try:
-        point_builder.DmSurfBuilder.StepoverBuilder.StepoverType = (
-            NXOpen.CAM.StepoverBuilder.StepoverTypes.Scallop
-        )
-        point_builder.DmSurfBuilder.StepoverBuilder.ScallopBuilder.Value = float(scallop_height)
-    except Exception:
-        pass
+    point_builder.ProjectionVector.DpmProjType = (
+        NXOpen.CAM.ProjVecCiBuilder.DpmProjTypes.ProjVecNormToDrive
+    )
+    point_builder.DmSurfBuilder.StepoverBuilder.StepoverType = (
+        NXOpen.CAM.StepoverBuilder.StepoverTypes.Scallop
+    )
+    point_builder.DmSurfBuilder.StepoverBuilder.ScallopBuilder.Value = float(scallop_height)
 
     # Use one representative drive face, consistent with the recorded journal.
-    try:
-        drive_geom = point_builder.DmSurfBuilder.DriveGeometry
-        drive_set_list = drive_geom.GeometryList
-        drive_set = drive_set_list.FindItem(0)
-        drive_set.Surface = cut_face_list[0]
-        drive_geom.Validate()
-        drive_geom.Commit()
-    except Exception:
-        pass
+    drive_geom = point_builder.DmSurfBuilder.DriveGeometry
+    drive_set_list = drive_geom.GeometryList
+    drive_set = drive_set_list.FindItem(0)
+    drive_set.Surface = cut_face_list[0]
+    drive_geom.Validate()
+    drive_geom.Commit()
 
     nXObject = point_builder.Commit()
     operation_list.append(nXObject)

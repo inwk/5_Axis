@@ -20,9 +20,8 @@ def planner_train_step(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     macro_class_loss_weight: float = 1.0,
-    target_node_loss_weight: float = 1.0,
+    action_face_loss_weight: float = 1.0,
     tool_choice_loss_weight: float = 1.0,
-    strategy_loss_weight: float = 0.25,
     transition_loss_weight: float = 1.0,
     point_sdf_loss_weight: float = 1.0,
     changed_mask_loss_weight: float = 0.25,
@@ -42,27 +41,19 @@ def planner_train_step(
 
     target_macro_class = batch["macro_class_id"].to(device)
     target_tool_choice = batch["tool_choice_id"].to(device)
-    target_strategy = _to_device(batch.get("strategy_id"), device)
-    target_target_node = _to_device(batch.get("target_node_id"), device)
+    target_action_face = _to_device(batch.get("action_face_id"), device)
 
     node_mask = _to_device(batch.get("node_mask"), device)
     point_mask = _to_device(batch.get("point_mask"), device)
-    target_node_mask = _to_device(batch.get("target_node_mask"), device)
+    action_face_mask = _to_device(batch.get("action_face_mask"), device)
     macro_class_mask = _to_device(batch.get("macro_class_mask"), device)
     tool_choice_mask = _to_device(batch.get("tool_choice_mask"), device)
-    strategy_mask = _to_device(batch.get("strategy_mask"), device)
-    target_node_valid = _to_device(batch.get("target_node_valid"), device)
+    action_face_valid = _to_device(batch.get("action_face_valid"), device)
     tool_choice_valid = _to_device(batch.get("tool_choice_valid"), device)
-    strategy_valid = _to_device(batch.get("strategy_valid"), device)
 
-    if target_target_node is None:
-        target_target_node = torch.full_like(target_macro_class, -1)
-    if target_strategy is None:
-        target_strategy = torch.full_like(target_macro_class, -1)
+    if target_action_face is None:
+        target_action_face = torch.full_like(target_macro_class, -1)
 
-    # is_chosen: True for the committed best action, False for candidates.
-    # Planner loss is only meaningful on chosen rows (correct labels).
-    # Transition loss uses ALL rows (each candidate has a valid next_node_sdf).
     is_chosen_raw = batch.get("is_chosen")
     if is_chosen_raw is not None:
         is_chosen = is_chosen_raw.to(device).bool()
@@ -79,50 +70,41 @@ def planner_train_step(
         point_mask=point_mask,
         axis_visible=axis_visible,
         global_process_state=global_process_state,
-        target_node_mask=target_node_mask,
+        action_face_mask=action_face_mask,
         macro_class_mask=macro_class_mask,
         tool_choice_mask=tool_choice_mask,
-        strategy_mask=strategy_mask,
     )
 
-    # Apply planner loss only on chosen rows when is_chosen is available.
     if is_chosen is not None and is_chosen.any():
         idx = is_chosen.nonzero(as_tuple=True)[0]
         planner_loss = process_planning_loss(
             pred_macro_class_logits=outputs["macro_class_logits"][idx],
             target_macro_class=target_macro_class[idx],
-            pred_target_node_logits=outputs["target_node_logits"][idx],
-            target_target_node=target_target_node[idx],
+            pred_action_face_logits=outputs["action_face_logits"][idx],
+            target_action_face=target_action_face[idx],
             pred_tool_choice_logits=outputs["tool_choice_logits"][idx],
             target_tool_choice=target_tool_choice[idx],
-            pred_strategy_logits=outputs["strategy_logits"][idx],
-            target_strategy=target_strategy[idx],
-            target_node_valid=target_node_valid[idx] if target_node_valid is not None else None,
+            action_face_valid=action_face_valid[idx] if action_face_valid is not None else None,
             tool_choice_valid=tool_choice_valid[idx] if tool_choice_valid is not None else None,
-            strategy_valid=strategy_valid[idx] if strategy_valid is not None else None,
             macro_class_weight=macro_class_loss_weight,
-            target_node_weight=target_node_loss_weight,
+            action_face_weight=action_face_loss_weight,
             tool_choice_weight=tool_choice_loss_weight,
-            strategy_weight=strategy_loss_weight,
         )
+    elif is_chosen is not None:
+        planner_loss = torch.zeros((), device=device, dtype=state_points.dtype)
     else:
-        # Fallback: use all rows (e.g., old data without is_chosen column).
         planner_loss = process_planning_loss(
             pred_macro_class_logits=outputs["macro_class_logits"],
             target_macro_class=target_macro_class,
-            pred_target_node_logits=outputs["target_node_logits"],
-            target_target_node=target_target_node,
+            pred_action_face_logits=outputs["action_face_logits"],
+            target_action_face=target_action_face,
             pred_tool_choice_logits=outputs["tool_choice_logits"],
             target_tool_choice=target_tool_choice,
-            pred_strategy_logits=outputs["strategy_logits"],
-            target_strategy=target_strategy,
-            target_node_valid=target_node_valid,
+            action_face_valid=action_face_valid,
             tool_choice_valid=tool_choice_valid,
-            strategy_valid=strategy_valid,
             macro_class_weight=macro_class_loss_weight,
-            target_node_weight=target_node_loss_weight,
+            action_face_weight=action_face_loss_weight,
             tool_choice_weight=tool_choice_loss_weight,
-            strategy_weight=strategy_loss_weight,
         )
     loss = planner_loss
 
@@ -140,14 +122,12 @@ def planner_train_step(
             point_mask=point_mask,
             axis_visible=axis_visible,
             global_process_state=global_process_state,
-            target_node_mask=target_node_mask,
+            action_face_mask=action_face_mask,
             macro_class_mask=macro_class_mask,
             tool_choice_mask=tool_choice_mask,
-            strategy_mask=strategy_mask,
             target_macro_class=target_macro_class,
             target_tool_choice=target_tool_choice,
-            target_strategy=target_strategy.clamp_min(0),
-            target_node_id=target_target_node.clamp_min(0),
+            target_action_face=target_action_face.clamp_min(0),
             use_teacher_forcing_action=True,
             run_transition=True,
         )
@@ -176,9 +156,8 @@ def planner_validation_step(
     batch: dict,
     device: torch.device,
     macro_class_loss_weight: float = 1.0,
-    target_node_loss_weight: float = 1.0,
+    action_face_loss_weight: float = 1.0,
     tool_choice_loss_weight: float = 1.0,
-    strategy_loss_weight: float = 0.25,
     transition_loss_weight: float = 1.0,
     point_sdf_loss_weight: float = 1.0,
     changed_mask_loss_weight: float = 0.25,
@@ -197,23 +176,18 @@ def planner_validation_step(
 
     target_macro_class = batch["macro_class_id"].to(device)
     target_tool_choice = batch["tool_choice_id"].to(device)
-    target_strategy = _to_device(batch.get("strategy_id"), device)
-    target_target_node = _to_device(batch.get("target_node_id"), device)
+    target_action_face = _to_device(batch.get("action_face_id"), device)
 
     node_mask = _to_device(batch.get("node_mask"), device)
     point_mask = _to_device(batch.get("point_mask"), device)
-    target_node_mask = _to_device(batch.get("target_node_mask"), device)
+    action_face_mask = _to_device(batch.get("action_face_mask"), device)
     macro_class_mask = _to_device(batch.get("macro_class_mask"), device)
     tool_choice_mask = _to_device(batch.get("tool_choice_mask"), device)
-    strategy_mask = _to_device(batch.get("strategy_mask"), device)
-    target_node_valid = _to_device(batch.get("target_node_valid"), device)
+    action_face_valid = _to_device(batch.get("action_face_valid"), device)
     tool_choice_valid = _to_device(batch.get("tool_choice_valid"), device)
-    strategy_valid = _to_device(batch.get("strategy_valid"), device)
 
-    if target_target_node is None:
-        target_target_node = torch.full_like(target_macro_class, -1)
-    if target_strategy is None:
-        target_strategy = torch.full_like(target_macro_class, -1)
+    if target_action_face is None:
+        target_action_face = torch.full_like(target_macro_class, -1)
 
     is_chosen_raw = batch.get("is_chosen")
     if is_chosen_raw is not None:
@@ -231,14 +205,12 @@ def planner_validation_step(
         point_mask=point_mask,
         axis_visible=axis_visible,
         global_process_state=global_process_state,
-        target_node_mask=target_node_mask,
+        action_face_mask=action_face_mask,
         macro_class_mask=macro_class_mask,
         tool_choice_mask=tool_choice_mask,
-        strategy_mask=strategy_mask,
         target_macro_class=target_macro_class,
         target_tool_choice=target_tool_choice,
-        target_strategy=target_strategy.clamp_min(0),
-        target_node_id=target_target_node.clamp_min(0),
+        target_action_face=target_action_face.clamp_min(0),
         use_teacher_forcing_action=True,
         run_transition=True,
     )
@@ -248,37 +220,31 @@ def planner_validation_step(
         loss = process_planning_loss(
             pred_macro_class_logits=outputs["macro_class_logits"][idx],
             target_macro_class=target_macro_class[idx],
-            pred_target_node_logits=outputs["target_node_logits"][idx],
-            target_target_node=target_target_node[idx],
+            pred_action_face_logits=outputs["action_face_logits"][idx],
+            target_action_face=target_action_face[idx],
             pred_tool_choice_logits=outputs["tool_choice_logits"][idx],
             target_tool_choice=target_tool_choice[idx],
-            pred_strategy_logits=outputs["strategy_logits"][idx],
-            target_strategy=target_strategy[idx],
-            target_node_valid=target_node_valid[idx] if target_node_valid is not None else None,
+            action_face_valid=action_face_valid[idx] if action_face_valid is not None else None,
             tool_choice_valid=tool_choice_valid[idx] if tool_choice_valid is not None else None,
-            strategy_valid=strategy_valid[idx] if strategy_valid is not None else None,
             macro_class_weight=macro_class_loss_weight,
-            target_node_weight=target_node_loss_weight,
+            action_face_weight=action_face_loss_weight,
             tool_choice_weight=tool_choice_loss_weight,
-            strategy_weight=strategy_loss_weight,
         )
+    elif is_chosen is not None:
+        loss = torch.zeros((), device=device, dtype=state_points.dtype)
     else:
         loss = process_planning_loss(
             pred_macro_class_logits=outputs["macro_class_logits"],
             target_macro_class=target_macro_class,
-            pred_target_node_logits=outputs["target_node_logits"],
-            target_target_node=target_target_node,
+            pred_action_face_logits=outputs["action_face_logits"],
+            target_action_face=target_action_face,
             pred_tool_choice_logits=outputs["tool_choice_logits"],
             target_tool_choice=target_tool_choice,
-            pred_strategy_logits=outputs["strategy_logits"],
-            target_strategy=target_strategy,
-            target_node_valid=target_node_valid,
+            action_face_valid=action_face_valid,
             tool_choice_valid=tool_choice_valid,
-            strategy_valid=strategy_valid,
             macro_class_weight=macro_class_loss_weight,
-            target_node_weight=target_node_loss_weight,
+            action_face_weight=action_face_loss_weight,
             tool_choice_weight=tool_choice_loss_weight,
-            strategy_weight=strategy_loss_weight,
         )
 
     if "next_node_sdf" in batch and transition_loss_weight > 0.0:

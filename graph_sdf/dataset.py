@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from .schema import TOOL_CHOICE_TO_ID, strategy_id_from_macro_class_id, tool_choice_key
+from .schema import TOOL_CHOICE_TO_ID, tool_choice_key
 
 
 class ProcessSkeletonParquetDataset(Dataset):
@@ -45,6 +45,15 @@ class ProcessSkeletonParquetDataset(Dataset):
         if arr.size == 0:
             return np.zeros(default_shape, dtype=dtype)
         return arr
+
+    @staticmethod
+    def _fit_global_process_state(value, target_dim: int = 11) -> np.ndarray:
+        """Pads or truncates process-history vectors for schema compatibility."""
+        arr = np.asarray(value, dtype=np.float32).reshape(-1)
+        out = np.zeros((target_dim,), dtype=np.float32)
+        count = min(len(arr), target_dim)
+        out[:count] = arr[:count]
+        return out
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         """Converts one dataframe row into the training batch schema."""
@@ -92,12 +101,25 @@ class ProcessSkeletonParquetDataset(Dataset):
         if tool_choice_valid is None or (isinstance(tool_choice_valid, float) and np.isnan(tool_choice_valid)):
             tool_choice_valid = 1 if int(tool_choice_id) >= 0 else 0
 
-        strategy_id = row["strategy_id"] if "strategy_id" in row.index else None
-        if strategy_id is None or (isinstance(strategy_id, float) and np.isnan(strategy_id)):
-            strategy_id = strategy_id_from_macro_class_id(int(row["macro_class_id"]))
-        strategy_valid = row["strategy_valid"] if "strategy_valid" in row.index else None
-        if strategy_valid is None or (isinstance(strategy_valid, float) and np.isnan(strategy_valid)):
-            strategy_valid = 1
+        action_face_id = None
+        if "action_face_id" in row.index:
+            action_face_id = row["action_face_id"]
+        elif "target_node_id" in row.index:
+            action_face_id = row["target_node_id"]
+        elif "target_face_id" in row.index:
+            action_face_id = row["target_face_id"]
+        elif "anchor_face_id" in row.index:
+            action_face_id = row["anchor_face_id"]
+        if action_face_id is None or (isinstance(action_face_id, float) and np.isnan(action_face_id)):
+            action_face_id = -1
+
+        action_face_valid = row["action_face_valid"] if "action_face_valid" in row.index else None
+        if action_face_valid is None or (isinstance(action_face_valid, float) and np.isnan(action_face_valid)):
+            legacy_valid = row["target_node_valid"] if "target_node_valid" in row.index else None
+            if legacy_valid is None or (isinstance(legacy_valid, float) and np.isnan(legacy_valid)):
+                action_face_valid = 1 if int(action_face_id) >= 0 else 0
+            else:
+                action_face_valid = legacy_valid
 
         batch = {
             "state_points": torch.from_numpy(state_points),
@@ -107,11 +129,9 @@ class ProcessSkeletonParquetDataset(Dataset):
             "point_mask": torch.from_numpy(self._array(row["point_mask"], np.int16).astype(np.bool_)),
             "macro_class_id": torch.tensor(int(row["macro_class_id"]), dtype=torch.long),
             "tool_choice_id": torch.tensor(int(max(int(tool_choice_id), 0)), dtype=torch.long),
-            "strategy_id": torch.tensor(int(max(int(strategy_id), 0)), dtype=torch.long),
-            "target_node_id": torch.tensor(int(row["target_node_id"]), dtype=torch.long),
-            "target_node_valid": torch.tensor(int(row["target_node_valid"]), dtype=torch.float32),
+            "action_face_id": torch.tensor(int(action_face_id), dtype=torch.long),
+            "action_face_valid": torch.tensor(int(action_face_valid), dtype=torch.float32),
             "tool_choice_valid": torch.tensor(int(tool_choice_valid), dtype=torch.float32),
-            "strategy_valid": torch.tensor(int(strategy_valid), dtype=torch.float32),
         }
         if next_point_sdf is not None:
             batch["next_point_sdf"] = torch.from_numpy(next_point_sdf)
@@ -121,10 +141,14 @@ class ProcessSkeletonParquetDataset(Dataset):
 
         if "global_process_state" in row.index:
             batch["global_process_state"] = torch.from_numpy(
-                self._array(row["global_process_state"], np.float32)
+                self._fit_global_process_state(row["global_process_state"], target_dim=11)
             )
-        if "target_node_mask" in row.index:
-            batch["target_node_mask"] = torch.from_numpy(
+        if "action_face_mask" in row.index:
+            batch["action_face_mask"] = torch.from_numpy(
+                self._array(row["action_face_mask"], np.int16).astype(np.bool_)
+            )
+        elif "target_node_mask" in row.index:
+            batch["action_face_mask"] = torch.from_numpy(
                 self._array(row["target_node_mask"], np.int16).astype(np.bool_)
             )
         if "macro_class_mask" in row.index:
@@ -135,11 +159,6 @@ class ProcessSkeletonParquetDataset(Dataset):
             batch["tool_choice_mask"] = torch.from_numpy(
                 self._array(row["tool_choice_mask"], np.int16).astype(np.bool_)
             )
-        if "strategy_mask" in row.index:
-            batch["strategy_mask"] = torch.from_numpy(
-                self._array(row["strategy_mask"], np.int16).astype(np.bool_)
-            )
-
         if "centrality_512" in row.index:
             node_centrality = torch.from_numpy(self._array(row["centrality_512"], np.int16))
             batch["centrality_512"] = node_centrality

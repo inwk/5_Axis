@@ -40,7 +40,6 @@ class ProcessPlannerHead(nn.Module):
         )
         self.macro_class_head = nn.Linear(hidden, config.macro_class_count)
         self.tool_choice_head = nn.Linear(hidden, config.tool_choice_count)
-        self.strategy_head = nn.Linear(hidden, config.strategy_count)
 
         self.node_selector = nn.Sequential(
             nn.Linear(hidden * 2, hidden),
@@ -53,12 +52,11 @@ class ProcessPlannerHead(nn.Module):
         state_embedding: torch.Tensor,
         node_mask: Optional[torch.Tensor] = None,
         global_process_state: Optional[torch.Tensor] = None,
-        target_node_mask: Optional[torch.Tensor] = None,
+        action_face_mask: Optional[torch.Tensor] = None,
         macro_class_mask: Optional[torch.Tensor] = None,
         tool_choice_mask: Optional[torch.Tensor] = None,
-        strategy_mask: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
-        """Produces macro class, target node, tool choice, and strategy logits."""
+        """Produces macro class, action-face, and tool-choice logits."""
 
         pooled_state = _masked_mean_pool(state_embedding, node_mask)
         global_hidden = self.global_trunk(pooled_state)
@@ -73,27 +71,23 @@ class ProcessPlannerHead(nn.Module):
         node_count = state_embedding.shape[1]
         repeated_global = global_hidden[:, None, :].expand(-1, node_count, -1)
         selector_input = torch.cat([state_embedding, repeated_global], dim=-1)
-        target_node_logits = self.node_selector(selector_input).squeeze(-1)
+        action_face_logits = self.node_selector(selector_input).squeeze(-1)
 
         if node_mask is not None:
-            target_node_logits = target_node_logits.masked_fill(node_mask, -1e9)
-        if target_node_mask is not None:
-            target_node_logits = target_node_logits.masked_fill(target_node_mask, -1e9)
+            action_face_logits = action_face_logits.masked_fill(node_mask, -1e9)
+        if action_face_mask is not None:
+            action_face_logits = action_face_logits.masked_fill(action_face_mask, -1e9)
 
         macro_class_logits = self.macro_class_head(global_hidden)
         tool_choice_logits = self.tool_choice_head(global_hidden)
-        strategy_logits = self.strategy_head(global_hidden)
         if macro_class_mask is not None:
             macro_class_logits = macro_class_logits.masked_fill(macro_class_mask, -1e9)
         if tool_choice_mask is not None:
             tool_choice_logits = tool_choice_logits.masked_fill(tool_choice_mask, -1e9)
-        if strategy_mask is not None:
-            strategy_logits = strategy_logits.masked_fill(strategy_mask, -1e9)
 
         return {
             "macro_class_logits": macro_class_logits,
             "tool_choice_logits": tool_choice_logits,
-            "strategy_logits": strategy_logits,
-            "target_node_logits": target_node_logits,
+            "action_face_logits": action_face_logits,
             "global_feature": global_hidden,
         }

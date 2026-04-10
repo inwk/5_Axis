@@ -1,0 +1,23 @@
+name: ai_cam_5axis
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - networkx
+  - pyarrow
+  - tqdm
+  - trimesh
+  - pyvista
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - pip:
+      - pyvistaqt

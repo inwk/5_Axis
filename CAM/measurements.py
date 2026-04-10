@@ -39,18 +39,15 @@ def calculate_distance_to_body_from_point(point, line, body, norm_vecs):
     #point3d = point.Coordinates
     #nx_point = work_part.Points.CreatePoint(point3d)
     #measure_manager = work_part.MeasureManager
-    try:
-        distance1, pt1_1, pt2_1, isapproximate1 = theSession.Measurement.GetDistance(NXOpen.Measurement.AlternateDistance.Minimum, False, [line], [body])
-        distance2, pt3_1, pt4_1, isapproximate2 = theSession.Measurement.GetDistance(NXOpen.Measurement.AlternateDistance.Minimum, False, [point], [body])
-        pt = [point.Coordinates.X - norm_vecs.Vector.X * 0.1,point.Coordinates.Y- norm_vecs.Vector.Y * 0.1,point.Coordinates.Z - norm_vecs.Vector.Z * 0.1]  # small offset to stabilize roughing measurements
-        vec2 = np.subtract([pt4_1.X,pt4_1.Y, pt4_1.Z],pt)
-        vec1 = [norm_vecs.Vector.X,norm_vecs.Vector.Y,norm_vecs.Vector.Z]
-        if np.dot(vec1, vec2)<0:
-            dist = math.sqrt((point.Coordinates.X-pt1_1.X)**2 + (point.Coordinates.Y-pt1_1.Y)**2 + (point.Coordinates.Z-pt1_1.Z)**2)
-        else:
-            dist = distance2
-    except:
-        dist = 0.0
+    distance1, pt1_1, pt2_1, isapproximate1 = theSession.Measurement.GetDistance(NXOpen.Measurement.AlternateDistance.Minimum, False, [line], [body])
+    distance2, pt3_1, pt4_1, isapproximate2 = theSession.Measurement.GetDistance(NXOpen.Measurement.AlternateDistance.Minimum, False, [point], [body])
+    pt = [point.Coordinates.X - norm_vecs.Vector.X * 0.1,point.Coordinates.Y- norm_vecs.Vector.Y * 0.1,point.Coordinates.Z - norm_vecs.Vector.Z * 0.1]  # small offset to stabilize roughing measurements
+    vec2 = np.subtract([pt4_1.X,pt4_1.Y, pt4_1.Z],pt)
+    vec1 = [norm_vecs.Vector.X,norm_vecs.Vector.Y,norm_vecs.Vector.Z]
+    if np.dot(vec1, vec2)<0:
+        dist = math.sqrt((point.Coordinates.X-pt1_1.X)**2 + (point.Coordinates.Y-pt1_1.Y)**2 + (point.Coordinates.Z-pt1_1.Z)**2)
+    else:
+        dist = distance2
 
     #unit = theSession.Parts.Work.UnitCollection.FindObject("MilliMeter")
     #measure_type = NXOpen.MeasureManager.MeasureType.Minimum
@@ -345,10 +342,7 @@ def getVolume(body):
     """Performs: get volume."""
     theUfSession = NXOpen.UF.UFSession.GetUFSession()
     theBodyTag = [body.Tag]
-    try:
-        (massProps, Stats) = theUfSession.Modeling.AskMassProps3d(theBodyTag, len(theBodyTag), 1, 3, .03, 1, [0.99,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0])
-    except:
-        (massProps, Stats) = theUfSession.Modeling.AskMassProps3d(theBodyTag, len(theBodyTag), 3, 3, .03, 1, [0.99,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0])
+    (massProps, Stats) = theUfSession.Modeling.AskMassProps3d(theBodyTag, len(theBodyTag), 1, 3, .03, 1, [0.99,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0])
     volume = massProps[1]
     return volume
 
@@ -394,16 +388,13 @@ def get_pointwise_deviation_per_face(ipw, points_array, norm_vecs_array, lines_a
         values = np.zeros((count,), dtype=np.float32)
 
         for idx in range(count):
-            try:
-                dist = calculate_distance_to_body_from_point(
-                    face_points[idx],
-                    face_lines[idx],
-                    ipw_body,
-                    face_norms[idx],
-                )
-                values[idx] = float(dist)
-            except Exception:
-                values[idx] = 0.0
+            dist = calculate_distance_to_body_from_point(
+                face_points[idx],
+                face_lines[idx],
+                ipw_body,
+                face_norms[idx],
+            )
+            values[idx] = float(dist)
 
         pointwise_per_face.append(values)
 

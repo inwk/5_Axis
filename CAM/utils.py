@@ -138,43 +138,40 @@ def create_tool(session, work_part, tool_diameter, tool_type, tool_list):
     """Performs: create tool."""
     tool_name = f"{tool_type}_{tool_diameter}PI"
     nCGroup = work_part.CAMSetup.CAMGroupCollection.FindObject("GENERIC_MACHINE")
-    try:
-        if (tool_name in tool_list):
-            tool_list.append(tool_name)
-            return
-        if tool_type == "STD_DRILL":
-            tool = work_part.CAMSetup.CAMGroupCollection.CreateTool(nCGroup, "hole_making", tool_type, NXOpen.CAM.NCGroupCollection.UseDefaultName.FalseValue, tool_name)
-            ToolBuilder = work_part.CAMSetup.CAMGroupCollection.CreateDrillStdToolBuilder(tool)
-        else:
-            tool = work_part.CAMSetup.CAMGroupCollection.CreateTool(nCGroup, "mill_contour", tool_type, NXOpen.CAM.NCGroupCollection.UseDefaultName.FalseValue, tool_name)
-            ToolBuilder = work_part.CAMSetup.CAMGroupCollection.CreateMillToolBuilder(tool)
-
-        ToolBuilder.TlDiameterBuilder.Value = float(tool_diameter)
-        ###
-        if tool_diameter >= 12:
-
-            ToolBuilder.TlHeightBuilder.Value = tool_diameter * 4
-            ToolBuilder.TlFluteLnBuilder.Value = tool_diameter * 2
-
-            # lower_diameter = 50.0
-            # holder_length = 120.0
-            # taper_angle = 0.0
-            # _ = ToolBuilder.HolderSectionBuilder.Add(0, lower_diameter, holder_length, taper_angle, 0.0)
-        else:
-            ToolBuilder.TlHeightBuilder.Value = tool_diameter * 6
-            ToolBuilder.TlFluteLnBuilder.Value = tool_diameter * 3
-
-            # lower_diameter = 32.0
-            # holder_length = 150.0
-            # taper_angle = 1.5275
-            # _ = ToolBuilder.HolderSectionBuilder.Add(0, lower_diameter, holder_length, taper_angle, 0.0)
-
-        ###
-        ToolBuilder.Commit()
-        ToolBuilder.Destroy()
+    if tool_name in tool_list:
         tool_list.append(tool_name)
-    except:
-        pass
+        return
+    if tool_type == "STD_DRILL":
+        tool = work_part.CAMSetup.CAMGroupCollection.CreateTool(nCGroup, "hole_making", tool_type, NXOpen.CAM.NCGroupCollection.UseDefaultName.FalseValue, tool_name)
+        ToolBuilder = work_part.CAMSetup.CAMGroupCollection.CreateDrillStdToolBuilder(tool)
+    else:
+        tool = work_part.CAMSetup.CAMGroupCollection.CreateTool(nCGroup, "mill_contour", tool_type, NXOpen.CAM.NCGroupCollection.UseDefaultName.FalseValue, tool_name)
+        ToolBuilder = work_part.CAMSetup.CAMGroupCollection.CreateMillToolBuilder(tool)
+
+    ToolBuilder.TlDiameterBuilder.Value = float(tool_diameter)
+    ###
+    if tool_diameter >= 12:
+
+        ToolBuilder.TlHeightBuilder.Value = tool_diameter * 4
+        ToolBuilder.TlFluteLnBuilder.Value = tool_diameter * 2
+
+        # lower_diameter = 50.0
+        # holder_length = 120.0
+        # taper_angle = 0.0
+        # _ = ToolBuilder.HolderSectionBuilder.Add(0, lower_diameter, holder_length, taper_angle, 0.0)
+    else:
+        ToolBuilder.TlHeightBuilder.Value = tool_diameter * 6
+        ToolBuilder.TlFluteLnBuilder.Value = tool_diameter * 3
+
+        # lower_diameter = 32.0
+        # holder_length = 150.0
+        # taper_angle = 1.5275
+        # _ = ToolBuilder.HolderSectionBuilder.Add(0, lower_diameter, holder_length, taper_angle, 0.0)
+
+    ###
+    ToolBuilder.Commit()
+    ToolBuilder.Destroy()
+    tool_list.append(tool_name)
 
 def rotate_vector(rot, vector):
     """Performs: rotate vector."""
@@ -845,4 +842,3 @@ def identify_visible_faces(body, direction):
 def get_face_point_cloud(faces):
     """Returns area and 100-point cloud samples per face."""
     return getPointCloud(faces)
-

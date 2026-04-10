@@ -37,26 +37,22 @@ def masked_huber_loss(
 def process_planning_loss(
     pred_macro_class_logits: torch.Tensor,
     target_macro_class: torch.Tensor,
-    pred_target_node_logits: torch.Tensor,
-    target_target_node: torch.Tensor,
+    pred_action_face_logits: torch.Tensor,
+    target_action_face: torch.Tensor,
     pred_tool_choice_logits: torch.Tensor,
     target_tool_choice: torch.Tensor,
-    pred_strategy_logits: Optional[torch.Tensor] = None,
-    target_strategy: Optional[torch.Tensor] = None,
-    target_node_valid: Optional[torch.Tensor] = None,
+    action_face_valid: Optional[torch.Tensor] = None,
     tool_choice_valid: Optional[torch.Tensor] = None,
-    strategy_valid: Optional[torch.Tensor] = None,
     macro_class_weight: float = 1.0,
-    target_node_weight: float = 1.0,
+    action_face_weight: float = 1.0,
     tool_choice_weight: float = 1.0,
-    strategy_weight: float = 0.25,
 ) -> torch.Tensor:
     """Combines classification losses for planner heads."""
     macro_class_loss = masked_classification_ce(pred_macro_class_logits, target_macro_class)
-    target_node_loss = masked_classification_ce(
-        pred_target_node_logits,
-        target_target_node,
-        valid_mask=target_node_valid,
+    action_face_loss = masked_classification_ce(
+        pred_action_face_logits,
+        target_action_face,
+        valid_mask=action_face_valid,
         ignore_index=-1,
     )
     tool_choice_loss = masked_classification_ce(
@@ -67,17 +63,9 @@ def process_planning_loss(
     )
     total_loss = (
         macro_class_weight * macro_class_loss
-        + target_node_weight * target_node_loss
+        + action_face_weight * action_face_loss
         + tool_choice_weight * tool_choice_loss
     )
-    if pred_strategy_logits is not None and target_strategy is not None and strategy_weight > 0.0:
-        strategy_loss = masked_classification_ce(
-            pred_strategy_logits,
-            target_strategy,
-            valid_mask=strategy_valid,
-            ignore_index=-1,
-        )
-        total_loss = total_loss + strategy_weight * strategy_loss
     return total_loss
 
 
