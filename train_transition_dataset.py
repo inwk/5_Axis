@@ -24,7 +24,8 @@ from graph_sdf.training import transition_train_step, transition_validation_step
 # User config: edit these directly in VSCode.
 # ---------------------------------------------------------------------------
 PARQUET_DIR = r""
-PARQUET_GLOB = "*.parquet"
+# Use "**/*.parquet" to include run subdirectories under PARQUET_DIR.
+PARQUET_GLOB = "**/*.parquet"
 EXPLICIT_PARQUET_PATHS: list[str] = []
 
 VAL_RATIO = 0.2
@@ -39,6 +40,8 @@ PRINT_EVERY = 1
 # For batched training this should stay fixed and positive.
 OCTREE_QUERY_NODES = 2048
 OCTREE_POS_WEIGHT_FACTOR = 2.0
+OCTREE_DEPTH_WEIGHT_BASE = 2.0
+MONOTONICITY_WEIGHT = 0.1
 
 SAVE_CHECKPOINTS = True
 CHECKPOINT_ROOT = r"C:\Users\inwoo\Desktop\5_Axis\checkpoints_transition"
@@ -240,6 +243,8 @@ def main() -> None:
                 "learning_rate": LEARNING_RATE,
                 "octree_query_nodes": int(OCTREE_QUERY_NODES),
                 "octree_pos_weight_factor": OCTREE_POS_WEIGHT_FACTOR,
+                "octree_depth_weight_base": OCTREE_DEPTH_WEIGHT_BASE,
+                "monotonicity_weight": MONOTONICITY_WEIGHT,
                 "model_config": asdict(model_cfg),
                 "train_rows": len(train_indices),
                 "val_rows": len(val_indices),
@@ -250,6 +255,11 @@ def main() -> None:
     print(f"[Files] {len(parquet_files)} parquet files")
     print(f"[Rows] total_valid={len(valid_indices)} train={len(train_indices)} val={len(val_indices)}")
     print(f"[Train] epochs={NUM_EPOCHS} lr={LEARNING_RATE} batch={BATCH_SIZE} octree_query_nodes={OCTREE_QUERY_NODES}")
+    print(
+        f"[Loss] pos_weight={OCTREE_POS_WEIGHT_FACTOR} "
+        f"depth_weight_base={OCTREE_DEPTH_WEIGHT_BASE} "
+        f"monotonicity_weight={MONOTONICITY_WEIGHT}"
+    )
     print(f"[Train Macro Dist] { _macro_distribution(base_dataset, train_indices) }")
     print(f"[Val Macro Dist] { _macro_distribution(base_dataset, val_indices) }")
     if run_dir is not None:
@@ -267,6 +277,8 @@ def main() -> None:
                 optimizer,
                 device,
                 octree_pos_weight_factor=OCTREE_POS_WEIGHT_FACTOR,
+                octree_depth_weight_base=OCTREE_DEPTH_WEIGHT_BASE,
+                monotonicity_weight=MONOTONICITY_WEIGHT,
             )
             train_losses.append(loss)
 
@@ -276,6 +288,8 @@ def main() -> None:
                 batch,
                 device,
                 octree_pos_weight_factor=OCTREE_POS_WEIGHT_FACTOR,
+                octree_depth_weight_base=OCTREE_DEPTH_WEIGHT_BASE,
+                monotonicity_weight=MONOTONICITY_WEIGHT,
             )
             for batch in val_loader
         ]
