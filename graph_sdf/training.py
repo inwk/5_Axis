@@ -4,8 +4,61 @@ from __future__ import annotations
 
 import torch
 
-from .losses import occupancy_bce_loss, process_planning_loss
+from .losses import (
+    monotonicity_occupancy_loss,
+    occupancy_bce_loss,
+    octree_bce_loss,
+    process_planning_loss,
+)
 from .model import GraphSdfPlanningModel
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMA-based loss scale balancer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EMALossBalancer:
+    """Tracks the exponential moving average of each named loss to produce
+    per-loss normalisation scales.
+
+    Each loss is divided by its EMA before being summed, so all losses
+    contribute with roughly equal gradient magnitude regardless of their
+    absolute scale.  The user-supplied weights then set the desired *ratio*
+    between terms rather than fighting against raw magnitude differences.
+
+    Example::
+
+        balancer = EMALossBalancer(momentum=0.99)
+        # inside train loop:
+        sp = balancer.scale("planner", float(planner_loss))
+        so = balancer.scale("octree",  float(octree_loss))
+        loss = sp * planner_loss + octree_weight * so * octree_loss
+
+    Args:
+        momentum:  EMA decay (0.99 → slow-adapting, 0.9 → fast-adapting).
+        eps:       Numerical floor to avoid division by zero.
+    """
+
+    def __init__(self, momentum: float = 0.99, eps: float = 1e-6) -> None:
+        self._ema: dict[str, float] = {}
+        self._momentum = float(momentum)
+        self._eps = float(eps)
+
+    def scale(self, name: str, value: float) -> float:
+        """Updates the EMA for *name* and returns ``1 / EMA(name)``."""
+        value = max(abs(float(value)), self._eps)
+        if name not in self._ema:
+            self._ema[name] = value
+        else:
+            self._ema[name] = (
+                self._momentum * self._ema[name]
+                + (1.0 - self._momentum) * value
+            )
+        return 1.0 / (self._ema[name] + self._eps)
+
+    def ema_values(self) -> dict[str, float]:
+        """Returns a snapshot of all current EMA values (for logging)."""
+        return dict(self._ema)
 
 
 def _to_device(optional_tensor, device: torch.device):
@@ -135,8 +188,19 @@ def _compute_octree_loss(
     device: torch.device,
     octree_loss_weight: float,
     octree_pos_weight_factor: float,
+    octree_depth_weight_base: float = 2.0,
+    monotonicity_weight: float = 0.1,
 ) -> torch.Tensor:
-    """Computes octree occupancy BCE for all transition rows in the batch."""
+    """Computes octree occupancy loss (depth-weighted BCE + optional monotonicity).
+
+    Adds two terms when the data is available:
+    1. ``octree_bce_loss``: depth-weighted BCE — finer octree cells get higher
+       gradient weight because they carry more surface detail.
+    2. ``monotonicity_occupancy_loss`` (scaled by *monotonicity_weight*): soft
+       penalty that discourages predicting occupied material in cells that were
+       already empty *before* the operation (material cannot be added back).
+       Requires ``octree_occ_labels_before`` in the batch.
+    """
     if octree_loss_weight <= 0.0:
         return torch.zeros((), device=device, dtype=inputs["state_points"].dtype)
     if model.octree_decoder is None:
@@ -164,11 +228,27 @@ def _compute_octree_loss(
         point_mask=inputs["point_mask"],
         state_embedding=outputs.get("state_embedding"),
     )
-    return occupancy_bce_loss(
-        occ_logits=octree_outputs["occ_logits"],
+    occ_logits = octree_outputs["occ_logits"]
+
+    # ── 1. Depth-weighted BCE ─────────────────────────────────────────────
+    bce = octree_bce_loss(
+        occ_logits=occ_logits,
         occ_labels=octree_labels,
+        octree_depths=octree_depths,
         pos_weight_factor=octree_pos_weight_factor,
+        depth_weight_base=octree_depth_weight_base,
     )
+
+    # ── 2. Monotonicity penalty (soft: already-empty cells must stay empty) ─
+    mono = torch.zeros((), device=device, dtype=occ_logits.dtype)
+    if monotonicity_weight > 0.0 and "octree_occ_labels_before" in batch:
+        labels_before = batch["octree_occ_labels_before"].to(device)
+        mono = monotonicity_occupancy_loss(
+            occ_logits=occ_logits,
+            occ_labels_before=labels_before,
+        )
+
+    return bce + monotonicity_weight * mono
 
 
 def _compute_transition_only_octree_loss(
@@ -177,8 +257,13 @@ def _compute_transition_only_octree_loss(
     inputs: dict,
     device: torch.device,
     octree_pos_weight_factor: float,
+    octree_depth_weight_base: float = 2.0,
+    monotonicity_weight: float = 0.1,
 ) -> torch.Tensor:
-    """Computes octree occupancy BCE with action labels as inputs and no planner path."""
+    """Computes octree occupancy loss with action labels as inputs and no planner path.
+
+    Uses depth-weighted BCE + optional monotonicity penalty.
+    """
     if model.octree_decoder is None:
         raise RuntimeError("Transition-only training requires model.octree_decoder to be enabled.")
     if "octree_centers" not in batch or "octree_depths" not in batch or "octree_occ_labels" not in batch:
@@ -187,6 +272,7 @@ def _compute_transition_only_octree_loss(
             "'octree_centers', 'octree_depths', and 'octree_occ_labels'."
         )
 
+    octree_depths = batch["octree_depths"].to(device)
     state_embedding = _encode_state_only(model, inputs)
     octree_outputs = model.forward_octree(
         state_points=inputs["state_points"],
@@ -194,7 +280,7 @@ def _compute_transition_only_octree_loss(
         tool_choice_id=inputs["target_tool_choice"],
         action_face_id=inputs["target_action_face"].clamp_min(0),
         octree_centers=batch["octree_centers"].to(device),
-        octree_depths=batch["octree_depths"].to(device),
+        octree_depths=octree_depths,
         axis_visible=inputs["axis_visible"],
         node_process_state=inputs["node_process_state"],
         node_centrality=inputs["node_centrality"],
@@ -204,11 +290,26 @@ def _compute_transition_only_octree_loss(
         point_mask=inputs["point_mask"],
         state_embedding=state_embedding,
     )
-    return occupancy_bce_loss(
-        occ_logits=octree_outputs["occ_logits"],
+    occ_logits = octree_outputs["occ_logits"]
+
+    # ── 1. Depth-weighted BCE ─────────────────────────────────────────────
+    bce = octree_bce_loss(
+        occ_logits=occ_logits,
         occ_labels=batch["octree_occ_labels"].to(device),
+        octree_depths=octree_depths,
         pos_weight_factor=octree_pos_weight_factor,
+        depth_weight_base=octree_depth_weight_base,
     )
+
+    # ── 2. Monotonicity penalty ───────────────────────────────────────────
+    mono = torch.zeros((), device=device, dtype=occ_logits.dtype)
+    if monotonicity_weight > 0.0 and "octree_occ_labels_before" in batch:
+        mono = monotonicity_occupancy_loss(
+            occ_logits=occ_logits,
+            occ_labels_before=batch["octree_occ_labels_before"].to(device),
+        )
+
+    return bce + monotonicity_weight * mono
 
 
 def planner_train_step(
@@ -224,10 +325,24 @@ def planner_train_step(
     changed_mask_loss_weight: float = 0.0,
     octree_loss_weight: float = 1.0,
     octree_pos_weight_factor: float = 2.0,
+    octree_depth_weight_base: float = 2.0,
+    monotonicity_weight: float = 0.1,
     occupancy_loss_weight: float | None = None,
     occ_pos_weight_factor: float | None = None,
+    balancer: "EMALossBalancer | None" = None,
 ) -> float:
-    """Runs one optimizer step for planner plus octree-only transition learning."""
+    """Runs one optimizer step for planner plus octree-only transition learning.
+
+    Args:
+        octree_depth_weight_base: Exponential base for per-cell depth weighting in
+            the octree BCE loss.  ``2.0`` doubles the weight per octree level.
+        monotonicity_weight: Scale for the monotonicity penalty loss term.
+            Requires ``octree_occ_labels_before`` to be present in the batch.
+            Set to ``0.0`` to disable.
+        balancer: Optional :class:`EMALossBalancer`.  When provided, each loss is
+            divided by its running EMA scale before summation so that planner and
+            octree terms contribute with comparable gradient magnitudes.
+    """
     del transition_loss_weight, point_sdf_loss_weight, changed_mask_loss_weight
     if occupancy_loss_weight is not None:
         octree_loss_weight = occupancy_loss_weight
@@ -255,8 +370,17 @@ def planner_train_step(
         device,
         octree_loss_weight,
         octree_pos_weight_factor,
+        octree_depth_weight_base=octree_depth_weight_base,
+        monotonicity_weight=monotonicity_weight,
     )
-    loss = planner_loss + octree_loss_weight * octree_loss
+
+    # ── Loss combination with optional EMA balancing ──────────────────────
+    if balancer is not None:
+        sp = balancer.scale("planner", float(planner_loss.item()))
+        so = balancer.scale("octree",  float(octree_loss.item()))
+        loss = sp * planner_loss + octree_loss_weight * so * octree_loss
+    else:
+        loss = planner_loss + octree_loss_weight * octree_loss
 
     if not loss.requires_grad:
         return float(loss.item())
@@ -271,11 +395,18 @@ def transition_train_step(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     octree_pos_weight_factor: float = 2.0,
+    octree_depth_weight_base: float = 2.0,
+    monotonicity_weight: float = 0.1,
 ) -> float:
     """Runs one optimizer step for transition-only octree learning.
 
     This path bypasses planner heads entirely:
-        current_state + action labels + octree queries -> next occupancy
+        current_state + GT action labels + octree queries → next occupancy
+
+    Args:
+        octree_depth_weight_base: Exponential base for per-cell depth weighting.
+        monotonicity_weight: Scale for the monotonicity penalty.  Requires
+            ``octree_occ_labels_before`` in the batch; set to ``0.0`` to disable.
     """
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -287,6 +418,8 @@ def transition_train_step(
         inputs=inputs,
         device=device,
         octree_pos_weight_factor=octree_pos_weight_factor,
+        octree_depth_weight_base=octree_depth_weight_base,
+        monotonicity_weight=monotonicity_weight,
     )
     loss.backward()
     optimizer.step()
@@ -306,6 +439,8 @@ def planner_validation_step(
     changed_mask_loss_weight: float = 0.0,
     octree_loss_weight: float = 1.0,
     octree_pos_weight_factor: float = 2.0,
+    octree_depth_weight_base: float = 2.0,
+    monotonicity_weight: float = 0.1,
     occupancy_loss_weight: float | None = None,
     occ_pos_weight_factor: float | None = None,
 ) -> float:
@@ -335,6 +470,8 @@ def planner_validation_step(
         device,
         octree_loss_weight,
         octree_pos_weight_factor,
+        octree_depth_weight_base=octree_depth_weight_base,
+        monotonicity_weight=monotonicity_weight,
     )
     loss = planner_loss + octree_loss_weight * octree_loss
     return float(loss.item())
@@ -346,6 +483,8 @@ def transition_validation_step(
     batch: dict,
     device: torch.device,
     octree_pos_weight_factor: float = 2.0,
+    octree_depth_weight_base: float = 2.0,
+    monotonicity_weight: float = 0.1,
 ) -> float:
     """Computes validation loss for transition-only octree learning."""
     model.eval()
@@ -356,5 +495,7 @@ def transition_validation_step(
         inputs=inputs,
         device=device,
         octree_pos_weight_factor=octree_pos_weight_factor,
+        octree_depth_weight_base=octree_depth_weight_base,
+        monotonicity_weight=monotonicity_weight,
     )
     return float(loss.item())

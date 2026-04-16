@@ -8,6 +8,50 @@ from typing import Any, Dict, Tuple, List
 from datetime import datetime
 import argparse
 
+
+# ── NX stdout/stderr safety wrapper ──────────────────────────────────────────
+# NX replaces sys.stdout/stderr with a custom stream whose underlying Windows
+# HANDLE does not support flush().  Calling print(..., flush=True) triggers
+# sys.stdout.flush() → Windows EINVAL (OSError 22).  Wrapping the streams
+# silences that error so the script continues safely inside NX.
+class _NXSafeStream:
+    """Wraps a stream so that OSError on write() or flush() is swallowed."""
+
+    def __init__(self, stream):
+        self._s = stream
+
+    def write(self, text):
+        try:
+            return self._s.write(text)
+        except OSError:
+            return 0
+
+    def flush(self):
+        try:
+            self._s.flush()
+        except OSError:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._s, name)
+
+
+def _is_nx_stream(stream) -> bool:
+    """Returns True when the stream is NX's non-file stdout (fileno() raises)."""
+    try:
+        stream.fileno()
+        return False
+    except Exception:
+        return True
+
+
+# Wrap unconditionally — harmless for real file streams, fixes NX streams.
+if not isinstance(sys.stdout, _NXSafeStream):
+    sys.stdout = _NXSafeStream(sys.stdout)
+if not isinstance(sys.stderr, _NXSafeStream):
+    sys.stderr = _NXSafeStream(sys.stderr)
+# ─────────────────────────────────────────────────────────────────────────────
+
 import numpy as np
 import networkx as nxg
 from networkx.readwrite import json_graph
@@ -1176,7 +1220,7 @@ def simulate_single_action(
             )
             result["octree_centers_raw"] = centers_raw      # [K, 3] world mm
             result["octree_depths"] = depths                # [K] int16
-            result["octree_occ_labels"] = labels            # [K] float32
+            result["octree_occ_labels"] = labels            # [K] float32  (AFTER labels)
             result["octree_bbox_min_raw"] = bbox_min_for_octree.astype(np.float32)
             result["octree_bbox_max_raw"] = bbox_max_for_octree.astype(np.float32)
             if labels.size > 0:
@@ -1188,6 +1232,47 @@ def simulate_single_action(
                         "Check IPW membership and bbox.",
                         flush=True,
                     )
+
+            # ── Query BEFORE-state occupancy at the same cell positions ──────
+            # Creates the before-operation IPW in a nested undo mark so it does
+            # not interfere with obj_a (the after-state body still live here).
+            # The before-labels enable the monotonicity training constraint.
+            if centers_raw is not None and len(centers_raw) > 0:
+                m_bef2 = session.SetUndoMark(
+                    NXOpen.Session.MarkVisibility.Invisible, "sim_bef_occ"
+                )
+                bef2_chain_snap = list(state_chain)
+                try:
+                    obj_b_inner = create_measure_geometry_for_depth(
+                        session, work_part, prt_file_path, state_chain, origin_body,
+                        int(operation_depth), base_object_blank,
+                    )
+                    before_labels = cam_utils.query_ipw_occupancy_at_positions(
+                        session=session,
+                        work_part=work_part,
+                        object_blank=obj_b_inner,
+                        tool_name=flat_tools[0],
+                        centers_xyz=centers_raw,
+                    )
+                    result["octree_occ_labels_before"] = before_labels  # [K] float32
+                    before_ratio = float(np.mean(before_labels >= 0.5)) if before_labels.size > 0 else float("nan")
+                    after_ratio  = float(np.mean(labels >= 0.5)) if labels.size > 0 else float("nan")
+                    if before_ratio < after_ratio - 0.01:
+                        print(
+                            "[WARN] simulate_single_action: before-occ < after-occ "
+                            f"(before={before_ratio:.4f}, after={after_ratio:.4f}). "
+                            "Monotonicity violated in ground-truth — check IPW chain.",
+                            flush=True,
+                        )
+                except Exception as exc:
+                    print(
+                        f"[WARN] simulate_single_action: before-occupancy query failed: {exc}",
+                        flush=True,
+                    )
+                finally:
+                    session.UndoToMark(m_bef2, "sim_bef_occ")
+                    session.DeleteUndoMark(m_bef2, "sim_bef_occ")
+                    restore_workpiece_chain(state_chain, bef2_chain_snap)
 
     finally:
         session.UndoToMark(m_aft, "sim_meas_aft")
@@ -2167,18 +2252,22 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         octree_centers_norm: np.ndarray | None = None
         octree_depths: np.ndarray | None = None
         octree_occ_labels: np.ndarray | None = None
+        octree_occ_labels_before: np.ndarray | None = None
         octree_bbox_min_norm: np.ndarray | None = None
         octree_bbox_max_norm: np.ndarray | None = None
         if OCTREE_ENABLED:
             raw_centers = result.get("octree_centers_raw")       # [K, 3] | None
             raw_depths = result.get("octree_depths")             # [K]    | None
-            raw_labels = result.get("octree_occ_labels")         # [K]    | None
+            raw_labels = result.get("octree_occ_labels")         # [K]    | None  (after)
+            raw_labels_before = result.get("octree_occ_labels_before")  # [K] | None (before)
             if raw_centers is not None and raw_depths is not None and raw_labels is not None:
                 octree_scale = float(max(normalization_scale, 1e-6))
                 raw_c = np.asarray(raw_centers, dtype=np.float32).reshape(-1, 3)
                 octree_centers_norm = (raw_c - normalization_center_xyz.reshape(1, 3)) / octree_scale
                 octree_depths = np.asarray(raw_depths, dtype=np.int16).reshape(-1)
                 octree_occ_labels = np.asarray(raw_labels, dtype=np.float32).reshape(-1)
+                if raw_labels_before is not None:
+                    octree_occ_labels_before = np.asarray(raw_labels_before, dtype=np.float32).reshape(-1)
                 raw_bbox_min = np.asarray(result.get("octree_bbox_min_raw", raw_c.min(axis=0)), dtype=np.float32).reshape(3)
                 raw_bbox_max = np.asarray(result.get("octree_bbox_max_raw", raw_c.max(axis=0)), dtype=np.float32).reshape(3)
                 octree_bbox_min_norm = (raw_bbox_min - normalization_center_xyz) / octree_scale
@@ -2251,7 +2340,12 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             # ── Octree occupancy transition target
             "octree_centers": _to_serializable_list(octree_centers_norm.reshape(-1).astype(np.float32)) if octree_centers_norm is not None else None,
             "octree_depths": _to_serializable_list(octree_depths.astype(np.int16)) if octree_depths is not None else None,
+            # After-operation occupancy (primary training target).
             "octree_occ_labels": _to_serializable_list(octree_occ_labels.astype(np.float32)) if octree_occ_labels is not None else None,
+            # Before-operation occupancy at the same cell positions.
+            # Used for the monotonicity training constraint:
+            #   once a cell is empty (before=0) it must remain empty (after=0).
+            "octree_occ_labels_before": _to_serializable_list(octree_occ_labels_before.astype(np.float32)) if octree_occ_labels_before is not None else None,
             "octree_bbox_min": _to_serializable_list(octree_bbox_min_norm.astype(np.float32)) if octree_bbox_min_norm is not None else None,
             "octree_bbox_max": _to_serializable_list(octree_bbox_max_norm.astype(np.float32)) if octree_bbox_max_norm is not None else None,
 

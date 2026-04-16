@@ -88,8 +88,14 @@ class ProcessSkeletonParquetDataset(Dataset):
         centers: np.ndarray,
         depths: np.ndarray,
         labels: np.ndarray,
+        rng: np.random.Generator | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Samples/repeats octree leaves to a fixed K so DataLoader can batch."""
+        """Samples/repeats octree leaves to a fixed K so DataLoader can batch.
+
+        Args:
+            rng: Optional random generator.  Pass the same instance to two calls
+                 so that before- and after-labels are sampled at the same indices.
+        """
         target = self.octree_query_nodes
         if target is None:
             return centers, depths, labels
@@ -110,7 +116,8 @@ class ProcessSkeletonParquetDataset(Dataset):
                 np.zeros((target,), dtype=np.float32),
             )
 
-        rng = np.random.default_rng()
+        if rng is None:
+            rng = np.random.default_rng()
         if count > target:
             indices = rng.choice(count, size=target, replace=False)
         else:
@@ -268,14 +275,42 @@ class ProcessSkeletonParquetDataset(Dataset):
 
             count = min(centers.shape[0], labels.shape[0], depths.shape[0])
             if count > 0:
+                # Use a single seeded RNG so before- and after-labels are sampled
+                # at the same indices (required for the monotonicity constraint).
+                sample_rng = np.random.default_rng(seed=abs(int(index)) % (2 ** 31))
+
                 centers, depths, labels = self._fit_octree_sample(
                     centers[:count],
                     depths[:count].astype(np.int64),
                     labels[:count],
+                    rng=sample_rng,
                 )
                 batch["octree_centers"] = torch.from_numpy(centers)
                 batch["octree_depths"] = torch.from_numpy(depths.astype(np.int64))
                 batch["octree_occ_labels"] = torch.from_numpy(labels)
+
+                # ── Before-state occupancy labels (for monotonicity loss) ──
+                # octree_occ_labels_before[i] is the occupancy of the same octree
+                # cell as octree_occ_labels[i] *before* the current operation.
+                # Requires data collection to store this field (see collect_axis_dataset.py).
+                labels_before_raw = (
+                    row["octree_occ_labels_before"] if "octree_occ_labels_before" in row.index else None
+                )
+                if not self._is_missing(labels_before_raw):
+                    labels_before_full = self._array(labels_before_raw, np.float32).reshape(-1)
+                    bcount = min(labels_before_full.shape[0], count)
+                    if bcount > 0:
+                        # Reset the same seeded RNG → same indices as after-labels.
+                        sample_rng_b = np.random.default_rng(seed=abs(int(index)) % (2 ** 31))
+                        centers_orig = self._array(centers_raw, np.float32).reshape(-1, 3)
+                        depths_orig = self._array(depths_raw, np.int16).reshape(-1) if not self._is_missing(depths_raw) else np.full((centers_orig.shape[0],), 5, dtype=np.int16)
+                        _, _, labels_before_sampled = self._fit_octree_sample(
+                            centers_orig[:count],
+                            depths_orig[:count].astype(np.int64),
+                            labels_before_full[:count],
+                            rng=sample_rng_b,
+                        )
+                        batch["octree_occ_labels_before"] = torch.from_numpy(labels_before_sampled)
 
         bbox_min_raw = row["octree_bbox_min"] if "octree_bbox_min" in row.index else None
         bbox_max_raw = row["octree_bbox_max"] if "octree_bbox_max" in row.index else None

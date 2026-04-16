@@ -242,14 +242,14 @@ try:
     from measurements import get_deviation_per_face, get_pointwise_deviation_per_face
     from measurements import getVolume
     from measurements import convert_facet_to_body, generate_points_v2, generate_points_convergent_face
-    from measurements import get_body_axis_aligned_bbox, sample_octree_occupancy
+    from measurements import get_body_axis_aligned_bbox, sample_octree_occupancy, query_occupancy_at_positions
 except ImportError as e:
     from CAM.measurements import getFaceVector#,getConvergentFaceInfo
     from CAM.measurements import getFaceArea
     from CAM.measurements import get_deviation_per_face, get_pointwise_deviation_per_face
     from CAM.measurements import getVolume
     from CAM.measurements import convert_facet_to_body, generate_points_v2, generate_points_convergent_face
-    from CAM.measurements import get_body_axis_aligned_bbox, sample_octree_occupancy
+    from CAM.measurements import get_body_axis_aligned_bbox, sample_octree_occupancy, query_occupancy_at_positions
 def create_tool(session, work_part, tool_diameter, tool_type, tool_list):
     """Performs: create tool."""
     tool_name = f"{tool_type}_{tool_diameter}PI"
@@ -869,6 +869,82 @@ def sample_ipw_octree_state(
         return centers, depths, labels, bbox_min_use.astype(np.float32), bbox_max_use.astype(np.float32)
     finally:
         session.UndoToMark(markId, "before_octree")
+
+
+def query_ipw_occupancy_at_positions(
+    session=None,
+    work_part=None,
+    object_blank=None,
+    tool_name=None,
+    centers_xyz=None,
+):
+    """Queries occupancy at fixed 3-D positions for the IPW of *object_blank*.
+
+    Creates a temporary dummy CAM operation to extract the IPW body associated
+    with *object_blank*, then evaluates point-in-body containment at every
+    position in *centers_xyz*.  All NX objects are cleaned up via an undo mark.
+
+    This is the companion to :func:`sample_ipw_octree_state` — use it to obtain
+    *before-operation* labels at the same octree cell positions that were sampled
+    from the *after-operation* body, enabling the monotonicity training signal.
+
+    Args:
+        session:       NX session (default: current session).
+        work_part:     NX work part (default: current work part).
+        object_blank:  CAM workpiece geometry object for the *before* state.
+        tool_name:     Tool name string used to create the dummy operation.
+        centers_xyz:   ``[K, 3]`` float array of world-coordinate positions.
+
+    Returns:
+        ``[K]`` float32 occupancy labels — 1.0 inside material, 0.0 outside.
+    """
+    if session is None:
+        session = NXOpen.Session.GetSession()
+    if work_part is None:
+        work_part = session.Parts.Work
+    if object_blank is None or tool_name is None or centers_xyz is None:
+        raise ValueError("object_blank, tool_name, and centers_xyz are all required")
+
+    centers = np.asarray(centers_xyz, dtype=np.float64).reshape(-1, 3)
+    if centers.shape[0] == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    session.ApplicationSwitchImmediate("UG_APP_MANUFACTURING")
+    work_part = session.Parts.Work
+
+    markId = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "query_ipw_occ")
+    try:
+        nCGroup = work_part.CAMSetup.CAMGroupCollection.FindObject("NC_PROGRAM")
+        method  = work_part.CAMSetup.CAMGroupCollection.FindObject("METHOD")
+        tool    = work_part.CAMSetup.CAMGroupCollection.FindObject(tool_name)
+        operation = work_part.CAMSetup.CAMOperationCollection.Create(
+            nCGroup,
+            method,
+            tool,
+            object_blank,
+            "mill_contour",
+            "AREA_MILL",
+            NXOpen.CAM.OperationCollection.UseDefaultName.TrueValue,
+            "AREA_MILL",
+        )
+        ipw = operation.GetInputIpw()
+        ipw_objects = convert_facet_to_body(ipw)
+        ipw_body = ipw_objects[0]
+
+        backend = os.getenv("OCTREE_CONTAINMENT_BACKEND", "mesh").strip().lower()
+        if backend == "mesh":
+            with tempfile.TemporaryDirectory(prefix="ai_cam_qipw_") as tmp_dir:
+                obj_path = _export_nx_body_to_obj(
+                    session, ipw_body, os.path.join(tmp_dir, "ipw_before.obj")
+                )
+                ipw_mesh = _load_obj_as_trimesh(obj_path)
+                labels = _contains_points_mesh(ipw_mesh, centers)
+        else:
+            labels = query_occupancy_at_positions(ipw_body, centers)
+
+        return np.asarray(labels, dtype=np.float32).reshape(-1)
+    finally:
+        session.UndoToMark(markId, "query_ipw_occ")
 
 
 def CAMFilter(dec_input_list,dec_output_list, cycle_time_list, volume_diff_list):

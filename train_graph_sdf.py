@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 
 from graph_sdf import GraphSdfModelConfig, GraphSdfPlanningModel
 from graph_sdf.training import (
+    EMALossBalancer,
     planner_train_step,
     planner_validation_step,
     transition_train_step,
@@ -30,6 +31,16 @@ class TrainConfig:
     # Octree-only transition supervision.
     octree_loss_weight: float = 1.0
     octree_pos_weight_factor: float = 2.0
+    # Depth-weighted BCE: each octree level multiplies the cell weight by this base.
+    # 2.0 = fine cells (surface boundary) get 4× the weight of coarse cells at depth 3 vs 5.
+    # 1.0 = uniform (legacy behaviour).
+    octree_depth_weight_base: float = 2.0
+    # Monotonicity penalty: penalises predicting occupied for already-empty cells.
+    # Requires octree_occ_labels_before in the dataset.  Set 0.0 to disable.
+    monotonicity_weight: float = 0.1
+    # EMA-based gradient balancing between planner and octree losses.
+    use_loss_balancer: bool = True
+    balancer_momentum: float = 0.99
 
 
 def run_training(
@@ -41,6 +52,7 @@ def run_training(
 ) -> None:
     """Trains the process skeleton planner."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+    balancer = EMALossBalancer(momentum=config.balancer_momentum) if config.use_loss_balancer else None
 
     for epoch in range(config.epochs):
         train_losses = [
@@ -57,6 +69,9 @@ def run_training(
                 changed_mask_loss_weight=config.changed_mask_loss_weight,
                 octree_loss_weight=config.octree_loss_weight,
                 octree_pos_weight_factor=config.octree_pos_weight_factor,
+                octree_depth_weight_base=config.octree_depth_weight_base,
+                monotonicity_weight=config.monotonicity_weight,
+                balancer=balancer,
             )
             for batch in train_loader
         ]
@@ -73,13 +88,19 @@ def run_training(
                 changed_mask_loss_weight=config.changed_mask_loss_weight,
                 octree_loss_weight=config.octree_loss_weight,
                 octree_pos_weight_factor=config.octree_pos_weight_factor,
+                octree_depth_weight_base=config.octree_depth_weight_base,
+                monotonicity_weight=config.monotonicity_weight,
             )
             for batch in val_loader
         ]
 
         train_loss = sum(train_losses) / max(len(train_losses), 1)
         val_loss = sum(val_losses) / max(len(val_losses), 1)
-        print(f"[Planner+Octree][Epoch {epoch + 1}] train={train_loss:.6f} val={val_loss:.6f}")
+        ema_str = ""
+        if balancer is not None:
+            ema_vals = balancer.ema_values()
+            ema_str = "  ema=" + " ".join(f"{k}:{v:.4f}" for k, v in sorted(ema_vals.items()))
+        print(f"[Planner+Octree][Epoch {epoch + 1}] train={train_loss:.6f} val={val_loss:.6f}{ema_str}")
 
 
 def run_transition_training(
@@ -100,6 +121,8 @@ def run_transition_training(
                 optimizer,
                 device,
                 octree_pos_weight_factor=config.octree_pos_weight_factor,
+                octree_depth_weight_base=config.octree_depth_weight_base,
+                monotonicity_weight=config.monotonicity_weight,
             )
             for batch in train_loader
         ]
@@ -109,6 +132,8 @@ def run_transition_training(
                 batch,
                 device,
                 octree_pos_weight_factor=config.octree_pos_weight_factor,
+                octree_depth_weight_base=config.octree_depth_weight_base,
+                monotonicity_weight=config.monotonicity_weight,
             )
             for batch in val_loader
         ]

@@ -607,3 +607,41 @@ def sample_octree_occupancy(
         labels = labels[keep]
 
     return centers.astype(np.float32), depths.astype(np.int16), labels.astype(np.float32)
+
+
+def query_occupancy_at_positions(
+    body,
+    centers_xyz: "np.ndarray",
+    contains_points_fn=None,
+) -> "np.ndarray":
+    """Returns occupancy labels at a fixed set of 3-D positions.
+
+    Unlike :func:`sample_octree_occupancy`, this function does **not** perform
+    adaptive sampling.  It simply evaluates containment at the provided centers,
+    making it suitable for querying the *before-operation* body at exactly the
+    same positions that were sampled from the *after-operation* body.
+
+    Args:
+        body:               NX body object.  Used only when *contains_points_fn*
+                            is ``None`` (falls back to ``AskPointContainment``).
+        centers_xyz:        ``[K, 3]`` float array of world-coordinate positions.
+        contains_points_fn: Optional batched containment callable ``f(pts) → bool[K]``.
+                            When provided (e.g. a trimesh proximity function),
+                            *body* is not queried directly.
+
+    Returns:
+        ``[K]`` float32 — 1.0 = inside / on-surface material, 0.0 = outside.
+    """
+    centers = np.asarray(centers_xyz, dtype=np.float64).reshape(-1, 3)
+    K = centers.shape[0]
+    if K == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    if contains_points_fn is not None:
+        return np.asarray(contains_points_fn(centers), dtype=np.float32).reshape(-1)
+
+    labels = np.zeros((K,), dtype=np.float32)
+    for i in range(K):
+        if _is_point_inside_body_uf(body, float(centers[i, 0]), float(centers[i, 1]), float(centers[i, 2])):
+            labels[i] = 1.0
+    return labels
