@@ -106,6 +106,21 @@ def _load_obj_as_trimesh(obj_path: str) -> "trimesh.Trimesh":
         faces=np.asarray(mesh.faces, dtype=np.int64),
         process=False,
     )
+    # NX facet export can contain zero-area triangles.  These make
+    # trimesh/ray barycentric tests unstable and can explode intersection lists.
+    if mesh.faces.size:
+        tri = np.asarray(mesh.vertices, dtype=np.float64)[np.asarray(mesh.faces, dtype=np.int64)]
+        area2 = np.linalg.norm(
+            np.cross(tri[:, 1, :] - tri[:, 0, :], tri[:, 2, :] - tri[:, 0, :]),
+            axis=1,
+        )
+        valid = np.isfinite(area2) & (area2 > 1e-12)
+        if not np.all(valid):
+            mesh = trimesh.Trimesh(
+                vertices=np.asarray(mesh.vertices, dtype=np.float64),
+                faces=np.asarray(mesh.faces, dtype=np.int64)[valid],
+                process=False,
+            )
     mesh.remove_unreferenced_vertices()
     return mesh
 
@@ -138,8 +153,8 @@ def _contains_points_ray_parity(mesh: "trimesh.Trimesh", points: "np.ndarray") -
     ray_dir = np.asarray([0.5773502691896258, 0.3713906763541037, 0.7276068751089989], dtype=np.float64)
     ray_dir = ray_dir / np.linalg.norm(ray_dir)
 
-    point_chunk = 192
-    tri_chunk = 4096
+    point_chunk = max(1, int(os.getenv("OCTREE_RAY_POINT_CHUNK", "32")))
+    tri_chunk = max(1, int(os.getenv("OCTREE_RAY_TRI_CHUNK", "1024")))
     counts = np.zeros((active_points.shape[0],), dtype=np.int32)
     for point_start in range(0, active_points.shape[0], point_chunk):
         pts = active_points[point_start : point_start + point_chunk]
@@ -184,9 +199,24 @@ def _contains_points_ray_parity(mesh: "trimesh.Trimesh", points: "np.ndarray") -
 def _contains_points_mesh(mesh: "trimesh.Trimesh", points: "np.ndarray") -> "np.ndarray":
     """Returns 1.0 for points inside a mesh and 0.0 otherwise."""
     points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    mode = os.getenv("OCTREE_MESH_CONTAINS_MODE", "ray").strip().lower()
+    if mode in {"ray", "fallback", "chunked_ray"}:
+        return _contains_points_ray_parity(mesh, points).astype(np.float32)
+
+    if mode not in {"trimesh", "rtree"}:
+        raise ValueError(f"Unsupported OCTREE_MESH_CONTAINS_MODE: {mode!r}")
+
+    # trimesh.contains can be fast with rtree, but on degenerate/highly-faceted
+    # IPW meshes it may allocate huge intersection arrays.  Keep it chunked and
+    # fall back to the bounded-memory ray implementation on any memory issue.
+    chunk = max(1, int(os.getenv("OCTREE_TRIMESH_POINT_CHUNK", "128")))
+    labels = np.zeros((points.shape[0],), dtype=np.float32)
     try:
-        return np.asarray(mesh.contains(points), dtype=np.float32)
-    except (ModuleNotFoundError, ImportError):
+        for start in range(0, points.shape[0], chunk):
+            stop = min(start + chunk, points.shape[0])
+            labels[start:stop] = np.asarray(mesh.contains(points[start:stop]), dtype=np.float32)
+        return labels
+    except (MemoryError, ModuleNotFoundError, ImportError, ValueError):
         return _contains_points_ray_parity(mesh, points).astype(np.float32)
 
 # Use get_raster_points.cache_clear() to clear the cache
