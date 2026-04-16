@@ -27,13 +27,33 @@ from CAM import session as cam_session
 from CAM import geometry, operations
 from CAM import utils as cam_utils
 
-from CAM.measurements import get_body_volume, sample_convergent_face_points, sample_face_points
+from CAM.measurements import (
+    create_line_with_point_and_vector,
+    get_body_volume,
+    sample_convergent_face_points,
+    sample_face_points,
+)
 
 
 def save_part(session, work_part, directory):
     work_part = session.Parts.Work
     savePart = work_part.SaveAs(directory)
     savePart.Dispose()
+
+def export_body_to_obj(session, work_part, body, output_path: str) -> str:
+    """Exports an NX body as an OBJ mesh for non-NX visualization overlays."""
+    output_path = os.path.abspath(output_path)
+    _ensure_dir(os.path.dirname(output_path))
+    obj_creator = session.DexManager.CreateWavefrontObjCreator()
+    obj_creator.ExportSelectionBlock.SelectionScope = NXOpen.ObjectSelector.Scope.SelectedObjects
+    obj_creator.AngularTolerance = 17.999999999999996
+    obj_creator.FlattenAssemblyStructure = True
+    obj_creator.ExportSelectionBlock.SelectionComp.Add(body)
+    obj_creator.OutputFile = output_path
+    obj_creator.FileSaveFlag = False
+    obj_creator.Commit()
+    obj_creator.Destroy()
+    return output_path
 
 def serialize_graph_to_node_link(G: nxg.Graph) -> dict:
     """Serializes a NetworkX graph into node-link JSON format."""
@@ -53,6 +73,10 @@ def _np_save(path: str, arr: np.ndarray) -> None:
     """Performs: np save."""
     _ensure_dir(os.path.dirname(path))
     np.save(path, arr)
+
+def _safe_filename(text: str) -> str:
+    """Returns a filesystem-safe filename fragment."""
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(text))
 
 def _vector_norm(v) -> float:
     """Performs: norm."""
@@ -92,11 +116,11 @@ def _is_direction_used(d, used_dirs, angle_tol_deg: float) -> bool:
 
 def get_predefined_axis_directions():
     """Performs: get predefined axis directions."""
-    base = [( 1, 0, 0), (-1, 0, 0), ( 0, 1, 0), ( 0,-1, 0), ( 0, 0, 1)]
+    base = [( 1, 0, 0), (-1, 0, 0), ( 0, 1, 0), ( 0,-1, 0), ( 0, 0, 1), (0, 0, -1)]
     out = []
     for d in base:
         dn = _normalize_vector(d)
-        out.append(dn if dn[2] >= 0 else (-dn[0], -dn[1], -dn[2]))
+        out.append(dn)
     return _deduplicate_directions(out, angle_tol_deg=0.1)
 
 def build_graph_distance_matrix(G: nxg.Graph) -> np.ndarray:
@@ -250,9 +274,6 @@ def select_single_axis_direction(
         if direction == (0.0, 0.0, 0.0):
             continue
 
-        if direction[2] < 0:
-            direction = (-direction[0], -direction[1], -direction[2])
-
         if _is_direction_used(direction, used_axis_dirs, used_tol_deg):
             continue
 
@@ -297,6 +318,16 @@ def build_point_test_operation_sequence():
 SDF_FEATURE_SCALE = 10.0
 ROUGH_DONE_DELTA_EPS = 1e-5
 FINISH_READY_TOL = float(os.getenv("FINISH_READY_TOL", "1.0"))
+
+# ── Adaptive octree occupancy sampling ────────────────────────────────────
+# The octree target is the only geometric transition supervision used by the
+# new model.  Current face SDF remains an encoder input, but next-state SDF is
+# no longer required as a training target.
+OCTREE_ENABLED: bool = os.getenv("OCTREE_ENABLED", "1") != "0"
+OCTREE_COARSE_DEPTH: int = int(os.getenv("OCTREE_COARSE_DEPTH", "3"))
+OCTREE_FINE_DEPTH: int = int(os.getenv("OCTREE_FINE_DEPTH", "5"))
+OCTREE_MAX_NODES: int = int(os.getenv("OCTREE_MAX_NODES", "4096"))
+OCTREE_BBOX_PADDING: float = float(os.getenv("OCTREE_BBOX_PADDING", "0.05"))
 
 
 def build_node_mask_512(num_valid_nodes: int, max_nodes: int = 512) -> np.ndarray:
@@ -404,6 +435,99 @@ def extract_point_coordinates(points_array) -> List[np.ndarray]:
             )
         coords_per_face.append(np.asarray(coords, dtype=np.float32))
     return coords_per_face
+
+
+def orient_normal_outward_from_center(
+    normal: np.ndarray,
+    face_points_xyz: np.ndarray,
+    part_center_xyz: np.ndarray,
+) -> np.ndarray:
+    """Orients a face normal away from the part-level center."""
+    n = np.asarray(normal, dtype=np.float32).reshape(3)
+    n_norm = float(np.linalg.norm(n))
+    if n_norm <= 1e-9:
+        return np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    n = n / n_norm
+
+    pts = np.asarray(face_points_xyz, dtype=np.float32).reshape(-1, 3)
+    if pts.size == 0:
+        return n.astype(np.float32)
+
+    face_center = np.mean(pts, axis=0)
+    outward_hint = face_center - np.asarray(part_center_xyz, dtype=np.float32).reshape(3)
+    if float(np.linalg.norm(outward_hint)) > 1e-9 and float(np.dot(n, outward_hint)) < 0.0:
+        n = -n
+    return n.astype(np.float32)
+
+
+def _nx_point_xyz(point_obj) -> np.ndarray:
+    c = point_obj.Coordinates
+    return np.array([float(c.X), float(c.Y), float(c.Z)], dtype=np.float32)
+
+
+def _nx_direction_xyz(direction_obj) -> np.ndarray:
+    v = direction_obj.Vector
+    return np.array([float(v.X), float(v.Y), float(v.Z)], dtype=np.float32)
+
+
+def orient_sample_directions_and_lines_outward(
+    work_part,
+    points_array,
+    norm_vecs_array,
+    lines_array,
+    part_center_xyz: np.ndarray,
+) -> None:
+    """Rebuilds probe directions/lines so each face points away from the part center."""
+    center = np.asarray(part_center_xyz, dtype=np.float32).reshape(3)
+
+    for face_idx, face_points in enumerate(points_array):
+        if face_idx >= len(norm_vecs_array):
+            continue
+        face_norms = norm_vecs_array[face_idx]
+        count = min(len(face_points), len(face_norms))
+        if count <= 0:
+            continue
+
+        coords = np.stack([_nx_point_xyz(face_points[i]) for i in range(count)], axis=0)
+        vectors = np.stack([_nx_direction_xyz(face_norms[i]) for i in range(count)], axis=0)
+        mean_normal = vectors.mean(axis=0)
+        n_norm = float(np.linalg.norm(mean_normal))
+        outward_hint = coords.mean(axis=0) - center
+        if n_norm <= 1e-9 or float(np.linalg.norm(outward_hint)) <= 1e-9:
+            continue
+        if float(np.dot(mean_normal / n_norm, outward_hint)) >= 0.0:
+            continue
+
+        new_norms = []
+        new_lines = []
+        for i in range(count):
+            v = -vectors[i]
+            v_norm = float(np.linalg.norm(v))
+            if v_norm <= 1e-9:
+                v = -mean_normal
+                v_norm = float(np.linalg.norm(v))
+            if v_norm <= 1e-9:
+                v = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                v_norm = 1.0
+            v = v / v_norm
+            direction = work_part.Directions.CreateDirection(
+                NXOpen.Point3d(0.0, 0.0, 0.0),
+                NXOpen.Vector3d(float(v[0]), float(v[1]), float(v[2])),
+                NXOpen.SmartObject.UpdateOption.DontUpdate,
+            )
+            point_xyz = coords[i]
+            new_norms.append(direction)
+            new_lines.append(
+                create_line_with_point_and_vector(
+                    work_part,
+                    [float(point_xyz[0]), float(point_xyz[1]), float(point_xyz[2])],
+                    direction,
+                    length=1000.0,
+                )
+            )
+
+        norm_vecs_array[face_idx] = new_norms
+        lines_array[face_idx] = new_lines
 
 
 def build_group_face_normals_512(
@@ -637,21 +761,20 @@ def derive_axis_direction(
 ) -> Tuple[float, float, float]:
     """Derives tool axis from macro class and target face geometry.
 
-    Indexed / 5-axis finishing → selected face normal (upper hemisphere)
+    Indexed / 5-axis finishing -> selected outward face normal.
     """
     n = _normalize_vector(tuple(float(x) for x in target_face_normal))
     if n == (0.0, 0.0, 0.0):
         return (0.0, 0.0, 1.0)
-    if n[2] < 0:
-        n = (-n[0], -n[1], -n[2])
     return n
 
 
 def sample_valid_tools_for_macro(
     macro_class_name: str,
     max_tools: int = 3,
+    rng: np.random.Generator | None = None,
 ) -> List[Tuple[str, float]]:
-    """Returns process-aware tool candidates for a macro class."""
+    """Randomly samples valid tool candidates for a macro class."""
     macro_id = MACRO_CLASS_TO_ID.get(macro_class_name, -1)
     if macro_id < 0:
         return []
@@ -660,51 +783,13 @@ def sample_valid_tools_for_macro(
     if not valid:
         return []
 
-    def _sort_tools(tools: List[Tuple[str, float]], descending: bool) -> List[Tuple[str, float]]:
-        return sorted(tools, key=lambda item: float(item[1]), reverse=descending)
+    count = max(1, min(int(max_tools), len(valid)))
+    if count >= len(valid):
+        return list(valid)
 
-    def _pick_spread(ordered_tools: List[Tuple[str, float]], count: int) -> List[Tuple[str, float]]:
-        count = max(1, int(count))
-        if len(ordered_tools) <= count:
-            return ordered_tools
-        if count == 1:
-            return [ordered_tools[0]]
-
-        sampled: List[Tuple[str, float]] = []
-        used_idx: set[int] = set()
-        for raw_idx in np.linspace(0, len(ordered_tools) - 1, num=count):
-            idx = int(round(float(raw_idx)))
-            idx = max(0, min(idx, len(ordered_tools) - 1))
-            while idx in used_idx and idx + 1 < len(ordered_tools):
-                idx += 1
-            while idx in used_idx and idx - 1 >= 0:
-                idx -= 1
-            if idx in used_idx:
-                continue
-            used_idx.add(idx)
-            sampled.append(ordered_tools[idx])
-        if len(sampled) < count:
-            for idx, tool in enumerate(ordered_tools):
-                if idx in used_idx:
-                    continue
-                sampled.append(tool)
-                if len(sampled) >= count:
-                    break
-        return sampled
-
-    if macro_class_name == "indexed_rough":
-        # Roughing should bias toward large cutters, but still expose size diversity.
-        ordered = _sort_tools(valid, descending=True)
-    elif macro_class_name in {"indexed_finish", "point_finish"}:
-        # Finishing should start from smaller tools, while keeping a spread.
-        ordered = _sort_tools(valid, descending=False)
-    elif macro_class_name == "flank_finish":
-        # Flank milling usually prefers larger flat tools.
-        ordered = _sort_tools(valid, descending=True)
-    else:
-        ordered = list(valid)
-
-    return _pick_spread(ordered, max_tools)
+    local_rng = rng if rng is not None else np.random.default_rng()
+    sampled_idx = local_rng.choice(len(valid), size=count, replace=False)
+    return [valid[int(i)] for i in sampled_idx]
 
 
 def create_geometry_for_state(
@@ -824,8 +909,6 @@ def select_action_face_candidates(
         for i in order:
             nid = int(idx[i])
             n = _normalize_vector(tuple(normals[nid]))
-            if n[2] < 0:
-                n = (-n[0], -n[1], -n[2])
             if any(_angle_between_vectors_deg(n, u) <= normal_dedup_tol_deg for u in used_n):
                 continue
             selected.append(nid)
@@ -851,6 +934,7 @@ def generate_action_candidates(
     max_rough_targets: int = 5,
     max_finish_targets: int = 5,
     max_tools_per_class: int = 7,
+    rng: np.random.Generator | None = None,
 ) -> List[Dict[str, Any]]:
     """Generates action candidates as (macro_class, action_face, tool).
 
@@ -888,18 +972,18 @@ def generate_action_candidates(
     if targets["indexed_rough"]:
         for face_id in targets["indexed_rough"]:
             axis = derive_axis_direction("indexed_rough", normals[face_id])
-            for tk, td in sample_valid_tools_for_macro("indexed_rough", max_tools_per_class):
+            for tk, td in sample_valid_tools_for_macro("indexed_rough", max_tools_per_class, rng=rng):
                 _add("indexed_rough", face_id, tk, td, axis)
 
     for face_id in targets["finish"]:
         axis = derive_axis_direction("indexed_finish", normals[face_id])
-        for tk, td in sample_valid_tools_for_macro("indexed_finish", max_tools_per_class):
+        for tk, td in sample_valid_tools_for_macro("indexed_finish", max_tools_per_class, rng=rng):
             _add("indexed_finish", face_id, tk, td, axis)
 
-        for tk, td in sample_valid_tools_for_macro("point_finish", max_tools_per_class):
+        for tk, td in sample_valid_tools_for_macro("point_finish", max_tools_per_class, rng=rng):
             _add("point_finish", face_id, tk, td, axis)
 
-        for tk, td in sample_valid_tools_for_macro("flank_finish", max_tools_per_class):
+        for tk, td in sample_valid_tools_for_macro("flank_finish", max_tools_per_class, rng=rng):
             _add("flank_finish", face_id, tk, td, axis)
 
     return candidates
@@ -918,6 +1002,16 @@ def simulate_single_action(
     commit_to_chain: bool = False,
     operation_depth: int = 0,
     base_object_blank=None,
+    # ── Adaptive octree occupancy sampling ────────────────────────────────
+    # Leaf centers are sampled from obj_a (post-op body) while it is still live
+    # in the NX undo stack.
+    octree_bbox_min_raw: "np.ndarray | None" = None,  # [3] world bbox lower corner
+    octree_bbox_max_raw: "np.ndarray | None" = None,  # [3] world bbox upper corner
+    octree_coarse_depth: int = 3,
+    octree_fine_depth: int = 5,
+    octree_max_nodes: int = 4096,
+    octree_bbox_padding: float = 0.05,
+    octree_enabled: bool = False,
 ) -> Dict[str, Any]:
     """Simulates one action and returns transition data.
 
@@ -1003,6 +1097,16 @@ def simulate_single_action(
             return []
         return [face_obj]
 
+    local_target_faces = None
+    if optype in {"Area Mill", "Cavity Mill", "Swarf Mill", "Point Mill"}:
+        local_target_faces = _select_local_target_faces()
+        if not local_target_faces:
+            result["volume_after"] = float(vol_before)
+            result["removed_volume"] = 0.0
+            result["cycle_time"] = 0.0
+            result["dev_after_red_512"] = dev_bef_red_512.copy()
+            return result
+
     obj_op = create_operation_geometry_for_depth(
         session, work_part, prt_file_path, state_chain, origin_body,
         int(operation_depth), base_object_blank,
@@ -1015,30 +1119,18 @@ def simulate_single_action(
             tool_orientation=axis_dir,
         )
     elif optype in {"Area Mill", "Cavity Mill"}:
-        sel = _select_local_target_faces()
-        if not sel:
-            ct_list.append(0.0)
-        else:
-            operations.create_surface_contour(
-                session, work_part, tool, obj_op, sel, op_list, ct_list,
-                tool_orientation=axis_dir,
-            )
+        operations.create_surface_contour(
+            session, work_part, tool, obj_op, local_target_faces, op_list, ct_list,
+            tool_orientation=axis_dir,
+        )
     elif optype == "Swarf Mill":
-        sel = _select_local_target_faces()
-        if not sel:
-            ct_list.append(0.0)
-        else:
-            operations.create_swarf_milling(
-                session, work_part, tool, obj_op, sel, op_list, ct_list,
-            )
+        operations.create_swarf_milling(
+            session, work_part, tool, obj_op, local_target_faces, op_list, ct_list,
+        )
     elif optype == "Point Mill":
-        sel = _select_local_target_faces()
-        if not sel:
-            ct_list.append(0.0)
-        else:
-            operations.create_point_milling(
-                session, work_part, tool, obj_op, sel, op_list, ct_list,
-            )
+        operations.create_point_milling(
+            session, work_part, tool, obj_op, local_target_faces, op_list, ct_list,
+        )
     else:
         raise ValueError(f"Unknown optype: {optype}")
 
@@ -1067,6 +1159,36 @@ def simulate_single_action(
                 points_array, norm_vecs_array, lines_array,
             )
             dev_aft_red = reduce_scalar_by_groups(np.asarray(dev_after, dtype=np.float32), groups_face, weights=face_areas)
+
+        # ── Adaptive octree occupancy target (inside try while obj_a is live) ──
+        if octree_enabled and octree_bbox_min_raw is not None and octree_bbox_max_raw is not None:
+            centers_raw, depths, labels, bbox_min_for_octree, bbox_max_for_octree = cam_utils.sample_ipw_octree_state(
+                session=session,
+                work_part=work_part,
+                object_blank=obj_a,
+                tool_name=flat_tools[0],
+                bbox_min=np.asarray(octree_bbox_min_raw, dtype=np.float32).reshape(3),
+                bbox_max=np.asarray(octree_bbox_max_raw, dtype=np.float32).reshape(3),
+                coarse_depth=octree_coarse_depth,
+                fine_depth=octree_fine_depth,
+                max_nodes=octree_max_nodes,
+                bbox_padding=octree_bbox_padding,
+            )
+            result["octree_centers_raw"] = centers_raw      # [K, 3] world mm
+            result["octree_depths"] = depths                # [K] int16
+            result["octree_occ_labels"] = labels            # [K] float32
+            result["octree_bbox_min_raw"] = bbox_min_for_octree.astype(np.float32)
+            result["octree_bbox_max_raw"] = bbox_max_for_octree.astype(np.float32)
+            if labels.size > 0:
+                occ_ratio = float(np.mean(labels >= 0.5))
+                if occ_ratio <= 0.001 or occ_ratio >= 0.999:
+                    print(
+                        "[WARN] simulate_single_action: octree occupancy is nearly constant "
+                        f"(occ_ratio={occ_ratio:.4f}, K={int(labels.size)}). "
+                        "Check IPW membership and bbox.",
+                        flush=True,
+                    )
+
     finally:
         session.UndoToMark(m_aft, "sim_meas_aft")
         session.DeleteUndoMark(m_aft, "sim_meas_aft")
@@ -1089,7 +1211,7 @@ def select_axis_candidates(
     theUfSession,
     max_candidates: int = 4,
 ) -> List[Tuple[float, float, float]]:
-    """Returns top axis candidates from residual-heavy groups plus +Z fallback."""
+    """Returns top axis candidates from residual-heavy groups plus predefined fallback directions."""
     dev = np.asarray(state_dev_red_512, dtype=np.float32).reshape(-1)
     scored_dirs: List[Tuple[float, Tuple[float, float, float]]] = []
 
@@ -1116,8 +1238,6 @@ def select_axis_candidates(
         )
         if direction == (0.0, 0.0, 0.0):
             continue
-        if direction[2] < 0:
-            direction = (-direction[0], -direction[1], -direction[2])
         score = float(group_area_sum * remaining)
         scored_dirs.append((score, direction))
 
@@ -1125,8 +1245,9 @@ def select_axis_candidates(
     ordered_dirs = [d for _, d in scored_dirs]
     ordered_dirs = _deduplicate_directions(ordered_dirs, angle_tol_deg=2.0)
 
-    if (0.0, 0.0, 1.0) not in ordered_dirs:
-        ordered_dirs.insert(0, (0.0, 0.0, 1.0))
+    for fallback_dir in get_predefined_axis_directions():
+        if not any(_angle_between_vectors_deg(fallback_dir, d) <= 2.0 for d in ordered_dirs):
+            ordered_dirs.append(fallback_dir)
     return ordered_dirs[: max(1, int(max_candidates))]
 
 
@@ -1725,14 +1846,112 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     part_name = os.path.splitext(os.path.basename(prt_file_path))[0]
     out_dir = create_run_output_dir(out_root, part_name, seed)
     run_name = os.path.basename(out_dir)
+    target_body_mesh_path = export_body_to_obj(
+        session,
+        work_part,
+        origin_body,
+        os.path.join(out_dir, "target_body.obj"),
+    )
 
-    NUM_DECISION_STEPS = int(os.getenv("NUM_DECISION_STEPS", "8"))
+    # NUM_DECISION_STEPS = int(os.getenv("NUM_DECISION_STEPS", "8"))
+    # SURFACE_FINISH_TOL = 0.01
+    # MAX_ROUGH_TARGETS = int(os.getenv("MAX_ROUGH_TARGETS", "5"))
+    # MAX_FINISH_TARGETS = int(os.getenv("MAX_FINISH_TARGETS", "5"))
+    # MAX_TOOLS_PER_CLASS = int(os.getenv("MAX_TOOLS_PER_CLASS", "2"))
+    # BEAM_WIDTH = max(1, int(os.getenv("BEAM_WIDTH", "3")))
+    # SAMPLED_BRANCHES = max(0, int(os.getenv("SAMPLED_BRANCHES", "1")))
+
+    NUM_DECISION_STEPS=4     
+    MAX_ROUGH_TARGETS=2    
+    MAX_FINISH_TARGETS=2  
+    MAX_TOOLS_PER_CLASS=1  
+    BEAM_WIDTH=1          
+    SAMPLED_BRANCHES=0   
+    FINISH_READY_TOL=1.0   
     SURFACE_FINISH_TOL = 0.01
-    MAX_ROUGH_TARGETS = int(os.getenv("MAX_ROUGH_TARGETS", "5"))
-    MAX_FINISH_TARGETS = int(os.getenv("MAX_FINISH_TARGETS", "5"))
-    MAX_TOOLS_PER_CLASS = int(os.getenv("MAX_TOOLS_PER_CLASS", "7"))
-    BEAM_WIDTH = max(1, int(os.getenv("BEAM_WIDTH", "3")))
-    SAMPLED_BRANCHES = max(0, int(os.getenv("SAMPLED_BRANCHES", "1")))
+    MIN_EFFECTIVE_REMOVED_VOLUME = float(os.getenv("MIN_EFFECTIVE_REMOVED_VOLUME", "0.1"))
+    MIN_EFFECTIVE_REMOVED_RATIO = float(os.getenv("MIN_EFFECTIVE_REMOVED_RATIO", "0.0"))
+    MIN_EFFECTIVE_MAX_NODE_DELTA = float(os.getenv("MIN_EFFECTIVE_MAX_NODE_DELTA", "0.0"))
+    MIN_EFFECTIVE_DONE_GAIN = float(os.getenv("MIN_EFFECTIVE_DONE_GAIN", "0.0"))
+    FAIL_ON_CANDIDATE_ERROR = bool(int(os.getenv("FAIL_ON_CANDIDATE_ERROR", "0")))
+    SAVE_PART_ON_CANDIDATE_ERROR = bool(int(os.getenv("SAVE_PART_ON_CANDIDATE_ERROR", "0")))
+    ERROR_PART_SNAPSHOT_DIR = os.getenv("ERROR_PART_SNAPSHOT_DIR", "")
+
+    def _is_effective_transition(
+        removed: float,
+        removed_ratio: float,
+        max_delta: float,
+        done_gain: float,
+    ) -> bool:
+        if removed <= 1e-6 and max_delta <= 1e-6 and done_gain <= 1e-9:
+            return False
+        checks = []
+        if MIN_EFFECTIVE_REMOVED_VOLUME > 0.0:
+            checks.append(removed >= MIN_EFFECTIVE_REMOVED_VOLUME)
+        if MIN_EFFECTIVE_REMOVED_RATIO > 0.0:
+            checks.append(removed_ratio >= MIN_EFFECTIVE_REMOVED_RATIO)
+        if MIN_EFFECTIVE_MAX_NODE_DELTA > 0.0:
+            checks.append(max_delta >= MIN_EFFECTIVE_MAX_NODE_DELTA)
+        if MIN_EFFECTIVE_DONE_GAIN > 0.0:
+            checks.append(done_gain >= MIN_EFFECTIVE_DONE_GAIN)
+        return any(checks) if checks else True
+
+    def _save_candidate_error_part(t: int, branch_id: str, candidate_index: int, action: Dict[str, Any], exc: Exception) -> str:
+        if not bool(SAVE_PART_ON_CANDIDATE_ERROR):
+            return ""
+        snapshot_dir = ERROR_PART_SNAPSHOT_DIR or os.path.join(out_dir, "error_prt_snapshots")
+        _ensure_dir(snapshot_dir)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        tool_name = f"{action.get('tool_kind', 'tool')}_{action.get('tool_diameter', 'dia')}"
+        filename = _safe_filename(
+            f"{part_name}_seed{int(seed)}_t{int(t):02d}_b{branch_id}_c{int(candidate_index):03d}_"
+            f"{action.get('macro_class_name', 'macro')}_{tool_name}_face{action.get('action_face_id', 'face')}_{stamp}.prt"
+        )
+        snapshot_path = os.path.abspath(os.path.join(snapshot_dir, filename))
+        try:
+            save_part(session, work_part, snapshot_path)
+            print(f"[WARN] Saved error PRT snapshot: {snapshot_path}", flush=True)
+            return snapshot_path
+        except Exception as save_exc:
+            print(
+                f"[WARN] Failed to save error PRT snapshot for candidate error {exc!r}: {save_exc!r}",
+                flush=True,
+            )
+            return ""
+
+    def _save_fatal_error_part(label: str, exc: Exception) -> str:
+        if not bool(SAVE_PART_ON_CANDIDATE_ERROR):
+            return ""
+        snapshot_dir = ERROR_PART_SNAPSHOT_DIR or os.path.join(out_dir, "error_prt_snapshots")
+        _ensure_dir(snapshot_dir)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = _safe_filename(f"{part_name}_seed{int(seed)}_fatal_{label}_{stamp}.prt")
+        snapshot_path = os.path.abspath(os.path.join(snapshot_dir, filename))
+        try:
+            save_part(session, work_part, snapshot_path)
+            print(f"[WARN] Saved fatal error PRT snapshot: {snapshot_path}", flush=True)
+            return snapshot_path
+        except Exception as save_exc:
+            print(
+                f"[WARN] Failed to save fatal error PRT snapshot for {exc!r}: {save_exc!r}",
+                flush=True,
+            )
+            return ""
+
+    node_mask_512 = build_node_mask_512(K)
+    point_mask_512x100 = build_point_mask_512x100(face_pc_raw_512, K)
+    measurement_point_coords = extract_point_coordinates(points_array)
+    normalization_center_xyz, normalization_scale, bbox_extent_xyz = compute_reference_frame(
+        face_pc_raw_512,
+        node_mask_512,
+    )
+    orient_sample_directions_and_lines_outward(
+        work_part,
+        points_array,
+        norm_vecs_array,
+        lines_array,
+        normalization_center_xyz,
+    )
 
     face_normals_list = []
     if norm_vecs_array:
@@ -1753,16 +1972,15 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 n_norm = np.linalg.norm(mean_normal)
                 if n_norm > 1e-9: mean_normal = mean_normal / n_norm
                 else: mean_normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            face_points = measurement_point_coords[i] if i < len(measurement_point_coords) else np.empty((0, 3), dtype=np.float32)
+            mean_normal = orient_normal_outward_from_center(
+                mean_normal,
+                face_points,
+                normalization_center_xyz,
+            )
             face_normals_list.append(mean_normal)
     face_normal_512 = build_group_face_normals_512(groups_face, face_normals_list, max_nodes=512)
 
-    node_mask_512 = build_node_mask_512(K)
-    point_mask_512x100 = build_point_mask_512x100(face_pc_raw_512, K)
-    measurement_point_coords = extract_point_coordinates(points_array)
-    normalization_center_xyz, normalization_scale, bbox_extent_xyz = compute_reference_frame(
-        face_pc_raw_512,
-        node_mask_512,
-    )
     face_pc = normalize_face_points(face_pc_raw_512, normalization_center_xyz, normalization_scale)
     face_area = normalize_face_area(face_area_raw_512, normalization_scale)
     workpiece_name_chain: List[str] = []
@@ -1772,6 +1990,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
 
     _json_dump(os.path.join(out_dir, "meta.json"), {
         "prt_file_path": os.path.abspath(prt_file_path),
+        "target_body_mesh_path": target_body_mesh_path,
         "part_name": part_name, "seed": int(seed), "K_raw_faces": int(K),
         "num_faces": int(len(origin_faces)),
         "note": {
@@ -1798,6 +2017,16 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 "reference_scale": float(normalization_scale),
                 "bbox_extent_xyz": bbox_extent_xyz.tolist(),
             },
+            "target_body_mesh_path": target_body_mesh_path,
+            "effective_transition_filter": {
+                "min_removed_volume": float(MIN_EFFECTIVE_REMOVED_VOLUME),
+                "min_removed_ratio": float(MIN_EFFECTIVE_REMOVED_RATIO),
+                "min_max_node_delta": float(MIN_EFFECTIVE_MAX_NODE_DELTA),
+                "min_done_gain": float(MIN_EFFECTIVE_DONE_GAIN),
+            },
+            "fail_on_candidate_error": bool(FAIL_ON_CANDIDATE_ERROR),
+            "save_part_on_candidate_error": bool(SAVE_PART_ON_CANDIDATE_ERROR),
+            "error_part_snapshot_dir": os.path.abspath(ERROR_PART_SNAPSHOT_DIR or os.path.join(out_dir, "error_prt_snapshots")),
         },
     })
     _np_save(os.path.join(out_dir, "embed_centrality.npy"), centrality)
@@ -1931,9 +2160,34 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         vol_before = float(result.get("volume_before", 0.0) or 0.0)
         axis_dir = tuple(action["axis_dir"])
 
+        # ── Adaptive octree occupancy ground truth ────────────────────────
+        # Octree leaf centers were sampled inside simulate_single_action while
+        # the post-operation NX body was still live.  Store normalized centers,
+        # per-leaf depths, and binary next-state occupancy labels.
+        octree_centers_norm: np.ndarray | None = None
+        octree_depths: np.ndarray | None = None
+        octree_occ_labels: np.ndarray | None = None
+        octree_bbox_min_norm: np.ndarray | None = None
+        octree_bbox_max_norm: np.ndarray | None = None
+        if OCTREE_ENABLED:
+            raw_centers = result.get("octree_centers_raw")       # [K, 3] | None
+            raw_depths = result.get("octree_depths")             # [K]    | None
+            raw_labels = result.get("octree_occ_labels")         # [K]    | None
+            if raw_centers is not None and raw_depths is not None and raw_labels is not None:
+                octree_scale = float(max(normalization_scale, 1e-6))
+                raw_c = np.asarray(raw_centers, dtype=np.float32).reshape(-1, 3)
+                octree_centers_norm = (raw_c - normalization_center_xyz.reshape(1, 3)) / octree_scale
+                octree_depths = np.asarray(raw_depths, dtype=np.int16).reshape(-1)
+                octree_occ_labels = np.asarray(raw_labels, dtype=np.float32).reshape(-1)
+                raw_bbox_min = np.asarray(result.get("octree_bbox_min_raw", raw_c.min(axis=0)), dtype=np.float32).reshape(3)
+                raw_bbox_max = np.asarray(result.get("octree_bbox_max_raw", raw_c.max(axis=0)), dtype=np.float32).reshape(3)
+                octree_bbox_min_norm = (raw_bbox_min - normalization_center_xyz) / octree_scale
+                octree_bbox_max_norm = (raw_bbox_max - normalization_center_xyz) / octree_scale
+
         return {
             "part_name": part_name,
             "prt_file_path": os.path.abspath(prt_file_path),
+            "target_body_mesh_path": target_body_mesh_path,
             "graph_nx_json": json.dumps(graph_json),
             "seed": int(seed),
             "decision_step": int(decision_step),
@@ -1994,12 +2248,31 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             "normalization_scale": _to_safe_float(normalization_scale),
             "bbox_extent_xyz": _to_serializable_list(bbox_extent_xyz.astype(np.float32)),
 
+            # ── Octree occupancy transition target
+            "octree_centers": _to_serializable_list(octree_centers_norm.reshape(-1).astype(np.float32)) if octree_centers_norm is not None else None,
+            "octree_depths": _to_serializable_list(octree_depths.astype(np.int16)) if octree_depths is not None else None,
+            "octree_occ_labels": _to_serializable_list(octree_occ_labels.astype(np.float32)) if octree_occ_labels is not None else None,
+            "octree_bbox_min": _to_serializable_list(octree_bbox_min_norm.astype(np.float32)) if octree_bbox_min_norm is not None else None,
+            "octree_bbox_max": _to_serializable_list(octree_bbox_max_norm.astype(np.float32)) if octree_bbox_max_norm is not None else None,
+
             "info_json": json.dumps({
                 "surface_finish_tol": float(SURFACE_FINISH_TOL),
                 "candidate_strategy": "beam_sampled_action_transition",
                 "normalization": "part_bbox_center_and_diagonal",
                 "rough_done_delta_eps": float(ROUGH_DONE_DELTA_EPS),
                 "finish_ready_tol": float(FINISH_READY_TOL),
+                "min_effective_removed_volume": float(MIN_EFFECTIVE_REMOVED_VOLUME),
+                "min_effective_removed_ratio": float(MIN_EFFECTIVE_REMOVED_RATIO),
+                "min_effective_max_node_delta": float(MIN_EFFECTIVE_MAX_NODE_DELTA),
+                "min_effective_done_gain": float(MIN_EFFECTIVE_DONE_GAIN),
+                "fail_on_candidate_error": bool(FAIL_ON_CANDIDATE_ERROR),
+                "save_part_on_candidate_error": bool(SAVE_PART_ON_CANDIDATE_ERROR),
+                "error_part_snapshot_dir": os.path.abspath(ERROR_PART_SNAPSHOT_DIR or os.path.join(out_dir, "error_prt_snapshots")),
+                "octree_enabled": bool(OCTREE_ENABLED),
+                "octree_coarse_depth": int(OCTREE_COARSE_DEPTH),
+                "octree_fine_depth": int(OCTREE_FINE_DEPTH),
+                "octree_max_nodes": int(OCTREE_MAX_NODES),
+                "octree_bbox_padding": float(OCTREE_BBOX_PADDING),
                 "row_unit": "one_executed_nx_operation",
             }, ensure_ascii=False),
         }
@@ -2009,10 +2282,18 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     root_chain_snapshot = list(workpiece_name_chain)
     beam_root_mark = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "beam_root")
 
-    def _restore_to_root() -> None:
+    def _restore_to_root(strict: bool = True) -> bool:
         """Restores NX and the Python-side IPW chain to the initial branch root."""
-        session.UndoToMark(beam_root_mark, "beam_root")
+        try:
+            session.UndoToMark(beam_root_mark, "beam_root")
+        except Exception as exc:
+            if strict:
+                raise
+            print(f"[WARN] Could not restore beam_root undo mark: {exc!r}", flush=True)
+            restore_workpiece_chain(workpiece_name_chain, root_chain_snapshot)
+            return False
         restore_workpiece_chain(workpiece_name_chain, root_chain_snapshot)
+        return True
 
     def _replay_history(history: List[Dict[str, Any]]) -> Tuple[bool, str | None]:
         """Replays a scenario action sequence from the current root state."""
@@ -2154,6 +2435,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                     max_rough_targets=MAX_ROUGH_TARGETS,
                     max_finish_targets=MAX_FINISH_TARGETS,
                     max_tools_per_class=MAX_TOOLS_PER_CLASS,
+                    rng=rng,
                 )
                 candidate_tools = sorted({
                     f"{c['tool_kind']}_{float(c['tool_diameter']):.1f}" for c in candidates
@@ -2176,7 +2458,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                     continue
 
                 scored: List[Tuple[float, int, Dict[str, Any], Dict[str, Any], int, Dict[str, Any]]] = []
-                reject_stats = {"no_effect": 0}
+                reject_stats = {"cam_error": 0, "no_effect": 0, "below_min_effect": 0}
                 reject_examples: List[str] = []
 
                 for ci, action in enumerate(candidates):
@@ -2185,7 +2467,20 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                         NXOpen.Session.MarkVisibility.Invisible,
                         f"beam_t{t:02d}_b{bi:03d}_c{ci:03d}",
                     )
+                    cand_mark_name = f"beam_t{t:02d}_b{bi:03d}_c{ci:03d}"
+                    candidate_error = None
+                    candidate_error_snapshot_path = ""
+                    rollback_error = None
                     try:
+                        # Pre-compute world-space bbox for octree sampling.
+                        _oct_valid_pts = face_pc_raw_512[node_mask_512 == 0]  # [K_valid, P, 3]
+                        _oct_valid_pts_flat = _oct_valid_pts.reshape(-1, 3)
+                        _oct_raw_min = _oct_valid_pts_flat.min(axis=0)
+                        _oct_raw_max = _oct_valid_pts_flat.max(axis=0)
+                        _oct_pad = (_oct_raw_max - _oct_raw_min) * OCTREE_BBOX_PADDING
+                        _oct_raw_min = _oct_raw_min - _oct_pad
+                        _oct_raw_max = _oct_raw_max + _oct_pad
+
                         result = simulate_single_action(
                             session=session, work_part=work_part,
                             prt_file_path=prt_file_path,
@@ -2199,32 +2494,73 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                             commit_to_chain=True,
                             operation_depth=len(branch["history"]),
                             base_object_blank=base_object_blank,
+                            # Octree occupancy sampling
+                            octree_bbox_min_raw=_oct_raw_min,
+                            octree_bbox_max_raw=_oct_raw_max,
+                            octree_coarse_depth=OCTREE_COARSE_DEPTH,
+                            octree_fine_depth=OCTREE_FINE_DEPTH,
+                            octree_max_nodes=OCTREE_MAX_NODES,
+                            octree_bbox_padding=OCTREE_BBOX_PADDING,
+                            octree_enabled=OCTREE_ENABLED,
                         )
+                    except Exception as exc:
+                        candidate_error_snapshot_path = _save_candidate_error_part(
+                            int(t), str(branch["id"]), int(ci), action, exc,
+                        )
+                        candidate_error = RuntimeError(
+                            "simulate_single_action failed "
+                            f"t={t} branch={branch['id']} candidate={ci} "
+                            f"macro={action.get('macro_class_name')} "
+                            f"tool={action.get('tool_kind')}_{action.get('tool_diameter')} "
+                            f"face={action.get('action_face_id')} "
+                            f"axis={action.get('axis_dir')} "
+                            f"history_depth={len(branch['history'])} "
+                            f"snapshot={candidate_error_snapshot_path or '<not_saved>'}"
+                        )
+                        candidate_error.__cause__ = exc
                     finally:
-                        session.UndoToMark(cand_mark, f"beam_t{t:02d}_b{bi:03d}_c{ci:03d}")
-                        session.DeleteUndoMark(cand_mark, f"beam_t{t:02d}_b{bi:03d}_c{ci:03d}")
+                        try:
+                            session.UndoToMark(cand_mark, cand_mark_name)
+                            session.DeleteUndoMark(cand_mark, cand_mark_name)
+                        except Exception as exc:
+                            rollback_error = exc
+                            print(
+                                f"[WARN] Candidate rollback failed: t={t} branch={branch['id']} "
+                                f"candidate={ci} mark={cand_mark_name} err={exc!r}",
+                                flush=True,
+                            )
                         restore_workpiece_chain(workpiece_name_chain, cand_chain_snapshot)
+                    if rollback_error is not None:
+                        rollback_runtime_error = RuntimeError(
+                            "candidate rollback failed after action simulation "
+                            f"t={t} branch={branch['id']} candidate={ci} "
+                            f"macro={action.get('macro_class_name')} "
+                            f"tool={action.get('tool_kind')}_{action.get('tool_diameter')} "
+                            f"face={action.get('action_face_id')} "
+                            f"mark={cand_mark_name} "
+                            f"snapshot={candidate_error_snapshot_path or '<not_saved>'}"
+                        )
+                        rollback_runtime_error.__cause__ = rollback_error
+                        raise rollback_runtime_error
+                    if candidate_error is not None:
+                        if bool(FAIL_ON_CANDIDATE_ERROR):
+                            raise candidate_error
+                        reject_stats["cam_error"] += 1
+                        if len(reject_examples) < 5:
+                            reject_examples.append(
+                                f"c{ci}:{action['macro_class_name']} "
+                                f"{action['tool_kind']}_{float(action['tool_diameter']):.1f} "
+                                f"face={action['action_face_id']} cam_error "
+                                f"err={candidate_error.__cause__!r} "
+                                f"snapshot={candidate_error_snapshot_path or '<not_saved>'}"
+                            )
+                        continue
 
                     removed = float(result.get("removed_volume", 0.0) or 0.0)
                     after_sdf = np.asarray(result["dev_after_red_512"], dtype=np.float32)
                     delta = np.maximum(state_dev_red_512 - after_sdf, 0.0)
                     max_delta = float(np.nanmax(delta)) if delta.size else 0.0
                     max_abs_delta = float(np.nanmax(np.abs(after_sdf - state_dev_red_512))) if after_sdf.size else 0.0
-                    if removed <= 1e-6 and max_delta <= 1e-6:
-                        reject_stats["no_effect"] += 1
-                        if len(reject_examples) < 5:
-                            reject_examples.append(
-                                f"c{ci}:{action['macro_class_name']} "
-                                f"{action['tool_kind']}_{float(action['tool_diameter']):.1f} "
-                                f"face={action['action_face_id']} no_effect "
-                                f"vol={float(result.get('volume_before', 0.0) or 0.0):.6f}"
-                                f"->{float(result.get('volume_after', 0.0) or 0.0):.6f} "
-                                f"removed={removed:.6g} max_delta={max_delta:.6g} "
-                                f"max_abs_delta={max_abs_delta:.6g} "
-                                f"ct={float(result.get('cycle_time', 0.0) or 0.0):.6g}"
-                            )
-                        continue
-
                     vol_before = float(result.get("volume_before", 1.0) or 1.0)
                     removed_ratio = removed / max(vol_before, 1e-9)
                     next_done_mask, next_done_ratio = compute_done_mask_from_dev_red(
@@ -2237,6 +2573,25 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                         )[1]
                     )
                     done_gain = max(float(next_done_ratio) - cur_done_ratio, 0.0)
+                    is_zero_effect = removed <= 1e-6 and max_delta <= 1e-6 and done_gain <= 1e-9
+                    is_effective = _is_effective_transition(removed, removed_ratio, max_delta, done_gain)
+                    if is_zero_effect or not is_effective:
+                        stat_key = "no_effect" if is_zero_effect else "below_min_effect"
+                        reject_stats[stat_key] += 1
+                        if len(reject_examples) < 5:
+                            reject_examples.append(
+                                f"c{ci}:{action['macro_class_name']} "
+                                f"{action['tool_kind']}_{float(action['tool_diameter']):.1f} "
+                                f"face={action['action_face_id']} {stat_key} "
+                                f"vol={float(result.get('volume_before', 0.0) or 0.0):.6f}"
+                                f"->{float(result.get('volume_after', 0.0) or 0.0):.6f} "
+                                f"removed={removed:.6g} ratio={removed_ratio:.6g} "
+                                f"max_delta={max_delta:.6g} done_gain={done_gain:.6g} "
+                                f"max_abs_delta={max_abs_delta:.6g} "
+                                f"ct={float(result.get('cycle_time', 0.0) or 0.0):.6g}"
+                            )
+                        continue
+
                     cycle_time = float(result.get("cycle_time", 0.0) or 0.0)
                     action_score = 4.0 * removed_ratio + 2.0 * done_gain - 0.002 * cycle_time
                     child_score = float(branch["score"]) + float(action_score)
@@ -2358,10 +2713,10 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             episode_record["steps"].append(depth_record)
             branches = next_branches
 
+    except Exception as exc:
+        _save_fatal_error_part("episode", exc)
+        raise
     finally:
-        _restore_to_root()
-        session.DeleteUndoMark(beam_root_mark, "beam_root")
-
         parquet_path = os.path.join(out_dir, f"{part_name}_seed{int(seed)}_process_skeleton_dataset.parquet")
         if parquet_rows:
             df = pd.DataFrame(parquet_rows)
@@ -2376,6 +2731,11 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 print(f"[INFO] Copied parquet to: {global_path}")
 
         _json_dump(os.path.join(out_dir, "episode_record.json"), episode_record)
+        _restore_to_root(strict=False)
+        try:
+            session.DeleteUndoMark(beam_root_mark, "beam_root")
+        except Exception as exc:
+            print(f"[WARN] Could not delete beam_root undo mark: {exc!r}", flush=True)
         force_close_part_by_path(prt_file_path)
 
     return {

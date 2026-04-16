@@ -1,4 +1,5 @@
 import functools
+import tempfile
 import trimesh
 import numpy as np
 import pyarrow as pa
@@ -75,6 +76,119 @@ def scale_to_unit_cube(mesh):
 
     return trimesh.Trimesh(vertices=vertices, faces=mesh.faces)
 
+
+def _export_nx_body_to_obj(session, body, output_path: str) -> str:
+    """Exports one NX body to OBJ for Python-side mesh queries."""
+    output_path = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    obj_creator = session.DexManager.CreateWavefrontObjCreator()
+    obj_creator.ExportSelectionBlock.SelectionScope = NXOpen.ObjectSelector.Scope.SelectedObjects
+    obj_creator.AngularTolerance = 17.999999999999996
+    obj_creator.FlattenAssemblyStructure = True
+    obj_creator.ExportSelectionBlock.SelectionComp.Add(body)
+    obj_creator.OutputFile = output_path
+    obj_creator.FileSaveFlag = False
+    obj_creator.Commit()
+    obj_creator.Destroy()
+    return output_path
+
+
+def _load_obj_as_trimesh(obj_path: str) -> "trimesh.Trimesh":
+    mesh = trimesh.load(obj_path, force="mesh", process=False)
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.dump(concatenate=True)
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise TypeError(f"OBJ did not load as a trimesh.Trimesh: {obj_path}")
+    if mesh.vertices.size == 0 or mesh.faces.size == 0:
+        raise ValueError(f"OBJ mesh is empty: {obj_path}")
+    mesh = trimesh.Trimesh(
+        vertices=np.asarray(mesh.vertices, dtype=np.float64),
+        faces=np.asarray(mesh.faces, dtype=np.int64),
+        process=False,
+    )
+    mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+def _contains_points_ray_parity(mesh: "trimesh.Trimesh", points: "np.ndarray") -> "np.ndarray":
+    """Vectorized ray-parity fallback for point-in-closed-triangle-mesh tests.
+
+    This avoids calling NX once per octree point.  It is intended for closed IPW
+    meshes; if the exported mesh is not watertight, labels are approximate.
+    """
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    labels = np.zeros((points.shape[0],), dtype=bool)
+    if points.size == 0:
+        return labels
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    triangles = vertices[faces]
+    if triangles.size == 0:
+        return labels
+
+    bounds = np.asarray(mesh.bounds, dtype=np.float64)
+    eps = 1e-9
+    inside_bbox = np.all(points >= (bounds[0] - eps), axis=1) & np.all(points <= (bounds[1] + eps), axis=1)
+    active_indices = np.flatnonzero(inside_bbox)
+    if active_indices.size == 0:
+        return labels
+
+    active_points = points[active_indices]
+    ray_dir = np.asarray([0.5773502691896258, 0.3713906763541037, 0.7276068751089989], dtype=np.float64)
+    ray_dir = ray_dir / np.linalg.norm(ray_dir)
+
+    point_chunk = 192
+    tri_chunk = 4096
+    counts = np.zeros((active_points.shape[0],), dtype=np.int32)
+    for point_start in range(0, active_points.shape[0], point_chunk):
+        pts = active_points[point_start : point_start + point_chunk]
+        chunk_counts = np.zeros((pts.shape[0],), dtype=np.int32)
+        for tri_start in range(0, triangles.shape[0], tri_chunk):
+            tri = triangles[tri_start : tri_start + tri_chunk]
+            v0 = tri[:, 0, :]
+            e1 = tri[:, 1, :] - v0
+            e2 = tri[:, 2, :] - v0
+            h = np.cross(np.broadcast_to(ray_dir, e2.shape), e2)
+            a = np.einsum("ij,ij->i", e1, h)
+            valid_tri = np.abs(a) > eps
+            if not np.any(valid_tri):
+                continue
+            v0 = v0[valid_tri]
+            e1 = e1[valid_tri]
+            e2 = e2[valid_tri]
+            h = h[valid_tri]
+            inv_a = 1.0 / a[valid_tri]
+
+            s = pts[:, None, :] - v0[None, :, :]
+            u = inv_a[None, :] * np.einsum("ptj,tj->pt", s, h)
+            mask = (u >= -eps) & (u <= 1.0 + eps)
+            if not np.any(mask):
+                continue
+
+            q = np.cross(s, e1[None, :, :])
+            v = inv_a[None, :] * np.einsum("ptj,j->pt", q, ray_dir)
+            mask &= (v >= -eps) & ((u + v) <= 1.0 + eps)
+            if not np.any(mask):
+                continue
+
+            t = inv_a[None, :] * np.einsum("tj,ptj->pt", e2, q)
+            mask &= t > eps
+            chunk_counts += np.count_nonzero(mask, axis=1).astype(np.int32)
+        counts[point_start : point_start + pts.shape[0]] = chunk_counts
+
+    labels[active_indices] = (counts % 2) == 1
+    return labels
+
+
+def _contains_points_mesh(mesh: "trimesh.Trimesh", points: "np.ndarray") -> "np.ndarray":
+    """Returns 1.0 for points inside a mesh and 0.0 otherwise."""
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    try:
+        return np.asarray(mesh.contains(points), dtype=np.float32)
+    except (ModuleNotFoundError, ImportError):
+        return _contains_points_ray_parity(mesh, points).astype(np.float32)
+
 # Use get_raster_points.cache_clear() to clear the cache
 @functools.lru_cache(maxsize=4)
 def get_raster_points(voxel_resolution):
@@ -127,13 +241,15 @@ try:
     from measurements import getFaceArea
     from measurements import get_deviation_per_face, get_pointwise_deviation_per_face
     from measurements import getVolume
-    from measurements import generate_points_v2, generate_points_convergent_face
+    from measurements import convert_facet_to_body, generate_points_v2, generate_points_convergent_face
+    from measurements import get_body_axis_aligned_bbox, sample_octree_occupancy
 except ImportError as e:
     from CAM.measurements import getFaceVector#,getConvergentFaceInfo
     from CAM.measurements import getFaceArea
     from CAM.measurements import get_deviation_per_face, get_pointwise_deviation_per_face
     from CAM.measurements import getVolume
-    from CAM.measurements import generate_points_v2, generate_points_convergent_face
+    from CAM.measurements import convert_facet_to_body, generate_points_v2, generate_points_convergent_face
+    from CAM.measurements import get_body_axis_aligned_bbox, sample_octree_occupancy
 def create_tool(session, work_part, tool_diameter, tool_type, tool_list):
     """Performs: create tool."""
     tool_name = f"{tool_type}_{tool_diameter}PI"
@@ -645,6 +761,114 @@ def get_ipw_property_detailed(
     assert volume != 0.0, "volume 0"
     session.UndoToMark(markId, "before_detailed")
     return deviation_list, pointwise_list, volume
+
+
+def sample_ipw_octree_state(
+    session=None,
+    work_part=None,
+    object_blank=None,
+    tool_name=None,
+    bbox_min=None,
+    bbox_max=None,
+    coarse_depth: int = 3,
+    fine_depth: int = 5,
+    max_nodes: int = 4096,
+    bbox_padding: float = 0.05,
+):
+    """Creates a temporary operation and samples octree occupancy from its input IPW.
+
+    By default, the IPW is exported once as an OBJ mesh and point containment is
+    evaluated in Python batches.  Set ``OCTREE_CONTAINMENT_BACKEND=nx`` to use
+    NX ``AskPointContainment`` per point instead.
+    """
+    if session is None:
+        session = NXOpen.Session.GetSession()
+    if work_part is None:
+        work_part = session.Parts.Work
+    if object_blank is None:
+        raise ValueError("object_blank is required")
+    if tool_name is None:
+        raise ValueError("tool_name is required")
+    if bbox_min is None or bbox_max is None:
+        raise ValueError("bbox_min and bbox_max are required")
+
+    session.ApplicationSwitchImmediate("UG_APP_MANUFACTURING")
+    work_part = session.Parts.Work
+    session.CAMSession.PathDisplay.SetIpwResolution(NXOpen.CAM.PathDisplay.IpwResolutionType.Fine)
+
+    markId = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "before_octree")
+    try:
+        nCGroup = work_part.CAMSetup.CAMGroupCollection.FindObject("NC_PROGRAM")
+        method = work_part.CAMSetup.CAMGroupCollection.FindObject("METHOD")
+        tool = work_part.CAMSetup.CAMGroupCollection.FindObject(tool_name)
+        operation = work_part.CAMSetup.CAMOperationCollection.Create(
+            nCGroup,
+            method,
+            tool,
+            object_blank,
+            "mill_contour",
+            "AREA_MILL",
+            NXOpen.CAM.OperationCollection.UseDefaultName.TrueValue,
+            "AREA_MILL",
+        )
+
+        ipw = operation.GetInputIpw()
+        ipw_objects = convert_facet_to_body(ipw)
+        ipw_body = ipw_objects[0]
+        bbox_min_use = np.asarray(bbox_min, dtype=np.float32).reshape(3)
+        bbox_max_use = np.asarray(bbox_max, dtype=np.float32).reshape(3)
+
+        backend = os.getenv("OCTREE_CONTAINMENT_BACKEND", "mesh").strip().lower()
+        contains_points_fn = None
+        if backend == "mesh":
+            with tempfile.TemporaryDirectory(prefix="ai_cam_ipw_mesh_") as tmp_dir:
+                obj_path = _export_nx_body_to_obj(session, ipw_body, os.path.join(tmp_dir, "ipw.obj"))
+                ipw_mesh = _load_obj_as_trimesh(obj_path)
+                body_bbox_min = np.asarray(ipw_mesh.bounds[0], dtype=np.float32)
+                body_bbox_max = np.asarray(ipw_mesh.bounds[1], dtype=np.float32)
+                contains_points_fn = lambda points: _contains_points_mesh(ipw_mesh, points)
+
+                bbox_min_use = np.minimum(bbox_min_use, body_bbox_min)
+                bbox_max_use = np.maximum(bbox_max_use, body_bbox_max)
+                bbox_extent = np.maximum(bbox_max_use - bbox_min_use, 1e-6)
+                bbox_pad = bbox_extent * float(max(bbox_padding, 0.0))
+                bbox_min_use = bbox_min_use - bbox_pad
+                bbox_max_use = bbox_max_use + bbox_pad
+
+                centers, depths, labels = sample_octree_occupancy(
+                    body=ipw_body,
+                    bbox_min=bbox_min_use,
+                    bbox_max=bbox_max_use,
+                    coarse_depth=coarse_depth,
+                    fine_depth=fine_depth,
+                    max_nodes=max_nodes,
+                    contains_points_fn=contains_points_fn,
+                )
+                return centers, depths, labels, bbox_min_use.astype(np.float32), bbox_max_use.astype(np.float32)
+        elif backend == "nx":
+            body_bbox_min, body_bbox_max = get_body_axis_aligned_bbox(ipw_body)
+        else:
+            raise ValueError(f"Unsupported OCTREE_CONTAINMENT_BACKEND: {backend!r}")
+
+        bbox_min_use = np.minimum(bbox_min_use, body_bbox_min)
+        bbox_max_use = np.maximum(bbox_max_use, body_bbox_max)
+        bbox_extent = np.maximum(bbox_max_use - bbox_min_use, 1e-6)
+        bbox_pad = bbox_extent * float(max(bbox_padding, 0.0))
+        bbox_min_use = bbox_min_use - bbox_pad
+        bbox_max_use = bbox_max_use + bbox_pad
+
+        centers, depths, labels = sample_octree_occupancy(
+            body=ipw_body,
+            bbox_min=bbox_min_use,
+            bbox_max=bbox_max_use,
+            coarse_depth=coarse_depth,
+            fine_depth=fine_depth,
+            max_nodes=max_nodes,
+            contains_points_fn=contains_points_fn,
+        )
+        return centers, depths, labels, bbox_min_use.astype(np.float32), bbox_max_use.astype(np.float32)
+    finally:
+        session.UndoToMark(markId, "before_octree")
 
 
 def CAMFilter(dec_input_list,dec_output_list, cycle_time_list, volume_diff_list):

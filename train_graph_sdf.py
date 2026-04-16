@@ -9,6 +9,8 @@ from graph_sdf import GraphSdfModelConfig, GraphSdfPlanningModel
 from graph_sdf.training import (
     planner_train_step,
     planner_validation_step,
+    transition_train_step,
+    transition_validation_step,
 )
 
 
@@ -22,9 +24,12 @@ class TrainConfig:
     target_node_loss_weight: float = 1.0
     tool_choice_loss_weight: float = 1.0
     strategy_loss_weight: float = 0.25
-    transition_loss_weight: float = 1.0
-    point_sdf_loss_weight: float = 1.0
-    changed_mask_loss_weight: float = 0.25
+    transition_loss_weight: float = 0.0
+    point_sdf_loss_weight: float = 0.0
+    changed_mask_loss_weight: float = 0.0
+    # Octree-only transition supervision.
+    octree_loss_weight: float = 1.0
+    octree_pos_weight_factor: float = 2.0
 
 
 def run_training(
@@ -45,12 +50,13 @@ def run_training(
                 optimizer,
                 device,
                 macro_class_loss_weight=config.macro_class_loss_weight,
-                target_node_loss_weight=config.target_node_loss_weight,
+                action_face_loss_weight=config.target_node_loss_weight,
                 tool_choice_loss_weight=config.tool_choice_loss_weight,
-                strategy_loss_weight=config.strategy_loss_weight,
                 transition_loss_weight=config.transition_loss_weight,
                 point_sdf_loss_weight=config.point_sdf_loss_weight,
                 changed_mask_loss_weight=config.changed_mask_loss_weight,
+                octree_loss_weight=config.octree_loss_weight,
+                octree_pos_weight_factor=config.octree_pos_weight_factor,
             )
             for batch in train_loader
         ]
@@ -60,19 +66,56 @@ def run_training(
                 batch,
                 device,
                 macro_class_loss_weight=config.macro_class_loss_weight,
-                target_node_loss_weight=config.target_node_loss_weight,
+                action_face_loss_weight=config.target_node_loss_weight,
                 tool_choice_loss_weight=config.tool_choice_loss_weight,
-                strategy_loss_weight=config.strategy_loss_weight,
                 transition_loss_weight=config.transition_loss_weight,
                 point_sdf_loss_weight=config.point_sdf_loss_weight,
                 changed_mask_loss_weight=config.changed_mask_loss_weight,
+                octree_loss_weight=config.octree_loss_weight,
+                octree_pos_weight_factor=config.octree_pos_weight_factor,
             )
             for batch in val_loader
         ]
 
         train_loss = sum(train_losses) / max(len(train_losses), 1)
         val_loss = sum(val_losses) / max(len(val_losses), 1)
-        print(f"[Planner+Transition][Epoch {epoch + 1}] train={train_loss:.6f} val={val_loss:.6f}")
+        print(f"[Planner+Octree][Epoch {epoch + 1}] train={train_loss:.6f} val={val_loss:.6f}")
+
+
+def run_transition_training(
+    model: GraphSdfPlanningModel,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    config: TrainConfig,
+) -> None:
+    """Trains only the action-conditioned octree transition model."""
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+
+    for epoch in range(config.epochs):
+        train_losses = [
+            transition_train_step(
+                model,
+                batch,
+                optimizer,
+                device,
+                octree_pos_weight_factor=config.octree_pos_weight_factor,
+            )
+            for batch in train_loader
+        ]
+        val_losses = [
+            transition_validation_step(
+                model,
+                batch,
+                device,
+                octree_pos_weight_factor=config.octree_pos_weight_factor,
+            )
+            for batch in val_loader
+        ]
+
+        train_loss = sum(train_losses) / max(len(train_losses), 1)
+        val_loss = sum(val_losses) / max(len(val_losses), 1)
+        print(f"[TransitionOnly-Octree][Epoch {epoch + 1}] train={train_loss:.6f} val={val_loss:.6f}")
 
 
 def build_model(device: torch.device) -> GraphSdfPlanningModel:
@@ -85,6 +128,7 @@ def build_model(device: torch.device) -> GraphSdfPlanningModel:
 
 if __name__ == "__main__":
     print(
-        "This script provides the planner training runner only. "
-        "Connect your DataLoader instances and call run_training from your training entrypoint."
+        "This script provides training runners only. "
+        "Connect your DataLoader instances and call run_training or run_transition_training "
+        "from your training entrypoint."
     )

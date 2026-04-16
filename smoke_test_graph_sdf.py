@@ -1,4 +1,4 @@
-"""Simple smoke test for the Graph-SDF planner + transition package."""
+"""Simple smoke test for the graph planner + octree transition model."""
 
 import torch
 
@@ -6,9 +6,9 @@ from graph_sdf import GraphSdfModelConfig, GraphSdfPlanningModel
 
 
 def run_smoke_test() -> None:
-    """Runs a minimal planner and transition forward pass on random tensors."""
+    """Runs a minimal planner and octree forward pass on random tensors."""
 
-    cfg = GraphSdfModelConfig()
+    cfg = GraphSdfModelConfig(octree_query_nodes=64)
     model = GraphSdfPlanningModel(cfg)
 
     batch_size = 2
@@ -21,6 +21,8 @@ def run_smoke_test() -> None:
     macro_class_id = torch.randint(0, cfg.macro_class_count, (batch_size,))
     tool_choice_id = torch.randint(0, cfg.tool_choice_count, (batch_size,))
     action_face_id = torch.randint(0, cfg.num_nodes, (batch_size,))
+    octree_centers = torch.rand(batch_size, cfg.octree_query_nodes, 3) * 2.0 - 1.0
+    octree_depths = torch.randint(cfg.octree_coarse_depth, cfg.octree_fine_depth + 1, (batch_size, cfg.octree_query_nodes))
 
     outputs = model(
         state_points=state_points,
@@ -34,15 +36,15 @@ def run_smoke_test() -> None:
         target_action_face=action_face_id,
         use_teacher_forcing_action=True,
         run_transition=True,
+        octree_centers=octree_centers,
+        octree_depths=octree_depths,
     )
     print("[Planner] macro_class_logits:", tuple(outputs["macro_class_logits"].shape))
     print("[Planner] action_face_logits:", tuple(outputs["action_face_logits"].shape))
     print("[Planner] tool_choice_logits:", tuple(outputs["tool_choice_logits"].shape))
     print("[Planner] pred_axis_from_face:", tuple(outputs["pred_axis_from_face"].shape))
     print("[Planner] pred_axis_mode:", tuple(outputs["pred_axis_mode"].shape))
-    print("[Transition] pred_next_node_sdf:", tuple(outputs["pred_next_node_sdf"].shape))
-    print("[Transition] pred_next_point_sdf:", tuple(outputs["pred_next_point_sdf"].shape))
-    print("[Transition] pred_changed_logits:", tuple(outputs["pred_changed_logits"].shape))
+    print("[Octree] occ_logits:", tuple(outputs["occ_logits"].shape))
 
 
 if __name__ == "__main__":

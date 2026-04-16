@@ -146,7 +146,8 @@ REQUIRED_COLS = [
     "tool_choice_id", "tool_choice_valid",
     "action_face_id", "action_face_valid",
     "state_points", "node_mask", "point_mask",
-    "next_node_sdf", "next_point_sdf",
+    "octree_centers", "octree_depths", "octree_occ_labels",
+    "octree_bbox_min", "octree_bbox_max",
     "node_process_state", "global_process_state",
     "macro_class_mask", "tool_choice_mask", "action_face_mask",
     "centrality_512", "spatial_pos_512x512", "face_area_512x1",
@@ -155,8 +156,6 @@ REQUIRED_COLS = [
 
 SHAPE_CHECKS = {
     "state_points":       (512, 100, 7),
-    "next_node_sdf":      (512,),
-    "next_point_sdf":     (512, 100),
     "node_mask":          (512,),
     "point_mask":         (512, 100),
     "node_process_state": (512, 2),
@@ -167,6 +166,8 @@ SHAPE_CHECKS = {
     "centrality_512":     (512,),
     "face_area_512x1":    (512, 1),
     "axis_visible_512":   (512,),
+    "octree_bbox_min":    (3,),
+    "octree_bbox_max":    (3,),
 }
 
 
@@ -256,7 +257,49 @@ def validate_parquet(pq_path: str) -> int:
         else:
             _ok(f"'{col}'  shape={expected_shape}  ✓")
 
-    # ── SDF value range checks ────────────────────────────────────────────────
+    # ── octree transition target checks ──────────────────────────────────────
+    if {"octree_centers", "octree_depths", "octree_occ_labels"}.issubset(df.columns):
+        octree_failures = 0
+        node_counts = []
+        occ_ratios = []
+        for _, row in df.head(10).iterrows():
+            centers = _load_array(row, "octree_centers")
+            depths = _load_array(row, "octree_depths")
+            labels = _load_array(row, "octree_occ_labels")
+            if centers is None or depths is None or labels is None:
+                _fail("octree target has missing value")
+                octree_failures += 1
+                continue
+            centers = centers.reshape(-1, 3)
+            depths = depths.reshape(-1)
+            labels = labels.reshape(-1)
+            if not (len(centers) == len(depths) == len(labels)):
+                _fail(
+                    "octree target length mismatch: "
+                    f"centers={len(centers)} depths={len(depths)} labels={len(labels)}"
+                )
+                octree_failures += 1
+                continue
+            if np.isnan(centers).any() or np.isnan(labels).any():
+                _fail("octree target contains NaN")
+                octree_failures += 1
+                continue
+            if not np.all((labels >= 0.0) & (labels <= 1.0)):
+                _fail("octree_occ_labels must be in [0, 1]")
+                octree_failures += 1
+                continue
+            node_counts.append(len(labels))
+            occ_ratios.append(float(labels.mean()) if len(labels) else 0.0)
+        if octree_failures:
+            failures += octree_failures
+        elif node_counts:
+            _ok(
+                "octree targets "
+                f"K range=[{min(node_counts)}, {max(node_counts)}] "
+                f"mean_occ_ratio={float(np.mean(occ_ratios)):.3f}"
+            )
+
+    # ── SDF value range checks (legacy optional) ─────────────────────────────
     if "next_node_sdf" in df.columns:
         chosen = df[df["is_chosen"] == 1] if "is_chosen" in df.columns else df
         sdfs = np.concatenate([

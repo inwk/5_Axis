@@ -118,3 +118,38 @@ def transition_reconstruction_loss(
         total_loss = total_loss + changed_mask_weight * changed_loss
 
     return total_loss
+
+
+def occupancy_bce_loss(
+    occ_logits: torch.Tensor,
+    occ_labels: torch.Tensor,
+    occ_valid_mask: Optional[torch.Tensor] = None,
+    pos_weight_factor: float = 1.0,
+) -> torch.Tensor:
+    """Binary cross-entropy loss for volumetric occupancy prediction.
+
+    Args:
+        occ_logits:       [B, Q] raw logits from OccupancyDecoder.
+        occ_labels:       [B, Q] float32 labels — 1.0 = inside material after
+                          the operation, 0.0 = empty / removed.
+        occ_valid_mask:   Optional [B, Q] bool; True = include this query point.
+                          When None, all points are used.
+        pos_weight_factor: Scalar multiplier for the positive-class BCE weight.
+                          Increase (e.g. 2–5) when empty-space samples outnumber
+                          inside-material samples.
+
+    Returns:
+        Scalar loss tensor.
+    """
+    if occ_valid_mask is None:
+        occ_valid_mask = torch.ones_like(occ_labels, dtype=torch.bool)
+
+    pos_weight = occ_labels.new_tensor([pos_weight_factor])
+    per_point = F.binary_cross_entropy_with_logits(
+        occ_logits,
+        occ_labels,
+        pos_weight=pos_weight,
+        reduction="none",
+    )  # [B, Q]
+    valid = occ_valid_mask.float()
+    return (per_point * valid).sum() / valid.sum().clamp_min(1.0)

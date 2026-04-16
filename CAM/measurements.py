@@ -414,3 +414,196 @@ def sample_convergent_face_points(face):
 def sample_face_points(face):
     """Samples points, normals, and probe lines on a regular face."""
     return generate_points(face)
+
+
+# Adaptive octree occupancy sampling.
+def _is_point_inside_body_uf(body, x: float, y: float, z: float) -> bool:
+    """Returns True when the point (x, y, z) is inside or on the body surface.
+
+    Uses ``NXOpen.UF.Modeling.AskPointContainment``:
+        1 = point is inside the body
+        2 = point is outside the body
+        3 = point is on the body
+
+    Occupancy is defined as inside or on-boundary material.
+    """
+    uf = NXOpen.UF.UFSession.GetUFSession()
+    status = int(uf.Modeling.AskPointContainment([float(x), float(y), float(z)], body.Tag))
+    if status not in (1, 2, 3):
+        raise RuntimeError(f"Unexpected AskPointContainment status: {status}")
+    return status in (1, 3)
+
+
+def get_body_axis_aligned_bbox(body) -> "tuple[np.ndarray, np.ndarray]":
+    """Returns an axis-aligned bounding box by sampling body face geometry."""
+    uf = NXOpen.UF.UFSession.GetUFSession()
+    points = []
+
+    for face in body.GetFaces():
+        try:
+            for edge in face.GetEdges():
+                for vertex in edge.GetVertices():
+                    points.append([float(vertex.X), float(vertex.Y), float(vertex.Z)])
+        except Exception:
+            pass
+
+        try:
+            if hasattr(face, "GetNumberOfFacets"):
+                facet = face.GetFirstFacetOnFace()
+                for _ in range(int(face.GetNumberOfFacets())):
+                    if facet is None:
+                        break
+                    for vertex in facet.GetVertices():
+                        points.append([float(vertex.X), float(vertex.Y), float(vertex.Z)])
+                    facet = face.GetNextFacet(facet)
+        except Exception:
+            pass
+
+        try:
+            uv = uf.Modeling.AskFaceUvMinmax(face.Tag)
+            us = np.linspace(float(uv[0]), float(uv[1]), 4)
+            vs = np.linspace(float(uv[2]), float(uv[3]), 4)
+            for u in us:
+                for v in vs:
+                    point, _, _, _, _, _, _ = uf.Modeling.AskFaceProps(face.Tag, [float(u), float(v)])
+                    points.append([float(point[0]), float(point[1]), float(point[2])])
+        except Exception:
+            pass
+
+    if not points:
+        raise RuntimeError("Could not sample any body points for bbox")
+
+    arr = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    bbox_min = arr.min(axis=0)
+    bbox_max = arr.max(axis=0)
+    return bbox_min.astype(np.float32), bbox_max.astype(np.float32)
+
+
+def sample_octree_occupancy(
+    body,
+    bbox_min: "np.ndarray",
+    bbox_max: "np.ndarray",
+    coarse_depth: int = 3,
+    fine_depth: int = 5,
+    max_nodes: int = 4096,
+    rng: "np.random.Generator | None" = None,
+    contains_points_fn=None,
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray]":
+    """Samples adaptive octree leaf centers and occupancy labels from an NX body.
+
+    The sampler builds a uniform coarse grid first, detects boundary cells from
+    6-neighbor occupancy changes, and refines only those boundary cells to
+    ``fine_depth``.  Returned centers are raw world coordinates in millimeters.
+
+    Returns:
+        centers: [K, 3] float32 leaf centers.
+        depths:  [K] int16 octree depth for each leaf.
+        labels:  [K] float32, 1.0 inside material, 0.0 outside.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    coarse_depth = int(max(0, coarse_depth))
+    fine_depth = int(max(coarse_depth, fine_depth))
+    max_nodes = int(max(1, max_nodes))
+
+    bbox_min_f = np.asarray(bbox_min, dtype=np.float64).reshape(3)
+    bbox_max_f = np.asarray(bbox_max, dtype=np.float64).reshape(3)
+    extent = bbox_max_f - bbox_min_f
+    max_extent = float(np.max(np.abs(extent)))
+    if max_extent <= 1e-9:
+        max_extent = 1.0
+    extent = np.where(np.abs(extent) <= 1e-9, max_extent * 1e-6, extent)
+    bbox_max_f = bbox_min_f + extent
+
+    coarse_n = 2 ** coarse_depth
+    coarse_indices = np.indices((coarse_n, coarse_n, coarse_n), dtype=np.int32)
+    coarse_indices = coarse_indices.reshape(3, -1).T
+    coarse_cell = extent / float(coarse_n)
+    coarse_centers = bbox_min_f.reshape(1, 3) + (coarse_indices.astype(np.float64) + 0.5) * coarse_cell.reshape(1, 3)
+
+    def label_points(points: "np.ndarray") -> "np.ndarray":
+        points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        if contains_points_fn is not None:
+            return np.asarray(contains_points_fn(points), dtype=np.float32).reshape(-1)
+        labels_out = np.zeros((points.shape[0],), dtype=np.float32)
+        for point_i, point in enumerate(points):
+            if _is_point_inside_body_uf(body, float(point[0]), float(point[1]), float(point[2])):
+                labels_out[point_i] = 1.0
+        return labels_out
+
+    coarse_labels = label_points(coarse_centers)
+
+    labels_grid = coarse_labels.reshape(coarse_n, coarse_n, coarse_n)
+    boundary_grid = np.zeros_like(labels_grid, dtype=bool)
+    for axis in range(3):
+        diff = np.diff(labels_grid, axis=axis) != 0
+        left = [slice(None), slice(None), slice(None)]
+        right = [slice(None), slice(None), slice(None)]
+        left[axis] = slice(0, -1)
+        right[axis] = slice(1, None)
+        boundary_grid[tuple(left)] |= diff
+        boundary_grid[tuple(right)] |= diff
+
+    boundary_flat = boundary_grid.reshape(-1)
+    non_boundary = ~boundary_flat
+
+    leaf_centers = []
+    leaf_depths = []
+    leaf_labels = []
+
+    if np.any(non_boundary):
+        leaf_centers.append(coarse_centers[non_boundary])
+        leaf_depths.append(np.full(int(non_boundary.sum()), coarse_depth, dtype=np.int16))
+        leaf_labels.append(coarse_labels[non_boundary])
+
+    if np.any(boundary_flat) and fine_depth > coarse_depth:
+        refine_factor = 2 ** (fine_depth - coarse_depth)
+        fine_cell = extent / float(2 ** fine_depth)
+        child_offsets = np.indices((refine_factor, refine_factor, refine_factor), dtype=np.int32)
+        child_offsets = child_offsets.reshape(3, -1).T.astype(np.float64) + 0.5
+
+        boundary_parent_indices = coarse_indices[boundary_flat]
+        child_count = child_offsets.shape[0]
+        fine_budget = max_nodes - int(non_boundary.sum())
+        total_fine = int(boundary_parent_indices.shape[0] * child_count)
+        if fine_budget > 0 and total_fine > fine_budget:
+            sampled_child_ids = rng.choice(total_fine, size=int(fine_budget), replace=False)
+            parent_ids = sampled_child_ids // child_count
+            child_ids = sampled_child_ids % child_count
+            parent_min = bbox_min_f.reshape(1, 3) + boundary_parent_indices[parent_ids].astype(np.float64) * coarse_cell.reshape(1, 3)
+            fine_centers = parent_min + child_offsets[child_ids] * fine_cell.reshape(1, 3)
+        else:
+            fine_chunks = []
+            for parent_index in boundary_parent_indices:
+                parent_min = bbox_min_f + parent_index.astype(np.float64) * coarse_cell
+                fine_chunks.append(parent_min.reshape(1, 3) + child_offsets * fine_cell.reshape(1, 3))
+            fine_centers = np.vstack(fine_chunks) if fine_chunks else np.empty((0, 3), dtype=np.float64)
+        fine_labels = label_points(fine_centers)
+        leaf_centers.append(fine_centers)
+        leaf_depths.append(np.full(fine_centers.shape[0], fine_depth, dtype=np.int16))
+        leaf_labels.append(fine_labels)
+    elif np.any(boundary_flat):
+        leaf_centers.append(coarse_centers[boundary_flat])
+        leaf_depths.append(np.full(int(boundary_flat.sum()), coarse_depth, dtype=np.int16))
+        leaf_labels.append(coarse_labels[boundary_flat])
+
+    centers = np.vstack(leaf_centers).astype(np.float32) if leaf_centers else coarse_centers.astype(np.float32)
+    depths = np.concatenate(leaf_depths).astype(np.int16) if leaf_depths else np.full(coarse_centers.shape[0], coarse_depth, dtype=np.int16)
+    labels = np.concatenate(leaf_labels).astype(np.float32) if leaf_labels else coarse_labels.astype(np.float32)
+
+    if centers.shape[0] > max_nodes:
+        fine_idx = np.flatnonzero(depths == fine_depth)
+        coarse_idx = np.flatnonzero(depths != fine_depth)
+        if fine_idx.size >= max_nodes:
+            keep = rng.choice(fine_idx, size=max_nodes, replace=False)
+        else:
+            remaining = max_nodes - fine_idx.size
+            extra = rng.choice(coarse_idx, size=min(remaining, coarse_idx.size), replace=False) if coarse_idx.size else np.asarray([], dtype=np.int64)
+            keep = np.concatenate([fine_idx, extra])
+        rng.shuffle(keep)
+        centers = centers[keep]
+        depths = depths[keep]
+        labels = labels[keep]
+
+    return centers.astype(np.float32), depths.astype(np.int16), labels.astype(np.float32)

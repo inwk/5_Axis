@@ -3,6 +3,7 @@
 from .config import GraphSdfModelConfig
 from .dataset import ProcessSkeletonParquetDataset
 from .model import GraphSdfPlanningModel
+from .octree_decoder import OctreeDecoder
 from .process_planner import ProcessPlannerHead
 from .shape_transition import ShapeTransitionHead
 from .schema import (
@@ -21,6 +22,7 @@ __all__ = [
     "GraphSdfModelConfig",
     "GraphSdfPlanningModel",
     "ID_TO_MACRO_CLASS",
+    "OctreeDecoder",
     "ID_TO_TOOL_CHOICE",
     "MACRO_CLASS_TO_ID",
     "ProcessSkeletonParquetDataset",
