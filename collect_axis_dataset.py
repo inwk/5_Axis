@@ -1046,6 +1046,7 @@ def simulate_single_action(
     commit_to_chain: bool = False,
     operation_depth: int = 0,
     base_object_blank=None,
+    precomputed_before_state: Dict[str, Any] | None = None,
     # ── Adaptive octree occupancy sampling ────────────────────────────────
     # Leaf centers are sampled from obj_a (post-op body) while it is still live
     # in the NX undo stack.
@@ -1088,37 +1089,56 @@ def simulate_single_action(
         state_chain = []
 
     # ── Measure BEFORE ──
-    m_bef = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "sim_meas_bef")
-    m_bef_chain_snapshot = list(state_chain)
     pw_before = None
-    try:
-        obj_b = create_measure_geometry_for_depth(
-            session, work_part, prt_file_path, state_chain, origin_body,
-            int(operation_depth), base_object_blank,
-        )
-        if capture_pw:
-            dev_before, pw_raw_bef, vol_before = cam_utils.measure_ipw_state_detailed(
-                session, work_part, obj_b, flat_tools[0],
-                points_array, norm_vecs_array, lines_array,
+    if precomputed_before_state is not None:
+        dev_before = np.asarray(precomputed_before_state["dev_raw"], dtype=np.float32).reshape(-1)
+        vol_before = float(precomputed_before_state["volume"])
+        dev_bef_red_512 = np.asarray(
+            precomputed_before_state.get(
+                "dev_red_512",
+                pad_1d_float(
+                    reduce_scalar_by_groups(dev_before, groups_face, weights=face_areas),
+                    512,
+                ),
+            ),
+            dtype=np.float32,
+        ).reshape(512)
+        if "point_sdf_before_512x100" in precomputed_before_state:
+            pw_before = np.asarray(
+                precomputed_before_state["point_sdf_before_512x100"],
+                dtype=np.float32,
+            ).reshape(512, 100)
+    else:
+        m_bef = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "sim_meas_bef")
+        m_bef_chain_snapshot = list(state_chain)
+        try:
+            obj_b = create_measure_geometry_for_depth(
+                session, work_part, prt_file_path, state_chain, origin_body,
+                int(operation_depth), base_object_blank,
             )
-            dev_bef_red = reduce_scalar_by_groups(np.asarray(dev_before, dtype=np.float32), groups_face, weights=face_areas)
-            pw_before = build_group_point_sdf_512x100(
-                group_reference_points_512x100x3, groups_face,
-                measurement_point_coords, pw_raw_bef,
-                pad_1d_float(dev_bef_red, 512),
-            )
-        else:
-            dev_before, vol_before = cam_utils.measure_ipw_state(
-                session, work_part, obj_b, flat_tools[0],
-                points_array, norm_vecs_array, lines_array,
-            )
-            dev_bef_red = reduce_scalar_by_groups(np.asarray(dev_before, dtype=np.float32), groups_face, weights=face_areas)
-    finally:
-        session.UndoToMark(m_bef, "sim_meas_bef")
-        session.DeleteUndoMark(m_bef, "sim_meas_bef")
-        restore_workpiece_chain(state_chain, m_bef_chain_snapshot)
+            if capture_pw:
+                dev_before, pw_raw_bef, vol_before = cam_utils.measure_ipw_state_detailed(
+                    session, work_part, obj_b, flat_tools[0],
+                    points_array, norm_vecs_array, lines_array,
+                )
+                dev_bef_red = reduce_scalar_by_groups(np.asarray(dev_before, dtype=np.float32), groups_face, weights=face_areas)
+                pw_before = build_group_point_sdf_512x100(
+                    group_reference_points_512x100x3, groups_face,
+                    measurement_point_coords, pw_raw_bef,
+                    pad_1d_float(dev_bef_red, 512),
+                )
+            else:
+                dev_before, vol_before = cam_utils.measure_ipw_state(
+                    session, work_part, obj_b, flat_tools[0],
+                    points_array, norm_vecs_array, lines_array,
+                )
+                dev_bef_red = reduce_scalar_by_groups(np.asarray(dev_before, dtype=np.float32), groups_face, weights=face_areas)
+        finally:
+            session.UndoToMark(m_bef, "sim_meas_bef")
+            session.DeleteUndoMark(m_bef, "sim_meas_bef")
+            restore_workpiece_chain(state_chain, m_bef_chain_snapshot)
 
-    dev_bef_red_512 = pad_1d_float(dev_bef_red, 512)
+        dev_bef_red_512 = pad_1d_float(dev_bef_red, 512)
     result: Dict[str, Any] = {
         "ok": True, "error": None,
         "optype": optype, "tool_kind": tool_kind, "tool_diameter": tool_diameter,
@@ -1631,6 +1651,75 @@ def measure_current_state(
         session.DeleteUndoMark(m, "measure_state")
         restore_workpiece_chain(workpiece_name_chain, chain_snapshot)
     return float(vol), dev_red_512
+
+def measure_current_state_for_branch(
+    session, work_part, prt_file_path, origin_body, origin_faces, groups_face,
+    face_areas, points_array, norm_vecs_array, lines_array, flat_tools,
+    workpiece_name_chain: List[str] | None = None,
+    state_depth: int = 0,
+    base_object_blank=None,
+    capture_pointwise: bool = False,
+    group_reference_points_512x100x3: np.ndarray | None = None,
+    measurement_point_coords: List[np.ndarray] | None = None,
+) -> Dict[str, Any]:
+    """Measures a branch state once and reuses it for all candidate actions.
+
+    Candidate actions from the same branch share the same current IPW.  This
+    cache avoids repeated GetInputIpw/deviation queries inside every candidate
+    simulation while preserving the same raw and reduced state tensors.
+    """
+    if workpiece_name_chain is None:
+        workpiece_name_chain = []
+    m = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "measure_branch_state")
+    chain_snapshot = list(workpiece_name_chain)
+    try:
+        obj_blank = create_measure_geometry_for_depth(
+            session, work_part, prt_file_path, workpiece_name_chain, origin_body,
+            int(state_depth), base_object_blank,
+        )
+        out: Dict[str, Any] = {}
+        if capture_pointwise and group_reference_points_512x100x3 is not None and measurement_point_coords is not None:
+            dev_raw, pointwise_raw, vol = cam_utils.measure_ipw_state_detailed(
+                session,
+                work_part,
+                obj_blank,
+                flat_tools[0],
+                points_array,
+                norm_vecs_array,
+                lines_array,
+            )
+            dev_red = reduce_scalar_by_groups(np.asarray(dev_raw, dtype=np.float32), groups_face, weights=face_areas)
+            dev_red_512 = pad_1d_float(dev_red, 512)
+            out["point_sdf_before_512x100"] = build_group_point_sdf_512x100(
+                group_reference_points_512x100x3,
+                groups_face,
+                measurement_point_coords,
+                pointwise_raw,
+                dev_red_512,
+            ).astype(np.float32)
+        else:
+            dev_raw, vol = cam_utils.measure_ipw_state(
+                session,
+                work_part,
+                obj_blank,
+                flat_tools[0],
+                points_array,
+                norm_vecs_array,
+                lines_array,
+            )
+            dev_red = reduce_scalar_by_groups(np.asarray(dev_raw, dtype=np.float32), groups_face, weights=face_areas)
+            dev_red_512 = pad_1d_float(dev_red, 512)
+
+        out.update({
+            "volume": float(vol),
+            "dev_raw": np.asarray(dev_raw, dtype=np.float32).reshape(-1),
+            "dev_red_512": np.asarray(dev_red_512, dtype=np.float32).reshape(512),
+        })
+        return out
+    finally:
+        session.UndoToMark(m, "measure_branch_state")
+        session.DeleteUndoMark(m, "measure_branch_state")
+        restore_workpiece_chain(workpiece_name_chain, chain_snapshot)
 
 def simulate_rollout_for_axis(
     session, work_part, prt_file_path, origin_body, origin_faces, groups_face,
@@ -2491,13 +2580,15 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                     continue
 
                 K_groups = len(groups_face)
-                state_volume, state_dev_red_512 = measure_current_state(
+                branch_before_state = measure_current_state_for_branch(
                     session, work_part, prt_file_path, origin_body, origin_faces, groups_face,
                     face_areas, points_array, norm_vecs_array, lines_array, flat_tools,
                     workpiece_name_chain=workpiece_name_chain,
                     state_depth=len(branch["history"]),
                     base_object_blank=base_object_blank,
                 )
+                state_volume = float(branch_before_state["volume"])
+                state_dev_red_512 = np.asarray(branch_before_state["dev_red_512"], dtype=np.float32).reshape(512)
                 state_done_mask_512, all_done = compute_done_mask_from_dev_red_with_K(
                     state_dev_red_512, SURFACE_FINISH_TOL, K_groups,
                 )
@@ -2551,6 +2642,16 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                     })
                     continue
 
+                # Branch-invariant octree bbox.  Candidate simulations can reuse
+                # this instead of recomputing it for every candidate action.
+                _oct_valid_pts = face_pc_raw_512[node_mask_512 == 0]  # [K_valid, P, 3]
+                _oct_valid_pts_flat = _oct_valid_pts.reshape(-1, 3)
+                _oct_raw_min = _oct_valid_pts_flat.min(axis=0)
+                _oct_raw_max = _oct_valid_pts_flat.max(axis=0)
+                _oct_pad = (_oct_raw_max - _oct_raw_min) * OCTREE_BBOX_PADDING
+                _oct_raw_min = _oct_raw_min - _oct_pad
+                _oct_raw_max = _oct_raw_max + _oct_pad
+
                 scored: List[Tuple[float, int, Dict[str, Any], Dict[str, Any], int, Dict[str, Any]]] = []
                 reject_stats = {"cam_error": 0, "no_effect": 0, "below_min_effect": 0}
                 reject_examples: List[str] = []
@@ -2566,15 +2667,6 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                     candidate_error_snapshot_path = ""
                     rollback_error = None
                     try:
-                        # Pre-compute world-space bbox for octree sampling.
-                        _oct_valid_pts = face_pc_raw_512[node_mask_512 == 0]  # [K_valid, P, 3]
-                        _oct_valid_pts_flat = _oct_valid_pts.reshape(-1, 3)
-                        _oct_raw_min = _oct_valid_pts_flat.min(axis=0)
-                        _oct_raw_max = _oct_valid_pts_flat.max(axis=0)
-                        _oct_pad = (_oct_raw_max - _oct_raw_min) * OCTREE_BBOX_PADDING
-                        _oct_raw_min = _oct_raw_min - _oct_pad
-                        _oct_raw_max = _oct_raw_max + _oct_pad
-
                         result = simulate_single_action(
                             session=session, work_part=work_part,
                             prt_file_path=prt_file_path,
@@ -2588,6 +2680,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                             commit_to_chain=True,
                             operation_depth=len(branch["history"]),
                             base_object_blank=base_object_blank,
+                            precomputed_before_state=branch_before_state,
                             # Octree occupancy sampling
                             octree_bbox_min_raw=_oct_raw_min,
                             octree_bbox_max_raw=_oct_raw_max,
