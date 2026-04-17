@@ -155,6 +155,7 @@ class OctreeDecoder(nn.Module):
         action_context:  [B, H]     – from ActionEmbedding
         octree_centers:  [B, K, 3]  – octree node centres (normalised coords)
         octree_depths:   [B, K]     – integer depth of each node (0=root)
+        octree_occ_before: [B, K]   optional current-state occupancy
         node_mask:       [B, N]     – True for padded face nodes (optional)
 
     Output:
@@ -174,6 +175,12 @@ class OctreeDecoder(nn.Module):
         # ── Input projection: pos_encoding → hidden ───────────────────────
         self.input_proj = nn.Sequential(
             nn.Linear(pos_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+        )
+        self.current_occ_proj = nn.Sequential(
+            nn.Linear(2, hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden),
@@ -206,6 +213,7 @@ class OctreeDecoder(nn.Module):
         action_context:  torch.Tensor,                         # [B, H]
         octree_centers:  torch.Tensor,                         # [B, K, 3]
         octree_depths:   torch.Tensor,                         # [B, K]  int
+        octree_occ_before: Optional[torch.Tensor] = None,       # [B, K]
         node_mask: Optional[torch.Tensor] = None,              # [B, N]
     ) -> torch.Tensor:
         """Returns occupancy logits [B, K]."""
@@ -217,6 +225,14 @@ class OctreeDecoder(nn.Module):
         # Fourier-encode + project
         pos_encoded     = self.pos_enc(xyzd)                   # [B, K, pos_dim]
         query_features  = self.input_proj(pos_encoded)          # [B, K, H]
+
+        if octree_occ_before is not None:
+            occ_before = octree_occ_before.float().clamp(0.0, 1.0)
+            if occ_before.ndim == 3 and occ_before.shape[-1] == 1:
+                occ_before = occ_before.squeeze(-1)
+            known = torch.ones_like(occ_before)
+            current_occ_features = torch.stack([occ_before, known], dim=-1)
+            query_features = query_features + self.current_occ_proj(current_occ_features)
 
         # Add depth embedding
         depth_clamped = octree_depths.long().clamp(0, self.max_depth)
@@ -265,7 +281,7 @@ class OctreeDecoder(nn.Module):
         for s in range(0, centers_flat.shape[1], chunk):
             c = centers_flat[:, s:s + chunk, :]
             d = depths_flat[:, s:s + chunk]
-            logit_parts.append(self.forward(node_embeddings, action_context, c, d, node_mask))
+            logit_parts.append(self.forward(node_embeddings, action_context, c, d, None, node_mask))
         probs = torch.sigmoid(torch.cat(logit_parts, dim=1).squeeze(0))
         probs = probs.reshape(R, R, R).cpu().numpy()
 
@@ -324,7 +340,7 @@ class OctreeDecoder(nn.Module):
                 break
 
             logits = self.forward(node_embeddings, action_context,
-                                  active_centers, active_depths, node_mask)  # [1, M]
+                                  active_centers, active_depths, None, node_mask)  # [1, M]
             probs  = torch.sigmoid(logits.squeeze(0))                         # [M]
 
             if depth == self.max_depth:

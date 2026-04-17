@@ -27,11 +27,13 @@ Current action order is `macro process + action face + tool choice`.  The axis i
 - optional `node_centrality`: `[B, N]`.
 - optional `spatial_pos`: `[B, N, N]`.
 - optional `face_area`: `[B, N, 1]`.
+- optional `node_face_type`: `[B, N]` discrete NX surface/face type ids.
 - `macro_class_id`: `[B]`.
 - `action_face_id`: `[B]`.
 - `tool_choice_id`: `[B]`.
 - `octree_centers`: `[B, K, 3]` normalized adaptive octree leaf centers.
 - `octree_depths`: `[B, K]` integer octree level per leaf.
+- optional `octree_occ_labels_before`: `[B, K]` current-state occupancy at the same octree cells; used as decoder input and monotonicity supervision.
 - `octree_occ_labels`: `[B, K]` next-state occupancy labels, `1=inside material`, `0=empty`.
 - optional `octree_bbox_min`, `octree_bbox_max`: normalized octree sampling bounds for mesh extraction.
 - optional `action_face_valid`, `tool_choice_valid`, `node_mask`, `point_mask`.

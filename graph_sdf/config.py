@@ -15,6 +15,7 @@ class GraphSdfModelConfig:
     node_process_feature_dim: int = 2
     global_process_feature_dim: int = 11
     face_area_feature_dim: int = 1
+    face_type_vocab_size: int = 32
     hidden_dim: int = 128                 # 64 → 128: octree decoder needs more capacity
     transformer_heads: int = 8
     transformer_layers: int = 4
@@ -70,6 +71,8 @@ class GraphSdfModelConfig:
             raise ValueError("global_process_feature_dim must be non-negative")
         if self.face_area_feature_dim < 0:
             raise ValueError("face_area_feature_dim must be non-negative")
+        if self.face_type_vocab_size <= 0:
+            raise ValueError("face_type_vocab_size must be positive")
         if self.action_embedding_dim <= 0:
             raise ValueError("action_embedding_dim must be positive")
         if self.transition_decoder_layers <= 0:

@@ -1976,7 +1976,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     origin_faces = origin_body.GetFaces()
     origin_faces_tag = [f.Tag for f in origin_faces]
 
-    graph, _, face_areas, _ = cam_utils.get_encoder_input_data(origin_faces, origin_faces_tag)
+    graph, _, face_areas, face_types = cam_utils.get_encoder_input_data(origin_faces, origin_faces_tag)
     face_areas = np.asarray(face_areas, dtype=np.float32)
     _, points_array_origin = cam_utils.get_face_point_cloud(origin_faces)
     raw_face_count = int(len(origin_faces))
@@ -1998,6 +1998,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     centrality = pad_1d_int(np.array([graph_dense.degree(n) for n in range(raw_face_count)], dtype=np.int16), 512)
     spatial_pos = pad_2d_int(build_graph_distance_matrix(graph_dense).astype(np.int16), 512)
     face_area_raw_512 = pad_face_area(face_areas.astype(np.float32), 512)
+    face_type_512 = pad_1d_int(np.asarray(face_types, dtype=np.int16), 512)
     face_pc_raw_512 = pad_face_pc(np.asarray(points_array_origin, dtype=np.float32), 512)
 
     points_array, norm_vecs_array, lines_array = [], [], []
@@ -2178,6 +2179,14 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 "sampled_branches": int(SAMPLED_BRANCHES),
             },
             "node_process_state_channels": ["rough_done", "finish_ready"],
+            "face_type_schema": {
+                "source": "NXOpen.Face.SolidFaceType.value with legacy blend/small-hole remapping",
+                "padding": 0,
+                "legacy_remap": {
+                    "blend_or_type_ge_5": 5,
+                    "small_circular_planar_face": 6,
+                },
+            },
             "global_process_state_channels": [
                 "prev_macro_onehot_5",
                 "rough_ratio",
@@ -2206,6 +2215,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     _np_save(os.path.join(out_dir, "embed_centrality.npy"), centrality)
     _np_save(os.path.join(out_dir, "embed_spatial_pos.npy"), spatial_pos)
     _np_save(os.path.join(out_dir, "embed_face_area.npy"), face_area)
+    _np_save(os.path.join(out_dir, "embed_face_type.npy"), face_type_512)
     _np_save(os.path.join(out_dir, "embed_face_pc.npy"), face_pc)
 
     rough_done_cumulative_512 = np.zeros((512,), dtype=np.int16)
@@ -2398,6 +2408,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             "centrality_512": _to_serializable_list(np.asarray(centrality, dtype=np.int16)),
             "spatial_pos_512x512": _to_serializable_list(np.asarray(spatial_pos, dtype=np.int16)),
             "face_area_512x1": _to_serializable_list(np.asarray(face_area, dtype=np.float32)),
+            "face_type_512": _to_serializable_list(np.asarray(face_type_512, dtype=np.int16)),
 
             "axis_visible_512": _to_serializable_list(axis_visible_512.astype(np.int16)),
             "state_node_sdf_raw_512": _to_serializable_list(state_node_sdf_raw.astype(np.float32)),

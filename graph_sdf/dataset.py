@@ -245,6 +245,12 @@ class ProcessSkeletonParquetDataset(Dataset):
             face_area = torch.from_numpy(self._array(row["face_area_512x1"], np.float32).reshape(num_nodes, 1))
             batch["face_area_512x1"] = face_area
             batch["face_area"] = face_area
+        if "face_type_512" in row.index:
+            face_type = torch.from_numpy(self._array(row["face_type_512"], np.int16).reshape(num_nodes))
+        else:
+            face_type = torch.zeros((num_nodes,), dtype=torch.int16)
+        batch["face_type_512"] = face_type
+        batch["node_face_type"] = face_type
         if "axis_visible_512" in row.index:
             axis_visible = torch.from_numpy(self._array(row["axis_visible_512"], np.int16).reshape(num_nodes))
             batch["axis_visible_512"] = axis_visible
@@ -311,6 +317,7 @@ class ProcessSkeletonParquetDataset(Dataset):
                             rng=sample_rng_b,
                         )
                         batch["octree_occ_labels_before"] = torch.from_numpy(labels_before_sampled)
+                        batch["octree_occ_before"] = batch["octree_occ_labels_before"]
 
         bbox_min_raw = row["octree_bbox_min"] if "octree_bbox_min" in row.index else None
         bbox_max_raw = row["octree_bbox_max"] if "octree_bbox_max" in row.index else None

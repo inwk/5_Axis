@@ -72,6 +72,7 @@ EXPECTED_NPY = {
     "embed_centrality.npy":    {"shape": (512,),        "dtype": np.int16},
     "embed_spatial_pos.npy":   {"shape": (512, 512),    "dtype": np.int16},
     "embed_face_area.npy":     {"shape": (512, 1),      "dtype": np.float32},
+    "embed_face_type.npy":     {"shape": (512,),        "dtype": np.int16},
     "embed_face_pc.npy":       {"shape": (512, 100, 3), "dtype": np.float32},
 }
 
@@ -151,6 +152,7 @@ REQUIRED_COLS = [
     "node_process_state", "global_process_state",
     "macro_class_mask", "tool_choice_mask", "action_face_mask",
     "centrality_512", "spatial_pos_512x512", "face_area_512x1",
+    "face_type_512",
     "axis_visible_512",
 ]
 
@@ -165,6 +167,7 @@ SHAPE_CHECKS = {
     "action_face_mask":   (512,),
     "centrality_512":     (512,),
     "face_area_512x1":    (512, 1),
+    "face_type_512":      (512,),
     "axis_visible_512":   (512,),
     "octree_bbox_min":    (3,),
     "octree_bbox_max":    (3,),

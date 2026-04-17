@@ -114,6 +114,7 @@ class GraphSdfPlanningModel(nn.Module):
         node_centrality:    Optional[torch.Tensor] = None,
         spatial_pos:        Optional[torch.Tensor] = None,
         face_area:          Optional[torch.Tensor] = None,
+        node_face_type:     Optional[torch.Tensor] = None,
         node_mask:          Optional[torch.Tensor] = None,
         point_mask:         Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -124,6 +125,7 @@ class GraphSdfPlanningModel(nn.Module):
             node_centrality=node_centrality,
             spatial_pos=spatial_pos,
             face_area=face_area,
+            node_face_type=node_face_type,
             node_mask=node_mask,
             point_mask=point_mask,
         )
@@ -135,6 +137,7 @@ class GraphSdfPlanningModel(nn.Module):
         node_centrality:    Optional[torch.Tensor] = None,
         spatial_pos:        Optional[torch.Tensor] = None,
         face_area:          Optional[torch.Tensor] = None,
+        node_face_type:     Optional[torch.Tensor] = None,
         node_mask:          Optional[torch.Tensor] = None,
         point_mask:         Optional[torch.Tensor] = None,
         axis_visible:       Optional[torch.Tensor] = None,
@@ -152,6 +155,7 @@ class GraphSdfPlanningModel(nn.Module):
             node_centrality=node_centrality,
             spatial_pos=spatial_pos,
             face_area=face_area,
+            node_face_type=node_face_type,
             node_mask=node_mask,
             point_mask=point_mask,
         )
@@ -186,11 +190,13 @@ class GraphSdfPlanningModel(nn.Module):
         action_face_id:  torch.Tensor,
         octree_centers:  torch.Tensor,   # [B, K, 3]
         octree_depths:   torch.Tensor,   # [B, K]
+        octree_occ_before: Optional[torch.Tensor] = None,  # [B, K]
         axis_visible:         Optional[torch.Tensor] = None,
         node_process_state:   Optional[torch.Tensor] = None,
         node_centrality:      Optional[torch.Tensor] = None,
         spatial_pos:          Optional[torch.Tensor] = None,
         face_area:            Optional[torch.Tensor] = None,
+        node_face_type:       Optional[torch.Tensor] = None,
         node_mask:            Optional[torch.Tensor] = None,
         point_mask:           Optional[torch.Tensor] = None,
         state_embedding:      Optional[torch.Tensor] = None,
@@ -212,6 +218,7 @@ class GraphSdfPlanningModel(nn.Module):
                 node_centrality=node_centrality,
                 spatial_pos=spatial_pos,
                 face_area=face_area,
+                node_face_type=node_face_type,
                 node_mask=node_mask,
                 point_mask=point_mask,
             )
@@ -233,6 +240,7 @@ class GraphSdfPlanningModel(nn.Module):
             action_context=action_context,
             octree_centers=octree_centers,
             octree_depths=octree_depths,
+            octree_occ_before=octree_occ_before,
             node_mask=node_mask,
         )
         return {
@@ -252,6 +260,7 @@ class GraphSdfPlanningModel(nn.Module):
         node_centrality:    Optional[torch.Tensor] = None,
         spatial_pos:        Optional[torch.Tensor] = None,
         face_area:          Optional[torch.Tensor] = None,
+        node_face_type:     Optional[torch.Tensor] = None,
         node_mask:          Optional[torch.Tensor] = None,
         point_mask:         Optional[torch.Tensor] = None,
         adaptive: bool = True,
@@ -274,6 +283,7 @@ class GraphSdfPlanningModel(nn.Module):
             node_centrality=node_centrality,
             spatial_pos=spatial_pos,
             face_area=face_area,
+            node_face_type=node_face_type,
             node_mask=node_mask,
             point_mask=point_mask,
         )
@@ -315,6 +325,7 @@ class GraphSdfPlanningModel(nn.Module):
         node_centrality:    Optional[torch.Tensor] = None,
         spatial_pos:        Optional[torch.Tensor] = None,
         face_area:          Optional[torch.Tensor] = None,
+        node_face_type:     Optional[torch.Tensor] = None,
         node_mask:          Optional[torch.Tensor] = None,
         point_mask:         Optional[torch.Tensor] = None,
         axis_visible:       Optional[torch.Tensor] = None,
@@ -330,6 +341,7 @@ class GraphSdfPlanningModel(nn.Module):
         # Octree decoder inputs (None → skipped)
         octree_centers: Optional[torch.Tensor] = None,   # [B, K, 3]
         octree_depths:  Optional[torch.Tensor] = None,   # [B, K]
+        octree_occ_before: Optional[torch.Tensor] = None, # [B, K]
     ) -> dict[str, torch.Tensor]:
         """Run planner; optionally run octree decoder.
 
@@ -342,6 +354,7 @@ class GraphSdfPlanningModel(nn.Module):
             node_centrality=node_centrality,
             spatial_pos=spatial_pos,
             face_area=face_area,
+            node_face_type=node_face_type,
             node_mask=node_mask,
             point_mask=point_mask,
             global_process_state=global_process_state,
@@ -393,8 +406,10 @@ class GraphSdfPlanningModel(nn.Module):
                 action_face_id=action_face_id,
                 octree_centers=octree_centers,
                 octree_depths=octree_depths,
+                octree_occ_before=octree_occ_before,
                 axis_visible=axis_visible,
                 node_process_state=node_process_state,
+                node_face_type=node_face_type,
                 node_mask=node_mask,
                 point_mask=point_mask,
                 state_embedding=outputs["state_embedding"],

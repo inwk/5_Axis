@@ -30,6 +30,8 @@ class StateEncoder(nn.Module):
             if config.face_area_feature_dim > 0
             else None
         )
+        self.face_type_embedding = nn.Embedding(config.face_type_vocab_size, config.hidden_dim)
+        self.face_type_vocab_size = int(config.face_type_vocab_size)
         self.node_index_embedding = nn.Embedding(config.num_nodes, config.hidden_dim)
         self.centrality_embedding = nn.Embedding(config.centrality_vocab_size + 1, config.hidden_dim)
         self.centrality_vocab_size = config.centrality_vocab_size
@@ -48,6 +50,7 @@ class StateEncoder(nn.Module):
         node_centrality: Optional[torch.Tensor] = None,
         spatial_pos: Optional[torch.Tensor] = None,
         face_area: Optional[torch.Tensor] = None,
+        node_face_type: Optional[torch.Tensor] = None,
         node_mask: Optional[torch.Tensor] = None,
         point_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -74,6 +77,9 @@ class StateEncoder(nn.Module):
         if node_centrality is not None:
             clipped = node_centrality.long().clamp(min=0, max=self.centrality_vocab_size)
             node_features = node_features + self.centrality_embedding(clipped)
+        if node_face_type is not None:
+            clipped_face_type = node_face_type.long().clamp(min=0, max=self.face_type_vocab_size - 1)
+            node_features = node_features + self.face_type_embedding(clipped_face_type)
 
         node_index = torch.arange(node_count, device=node_point_features.device).unsqueeze(0)
         node_index = node_index.expand(batch_size, node_count)

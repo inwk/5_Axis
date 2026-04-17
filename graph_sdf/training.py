@@ -83,6 +83,7 @@ def _collect_common_inputs(batch: dict, device: torch.device) -> dict:
         "node_centrality": _to_device(batch.get("node_centrality"), device),
         "spatial_pos": _to_device(batch.get("spatial_pos"), device),
         "face_area": _to_device(batch.get("face_area"), device),
+        "node_face_type": _to_device(batch.get("node_face_type"), device),
         "axis_visible": _to_device(batch.get("axis_visible"), device),
         "global_process_state": _to_device(batch.get("global_process_state"), device),
         "target_macro_class": target_macro_class,
@@ -107,6 +108,7 @@ def _encode_state_only(model: GraphSdfPlanningModel, inputs: dict) -> torch.Tens
         node_centrality=inputs["node_centrality"],
         spatial_pos=inputs["spatial_pos"],
         face_area=inputs["face_area"],
+        node_face_type=inputs["node_face_type"],
         node_mask=inputs["node_mask"],
         point_mask=inputs["point_mask"],
     )
@@ -120,6 +122,7 @@ def _run_planner(model: GraphSdfPlanningModel, inputs: dict) -> dict:
         node_centrality=inputs["node_centrality"],
         spatial_pos=inputs["spatial_pos"],
         face_area=inputs["face_area"],
+        node_face_type=inputs["node_face_type"],
         node_mask=inputs["node_mask"],
         point_mask=inputs["point_mask"],
         axis_visible=inputs["axis_visible"],
@@ -193,7 +196,10 @@ def _compute_octree_loss(
 ) -> torch.Tensor:
     """Computes octree occupancy loss (depth-weighted BCE + optional monotonicity).
 
-    Adds two terms when the data is available:
+    When ``octree_occ_labels_before`` is available, it is also passed to the
+    decoder as current-state occupancy at each query cell.
+
+    Adds two loss terms when the data is available:
     1. ``octree_bce_loss``: depth-weighted BCE — finer octree cells get higher
        gradient weight because they carry more surface detail.
     2. ``monotonicity_occupancy_loss`` (scaled by *monotonicity_weight*): soft
@@ -211,6 +217,11 @@ def _compute_octree_loss(
     octree_centers = batch["octree_centers"].to(device)
     octree_depths = batch["octree_depths"].to(device)
     octree_labels = batch["octree_occ_labels"].to(device)
+    octree_occ_before = (
+        batch["octree_occ_labels_before"].to(device)
+        if "octree_occ_labels_before" in batch
+        else None
+    )
 
     octree_outputs = model.forward_octree(
         state_points=inputs["state_points"],
@@ -219,11 +230,13 @@ def _compute_octree_loss(
         action_face_id=inputs["target_action_face"].clamp_min(0),
         octree_centers=octree_centers,
         octree_depths=octree_depths,
+        octree_occ_before=octree_occ_before,
         axis_visible=inputs["axis_visible"],
         node_process_state=inputs["node_process_state"],
         node_centrality=inputs["node_centrality"],
         spatial_pos=inputs["spatial_pos"],
         face_area=inputs["face_area"],
+        node_face_type=inputs["node_face_type"],
         node_mask=inputs["node_mask"],
         point_mask=inputs["point_mask"],
         state_embedding=outputs.get("state_embedding"),
@@ -262,7 +275,8 @@ def _compute_transition_only_octree_loss(
 ) -> torch.Tensor:
     """Computes octree occupancy loss with action labels as inputs and no planner path.
 
-    Uses depth-weighted BCE + optional monotonicity penalty.
+    Uses depth-weighted BCE + optional monotonicity penalty.  When available,
+    before-state occupancy is also used as a decoder query input.
     """
     if model.octree_decoder is None:
         raise RuntimeError("Transition-only training requires model.octree_decoder to be enabled.")
@@ -273,6 +287,11 @@ def _compute_transition_only_octree_loss(
         )
 
     octree_depths = batch["octree_depths"].to(device)
+    octree_occ_before = (
+        batch["octree_occ_labels_before"].to(device)
+        if "octree_occ_labels_before" in batch
+        else None
+    )
     state_embedding = _encode_state_only(model, inputs)
     octree_outputs = model.forward_octree(
         state_points=inputs["state_points"],
@@ -281,11 +300,13 @@ def _compute_transition_only_octree_loss(
         action_face_id=inputs["target_action_face"].clamp_min(0),
         octree_centers=batch["octree_centers"].to(device),
         octree_depths=octree_depths,
+        octree_occ_before=octree_occ_before,
         axis_visible=inputs["axis_visible"],
         node_process_state=inputs["node_process_state"],
         node_centrality=inputs["node_centrality"],
         spatial_pos=inputs["spatial_pos"],
         face_area=inputs["face_area"],
+        node_face_type=inputs["node_face_type"],
         node_mask=inputs["node_mask"],
         point_mask=inputs["point_mask"],
         state_embedding=state_embedding,
