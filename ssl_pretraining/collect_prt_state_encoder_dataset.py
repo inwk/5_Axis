@@ -10,6 +10,7 @@ No CLI arguments are required.
 
 from __future__ import annotations
 
+import gc
 from datetime import datetime
 import glob
 import json
@@ -69,16 +70,46 @@ PRT_GLOB = "*.prt"
 EXPLICIT_PRT_PATHS: list[str] = []
 
 OUTPUT_DIR = r"C:\Users\inwoo\Desktop\5_Axis\ssl_state_encoder_dataset"
-OUTPUT_PARQUET = r""  # If empty, a timestamped parquet is written under OUTPUT_DIR.
+WRITE_ONE_PARQUET_PER_PART = True
+OUTPUT_PARQUET = r""  # Used only when WRITE_ONE_PARQUET_PER_PART=False.
 MAX_PARTS = 0  # 0 means all resolved parts.
 FAIL_ON_ERROR = False
 
 MAX_NODES = 512
 POINTS_PER_FACE = 100
 
+_LOG_PATH: str | None = None
+
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def _configure_log_file(output_dir: str) -> None:
+    """Initializes a sidecar log file because NX stdout can be unreliable."""
+    global _LOG_PATH
+    _ensure_dir(output_dir)
+    _LOG_PATH = os.path.join(
+        output_dir,
+        f"collect_prt_state_encoder_dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+    )
+    _log(f"[INFO] log={_LOG_PATH}")
+
+
+def _log(message: str) -> None:
+    """Writes progress to stdout and to a log file when configured."""
+    text = str(message)
+    try:
+        print(text, flush=True)
+    except Exception:
+        pass
+    if not _LOG_PATH:
+        return
+    try:
+        with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except Exception:
+        pass
 
 
 def _to_serializable_list(x):
@@ -87,12 +118,22 @@ def _to_serializable_list(x):
     return x
 
 
+def _safe_filename(text: str) -> str:
+    """Returns a filesystem-safe filename fragment."""
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(text))
+
+
 def _resolve_prt_files() -> list[str]:
     paths: list[str] = []
     if EXPLICIT_PRT_PATHS:
-        paths.extend(str(Path(p).expanduser().resolve()) for p in EXPLICIT_PRT_PATHS if str(p).strip())
+        _log(f"[INFO] explicit PRT paths configured: {len(EXPLICIT_PRT_PATHS)}")
+        paths.extend(os.path.abspath(os.path.expanduser(p)) for p in EXPLICIT_PRT_PATHS if str(p).strip())
     elif PRT_DIR:
-        paths.extend(str(Path(p).resolve()) for p in sorted(glob.glob(os.path.join(PRT_DIR, PRT_GLOB))))
+        pattern = os.path.join(PRT_DIR, PRT_GLOB)
+        _log(f"[INFO] scanning PRT glob: {pattern}")
+        matched = sorted(glob.glob(pattern))
+        _log(f"[INFO] matched PRT candidates: {len(matched)}")
+        paths.extend(os.path.abspath(p) for p in matched)
     else:
         raise ValueError("Set either EXPLICIT_PRT_PATHS or PRT_DIR at the top of collect_prt_state_encoder_dataset.py")
 
@@ -108,15 +149,18 @@ def _resolve_prt_files() -> list[str]:
         unique.append(path)
     if MAX_PARTS > 0:
         unique = unique[: int(MAX_PARTS)]
+        _log(f"[INFO] MAX_PARTS applied: {len(unique)}")
     if not unique:
         raise ValueError("No .prt files matched the configured paths.")
     return unique
 
 
 def _open_part(prt_path: str):
+    _log(f"[INFO] opening part: {prt_path}")
     session = NXOpen.Session.GetSession()
     _, load_status = session.Parts.OpenActiveDisplay(prt_path, NXOpen.DisplayPartOption.AllowAdditional)
     load_status.Dispose()
+    _log(f"[INFO] opened part: {prt_path}")
     return session, session.Parts.Work
 
 
@@ -308,16 +352,20 @@ def _build_state_points(face_pc_norm: np.ndarray, normals: np.ndarray) -> np.nda
 
 
 def _collect_one_part(prt_path: str) -> dict[str, Any]:
+    part_name = os.path.splitext(os.path.basename(prt_path))[0]
+    _log(f"[INFO] collect start part={part_name}")
     session, work_part = _open_part(prt_path)
     mark = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "ssl_prt_extract")
     try:
         origin_body = max(work_part.Bodies, key=get_body_volume)
         origin_faces = list(origin_body.GetFaces())
         raw_face_count = int(len(origin_faces))
+        _log(f"[INFO] part={part_name} raw_faces={raw_face_count}")
         if raw_face_count > MAX_NODES:
             raise ValueError(f"Raw-face schema requires <= {MAX_NODES} faces, got {raw_face_count}: {prt_path}")
 
         face_tags = [face.Tag for face in origin_faces]
+        _log(f"[INFO] part={part_name} building face adjacency graph")
         graph = _build_graph(origin_faces, face_tags)
         graph_json = json_graph.node_link_data(graph)
 
@@ -333,6 +381,8 @@ def _collect_one_part(prt_path: str) -> dict[str, Any]:
             face_normals[idx] = normal
             face_area[idx, 0] = area
             face_type[idx] = int(_legacy_face_type(face, area))
+            if idx == 0 or (idx + 1) % 50 == 0 or (idx + 1) == raw_face_count:
+                _log(f"[INFO] part={part_name} sampled_faces={idx + 1}/{raw_face_count}")
 
         node_mask = _node_mask(raw_face_count, MAX_NODES)
         point_mask = _point_mask(face_pc_raw, raw_face_count)
@@ -346,9 +396,10 @@ def _collect_one_part(prt_path: str) -> dict[str, Any]:
         for node in graph.nodes():
             if int(node) < MAX_NODES:
                 centrality[int(node)] = int(graph.degree(node))
+        _log(f"[INFO] part={part_name} building graph distance matrix")
         spatial_pos = _build_graph_distance_matrix(graph, MAX_NODES)
 
-        part_name = os.path.splitext(os.path.basename(prt_path))[0]
+        _log(f"[INFO] collect done part={part_name}")
         return {
             "part_name": part_name,
             "prt_file_path": os.path.abspath(prt_path),
@@ -392,42 +443,80 @@ def _collect_one_part(prt_path: str) -> dict[str, Any]:
 
 
 def main() -> None:
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _configure_log_file(OUTPUT_DIR)
+    _log("[INFO] collect_prt_state_encoder_dataset started")
+    _log(f"[INFO] PRT_DIR={PRT_DIR}")
+    _log(f"[INFO] PRT_GLOB={PRT_GLOB}")
+    _log(f"[INFO] OUTPUT_DIR={OUTPUT_DIR}")
+    _log(f"[INFO] WRITE_ONE_PARQUET_PER_PART={WRITE_ONE_PARQUET_PER_PART}")
     prt_files = _resolve_prt_files()
-    _ensure_dir(OUTPUT_DIR)
-    output_path = OUTPUT_PARQUET.strip()
-    if not output_path:
-        output_path = os.path.join(
-            OUTPUT_DIR,
-            f"state_encoder_ssl_prt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet",
-        )
-    output_path = os.path.abspath(output_path)
-    _ensure_dir(os.path.dirname(output_path))
+    output_path = ""
+    if not WRITE_ONE_PARQUET_PER_PART:
+        output_path = OUTPUT_PARQUET.strip()
+        if not output_path:
+            output_path = os.path.join(OUTPUT_DIR, f"state_encoder_ssl_prt_{run_stamp}.parquet")
+        output_path = os.path.abspath(output_path)
+        _ensure_dir(os.path.dirname(output_path))
 
     rows: list[dict[str, Any]] = []
+    written_files: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
-    print(f"[INFO] PRT files={len(prt_files)}")
-    print(f"[INFO] output={output_path}")
+    _log(f"[INFO] PRT files={len(prt_files)}")
+    if WRITE_ONE_PARQUET_PER_PART:
+        _log(f"[INFO] output_mode=one_parquet_per_part output_dir={os.path.abspath(OUTPUT_DIR)}")
+    else:
+        _log(f"[INFO] output_mode=single_parquet output={output_path}")
     for idx, prt_path in enumerate(prt_files, start=1):
         try:
+            _log(f"[INFO] processing {idx}/{len(prt_files)}: {prt_path}")
             row = _collect_one_part(prt_path)
-            rows.append(row)
-            print(f"[{idx}/{len(prt_files)}] ok part={row['part_name']} faces={int(np.sum(np.asarray(row['node_mask']) == 0))}")
+            face_count = int(np.sum(np.asarray(row["node_mask"]) == 0))
+            if WRITE_ONE_PARQUET_PER_PART:
+                part_name = _safe_filename(str(row["part_name"]))
+                part_parquet_path = os.path.abspath(
+                    os.path.join(OUTPUT_DIR, f"{idx:05d}_{part_name}_state_encoder_ssl.parquet")
+                )
+                pd.DataFrame([row]).to_parquet(part_parquet_path, index=False)
+                written_files.append(
+                    {
+                        "part_name": str(row["part_name"]),
+                        "prt_file_path": str(row["prt_file_path"]),
+                        "parquet_path": part_parquet_path,
+                        "face_count": face_count,
+                    }
+                )
+                _log(f"[{idx}/{len(prt_files)}] ok part={row['part_name']} faces={face_count} parquet={part_parquet_path}")
+                del row
+                gc.collect()
+            else:
+                rows.append(row)
+                _log(f"[{idx}/{len(prt_files)}] ok part={row['part_name']} faces={face_count}")
         except Exception as exc:
             errors.append({"prt_file_path": prt_path, "error": repr(exc)})
-            print(f"[WARN] failed {prt_path}: {exc!r}")
+            _log(f"[WARN] failed {prt_path}: {exc!r}")
             if FAIL_ON_ERROR:
                 raise
 
-    if not rows:
+    num_rows = len(written_files) if WRITE_ONE_PARQUET_PER_PART else len(rows)
+    if num_rows <= 0:
         raise RuntimeError(f"No rows collected. errors={errors[:5]}")
 
-    pd.DataFrame(rows).to_parquet(output_path, index=False)
-    summary_path = os.path.splitext(output_path)[0] + "_summary.json"
+    summary_path = (
+        os.path.join(OUTPUT_DIR, f"state_encoder_ssl_prt_{run_stamp}_summary.json")
+        if WRITE_ONE_PARQUET_PER_PART
+        else os.path.splitext(output_path)[0] + "_summary.json"
+    )
+    if not WRITE_ONE_PARQUET_PER_PART:
+        pd.DataFrame(rows).to_parquet(output_path, index=False)
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(
             {
-                "output_parquet": output_path,
-                "num_rows": len(rows),
+                "output_mode": "one_parquet_per_part" if WRITE_ONE_PARQUET_PER_PART else "single_parquet",
+                "output_parquet": output_path if not WRITE_ONE_PARQUET_PER_PART else "",
+                "output_dir": os.path.abspath(OUTPUT_DIR),
+                "parquet_files": written_files,
+                "num_rows": num_rows,
                 "num_errors": len(errors),
                 "errors": errors,
             },
@@ -435,10 +524,12 @@ def main() -> None:
             ensure_ascii=False,
             indent=2,
         )
-    print(f"[OK] parquet saved: {output_path}")
-    print(f"[OK] summary saved: {summary_path}")
+    if not WRITE_ONE_PARQUET_PER_PART:
+        _log(f"[OK] parquet saved: {output_path}")
+    else:
+        _log(f"[OK] parquet files saved: {len(written_files)}")
+    _log(f"[OK] summary saved: {summary_path}")
 
 
 if __name__ == "__main__":
     main()
-

@@ -7,7 +7,9 @@ CAM transition collection/training.
 
 - `collect_prt_state_encoder_dataset.py`
   - NX/Open script.
-  - Opens `.prt` files and writes a lightweight StateEncoder SSL parquet.
+  - Opens `.prt` files and writes lightweight StateEncoder SSL parquet files.
+  - Default output mode is one parquet per `.prt` so rows are not accumulated in memory.
+  - Set `WRITE_ONE_PARQUET_PER_PART = False` only if a single bundled parquet is explicitly needed.
   - Does not create CAM operations, IPW bodies, toolpaths, octree labels, or SDF transition labels.
   - `state_points[..., 6]` is zero-filled because prt-only data has no current residual/SDF.
 
@@ -29,4 +31,3 @@ CAM transition collection/training.
 3. Set `PARQUET_DIR` or `EXPLICIT_PARQUET_PATHS` in `train_state_encoder_ssl.py`.
 4. Keep `SDF_LOSS_WEIGHT = 0.0` for prt-only data.
 5. Train and use the saved `encoder_state_dict` for downstream transition fine-tuning.
-
