@@ -30,6 +30,9 @@ class StateEncoderSslLossConfig:
     edge_loss_weight: float = 0.5
     use_edge_loss: bool = True
     edge_pairs_per_sample: int = 512
+    # Optional CE weights for face-type reconstruction. Length must match
+    # GraphSdfModelConfig.face_type_vocab_size when provided.
+    face_type_class_weights: tuple[float, ...] | None = None
 
 
 class StateEncoderSslModel(nn.Module):
@@ -274,7 +277,19 @@ def compute_ssl_loss(
     outputs = model(**corrupted)
 
     target_type = targets["face_type"].clamp(min=0, max=model.config.face_type_vocab_size - 1)
-    type_loss = F.cross_entropy(outputs["face_type_logits"][ssl_mask], target_type[ssl_mask])
+    face_type_weight = None
+    if loss_config.face_type_class_weights is not None:
+        if len(loss_config.face_type_class_weights) != int(model.config.face_type_vocab_size):
+            raise ValueError(
+                "face_type_class_weights length must match face_type_vocab_size "
+                f"({len(loss_config.face_type_class_weights)} != {model.config.face_type_vocab_size})"
+            )
+        face_type_weight = outputs["face_type_logits"].new_tensor(loss_config.face_type_class_weights)
+    type_loss = F.cross_entropy(
+        outputs["face_type_logits"][ssl_mask],
+        target_type[ssl_mask],
+        weight=face_type_weight,
+    )
 
     normal_cos = (outputs["pred_normal"][ssl_mask] * targets["normal"][ssl_mask]).sum(dim=-1).clamp(-1.0, 1.0)
     normal_loss = (1.0 - normal_cos).mean()
@@ -306,10 +321,19 @@ def compute_ssl_loss(
     )
 
     with torch.no_grad():
-        type_acc = float((outputs["face_type_logits"][ssl_mask].argmax(dim=-1) == target_type[ssl_mask]).float().mean().item())
+        target_type_masked = target_type[ssl_mask]
+        pred_type_masked = outputs["face_type_logits"][ssl_mask].argmax(dim=-1)
+        type_acc = float((pred_type_masked == target_type_masked).float().mean().item())
         sdf_mae = float(torch.abs(outputs["pred_sdf"][ssl_mask] - targets["sdf"][ssl_mask]).mean().item())
         area_mae = float(torch.abs(outputs["pred_log_area"][ssl_mask] - targets["log_area"][ssl_mask]).mean().item())
         normal_cos_mean = float(normal_cos.mean().item())
+        type_counts: dict[str, float] = {}
+        for class_id in range(int(model.config.face_type_vocab_size)):
+            class_mask = target_type_masked == class_id
+            count = int(class_mask.sum().item())
+            correct = int(((pred_type_masked == target_type_masked) & class_mask).sum().item())
+            type_counts[f"type_count_{class_id}"] = float(count)
+            type_counts[f"type_correct_{class_id}"] = float(correct)
 
     metrics = {
         "loss": float(loss.detach().item()),
@@ -325,6 +349,7 @@ def compute_ssl_loss(
         "edge_acc": edge_acc,
         "masked_ratio": float(ssl_mask.float().mean().item()),
     }
+    metrics.update(type_counts)
     return loss, metrics
 
 
@@ -336,5 +361,8 @@ def merge_metrics(items: list[dict[str, float]]) -> dict[str, float]:
     out: dict[str, float] = {}
     for key in keys:
         values = [m[key] for m in items if not np.isnan(m[key])]
-        out[key] = float(sum(values) / max(len(values), 1)) if values else math.nan
+        if key.startswith("type_count_") or key.startswith("type_correct_"):
+            out[key] = float(sum(values)) if values else 0.0
+        else:
+            out[key] = float(sum(values) / max(len(values), 1)) if values else math.nan
     return out

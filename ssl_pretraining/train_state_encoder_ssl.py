@@ -72,6 +72,16 @@ EDGE_LOSS_WEIGHT = 0.5
 USE_EDGE_LOSS = True
 EDGE_PAIRS_PER_SAMPLE = 512
 
+# Face-type imbalance handling.
+# Use "sqrt_inv_clipped" for the observed imbalanced face-type distribution.
+# Set to "none" only when you need an unweighted ablation.
+FACE_TYPE_CLASS_WEIGHT_MODE = "sqrt_inv_clipped"  # "none" or "sqrt_inv_clipped"
+FACE_TYPE_CLASS_WEIGHT_MIN = 0.5
+FACE_TYPE_CLASS_WEIGHT_MAX = 3.0
+FACE_TYPE_REPORT_CLASSES = [1, 2, 3, 4, 5, 6]
+FACE_TYPE_LOW_ACC_WARN_CLASSES = [3, 6]
+FACE_TYPE_LOW_ACC_THRESHOLD = 0.60
+
 SAVE_CHECKPOINTS = True
 CHECKPOINT_ROOT = r"C:\Users\inwoo\Desktop\5_Axis\checkpoints_state_encoder_ssl"
 RUN_NAME = ""
@@ -96,6 +106,84 @@ def _make_run_dir() -> Path | None:
 
 def _save_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _face_type_counts(
+    dataset: StateEncoderSslParquetDataset,
+    indices: list[int],
+    vocab_size: int,
+) -> np.ndarray:
+    """Counts valid-node face types for the selected dataset rows."""
+    counts = np.zeros((int(vocab_size),), dtype=np.int64)
+    for idx in indices:
+        row = dataset.df.iloc[int(idx)]
+        face_type = dataset._array(row["face_type_512"], np.int16).reshape(-1)
+        if "node_mask" in row.index:
+            node_mask = dataset._array(row["node_mask"], np.int16).reshape(-1)
+        else:
+            node_mask = np.zeros_like(face_type, dtype=np.int16)
+        count = min(len(face_type), len(node_mask))
+        valid = node_mask[:count] == 0
+        valid_face_type = np.clip(face_type[:count][valid], 0, int(vocab_size) - 1)
+        if valid_face_type.size:
+            bincount = np.bincount(valid_face_type.astype(np.int64), minlength=int(vocab_size))
+            counts += bincount[: int(vocab_size)]
+    return counts
+
+
+def _build_face_type_class_weights(
+    counts: np.ndarray,
+    mode: str,
+    min_weight: float,
+    max_weight: float,
+) -> tuple[float, ...] | None:
+    """Builds mild face-type CE weights from training-set counts."""
+    normalized_mode = str(mode).strip().lower()
+    if normalized_mode in {"", "none", "off", "false", "0"}:
+        return None
+    if normalized_mode != "sqrt_inv_clipped":
+        raise ValueError(f"Unsupported FACE_TYPE_CLASS_WEIGHT_MODE: {mode}")
+
+    counts = np.asarray(counts, dtype=np.float64)
+    weights = np.ones_like(counts, dtype=np.float64)
+    present = counts > 0
+    if not present.any():
+        return tuple(float(x) for x in weights)
+
+    freq = counts[present] / float(counts[present].sum())
+    inv_sqrt = 1.0 / np.sqrt(np.maximum(freq, 1e-12))
+    inv_sqrt = inv_sqrt / float(inv_sqrt.mean())
+    inv_sqrt = np.clip(inv_sqrt, float(min_weight), float(max_weight))
+    weights[present] = inv_sqrt
+    return tuple(float(x) for x in weights)
+
+
+def _face_type_acc(metrics: dict[str, float], class_id: int) -> float:
+    count = float(metrics.get(f"type_count_{int(class_id)}", 0.0))
+    correct = float(metrics.get(f"type_correct_{int(class_id)}", 0.0))
+    return float(correct / count) if count > 0 else float("nan")
+
+
+def _format_face_type_acc(metrics: dict[str, float], class_ids: list[int]) -> str:
+    chunks = []
+    for class_id in class_ids:
+        count = int(metrics.get(f"type_count_{int(class_id)}", 0.0))
+        acc = _face_type_acc(metrics, int(class_id))
+        if np.isnan(acc):
+            chunks.append(f"t{int(class_id)}=nan({count})")
+        else:
+            chunks.append(f"t{int(class_id)}={acc:.3f}({count})")
+    return " ".join(chunks)
+
+
+def _low_accuracy_warnings(metrics: dict[str, float], class_ids: list[int], threshold: float) -> list[str]:
+    warnings = []
+    for class_id in class_ids:
+        count = int(metrics.get(f"type_count_{int(class_id)}", 0.0))
+        acc = _face_type_acc(metrics, int(class_id))
+        if count > 0 and not np.isnan(acc) and acc < float(threshold):
+            warnings.append(f"type {int(class_id)} acc={acc:.3f} count={count}")
+    return warnings
 
 
 def _save_checkpoint(
@@ -154,6 +242,13 @@ def main() -> None:
     )
 
     model_config = GraphSdfModelConfig()
+    train_face_type_counts = _face_type_counts(dataset, train_indices, model_config.face_type_vocab_size)
+    face_type_class_weights = _build_face_type_class_weights(
+        train_face_type_counts,
+        FACE_TYPE_CLASS_WEIGHT_MODE,
+        FACE_TYPE_CLASS_WEIGHT_MIN,
+        FACE_TYPE_CLASS_WEIGHT_MAX,
+    )
     loss_config = StateEncoderSslLossConfig(
         mask_node_ratio=MASK_NODE_RATIO,
         mask_face_type_id=MASK_FACE_TYPE_ID,
@@ -166,6 +261,7 @@ def main() -> None:
         edge_loss_weight=EDGE_LOSS_WEIGHT,
         use_edge_loss=USE_EDGE_LOSS,
         edge_pairs_per_sample=EDGE_PAIRS_PER_SAMPLE,
+        face_type_class_weights=face_type_class_weights,
     )
     model = StateEncoderSslModel(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -185,6 +281,9 @@ def main() -> None:
                 "weight_decay": WEIGHT_DECAY,
                 "model_config": asdict(model_config),
                 "loss_config": asdict(loss_config),
+                "face_type_class_weight_mode": FACE_TYPE_CLASS_WEIGHT_MODE,
+                "face_type_train_counts": train_face_type_counts.tolist(),
+                "face_type_class_weights": list(face_type_class_weights) if face_type_class_weights is not None else None,
                 "train_rows": len(train_indices),
                 "val_rows": len(val_indices),
             },
@@ -196,6 +295,10 @@ def main() -> None:
     print(f"[Train] epochs={NUM_EPOCHS} lr={LEARNING_RATE} batch={BATCH_SIZE} mask_ratio={MASK_NODE_RATIO}")
     resolved_mask_id = MASK_FACE_TYPE_ID if MASK_FACE_TYPE_ID >= 0 else model_config.face_type_vocab_size - 1
     print(f"[FaceType] vocab={model_config.face_type_vocab_size} mask_id={resolved_mask_id}")
+    print(f"[FaceType Counts] { {i: int(c) for i, c in enumerate(train_face_type_counts.tolist()) if int(c) > 0} }")
+    print(f"[FaceType Weight Mode] {FACE_TYPE_CLASS_WEIGHT_MODE}")
+    if face_type_class_weights is not None:
+        print(f"[FaceType Weights] { {i: round(float(w), 4) for i, w in enumerate(face_type_class_weights) if int(train_face_type_counts[i]) > 0} }")
     print(
         f"[Loss] type={TYPE_LOSS_WEIGHT} normal={NORMAL_LOSS_WEIGHT} "
         f"sdf={SDF_LOSS_WEIGHT} area={AREA_LOSS_WEIGHT} edge={EDGE_LOSS_WEIGHT}"
@@ -240,6 +343,22 @@ def main() -> None:
                 f"sdf_mae={val_avg.get('sdf_mae', float('nan')):.6f} "
                 f"edge_acc={val_avg.get('edge_acc', float('nan')):.4f}"
             )
+            print(
+                "            "
+                f"type_acc_by_class={_format_face_type_acc(val_avg, FACE_TYPE_REPORT_CLASSES)}"
+            )
+            low_acc = _low_accuracy_warnings(
+                val_avg,
+                FACE_TYPE_LOW_ACC_WARN_CLASSES,
+                FACE_TYPE_LOW_ACC_THRESHOLD,
+            )
+            if low_acc and FACE_TYPE_CLASS_WEIGHT_MODE.strip().lower() in {"", "none", "off", "false", "0"}:
+                print(
+                    "            "
+                    "[WARN] low minority face-type accuracy; consider "
+                    "FACE_TYPE_CLASS_WEIGHT_MODE='sqrt_inv_clipped': "
+                    + "; ".join(low_acc)
+                )
 
     print("[Done] StateEncoder SSL pretraining finished.")
 

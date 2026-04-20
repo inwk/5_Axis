@@ -23,6 +23,8 @@ CAM transition collection/training.
 - `analyze_face_type_distribution.py`
   - Reads only `face_type_512`, `node_mask`, and optional `part_name`.
   - Reports valid-node face-type counts, ratios, part coverage, and class-balance weights.
+  - The `sqrt_inv_clipped_weight` column matches the optional
+    `FACE_TYPE_CLASS_WEIGHT_MODE = "sqrt_inv_clipped"` training mode.
 
 - `state_encoder_dataset.py`
   - Minimal parquet dataset loader for StateEncoder SSL columns.
@@ -40,3 +42,8 @@ CAM transition collection/training.
 
 Run `analyze_face_type_distribution.py` before training if you need to inspect
 face-type class imbalance.
+
+During SSL training, `train_state_encoder_ssl.py` prints validation
+`type_acc_by_class` for the configured face-type classes. The default
+`FACE_TYPE_CLASS_WEIGHT_MODE = "sqrt_inv_clipped"` applies mild weighted CE for
+the observed imbalance; set it to `"none"` only for an unweighted ablation.

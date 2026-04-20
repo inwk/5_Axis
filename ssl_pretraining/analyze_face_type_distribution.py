@@ -102,6 +102,20 @@ def _effective_number_weight(count: int, beta: float = 0.999) -> float:
     return float((1.0 - beta) / (1.0 - math.pow(beta, int(count))))
 
 
+def _sqrt_inv_weights(counts: list[int], min_weight: float = 0.5, max_weight: float = 3.0) -> np.ndarray:
+    """Mild class weights used by train_state_encoder_ssl.py."""
+    arr = np.asarray(counts, dtype=np.float64)
+    weights = np.ones_like(arr)
+    present = arr > 0
+    if not present.any():
+        return weights
+    freq = arr[present] / float(arr[present].sum())
+    inv_sqrt = 1.0 / np.sqrt(np.maximum(freq, 1e-12))
+    inv_sqrt = inv_sqrt / float(inv_sqrt.mean())
+    weights[present] = np.clip(inv_sqrt, float(min_weight), float(max_weight))
+    return weights
+
+
 def main() -> None:
     parquet_files = resolve_parquet_files(
         parquet_dir=PARQUET_DIR,
@@ -158,8 +172,10 @@ def main() -> None:
         raise RuntimeError(f"No face type values found. errors={errors[:5]}")
 
     total = int(sum(counts.values()))
+    sorted_items = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    sqrt_inv_weight_by_rank = _sqrt_inv_weights([int(count) for _, count in sorted_items])
     rows = []
-    for type_id, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+    for rank, (type_id, count) in enumerate(sorted_items):
         rows.append(
             {
                 "face_type_id": int(type_id),
@@ -169,6 +185,7 @@ def main() -> None:
                 "padded_count_with_same_id": int(padded_counts.get(int(type_id), 0)),
                 "inverse_freq_weight_raw": _safe_ratio(total, int(count)),
                 "effective_num_weight_raw": _effective_number_weight(int(count)),
+                "sqrt_inv_clipped_weight": float(sqrt_inv_weight_by_rank[rank]),
             }
         )
 
