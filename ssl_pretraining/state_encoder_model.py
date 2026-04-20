@@ -18,7 +18,9 @@ class StateEncoderSslLossConfig:
     """Loss and corruption settings for StateEncoder SSL."""
 
     mask_node_ratio: float = 0.25
-    mask_face_type_id: int = 0
+    # -1 means "use the last face-type vocab id" as a dedicated SSL mask token.
+    # This keeps the mask token separate from real class 0 / padding.
+    mask_face_type_id: int = -1
     mask_normal_and_sdf: bool = True
     mask_face_area: bool = True
     type_loss_weight: float = 1.0
@@ -197,7 +199,11 @@ def corrupt_inputs(
         state_points[ssl_mask, :, 6] = 0.0
     if loss_config.mask_face_area:
         face_area[ssl_mask] = 0.0
-    node_face_type[ssl_mask] = int(loss_config.mask_face_type_id)
+    mask_face_type_id = int(loss_config.mask_face_type_id)
+    if mask_face_type_id < 0:
+        mask_face_type_id = int(model_config.face_type_vocab_size) - 1
+    mask_face_type_id = max(0, min(mask_face_type_id, int(model_config.face_type_vocab_size) - 1))
+    node_face_type[ssl_mask] = mask_face_type_id
 
     return {
         "state_points": state_points,
@@ -332,4 +338,3 @@ def merge_metrics(items: list[dict[str, float]]) -> dict[str, float]:
         values = [m[key] for m in items if not np.isnan(m[key])]
         out[key] = float(sum(values) / max(len(values), 1)) if values else math.nan
     return out
-

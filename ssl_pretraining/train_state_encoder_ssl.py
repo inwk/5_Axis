@@ -55,7 +55,9 @@ WEIGHT_DECAY = 1e-4
 PRINT_EVERY = 1
 
 MASK_NODE_RATIO = 0.25
-MASK_FACE_TYPE_ID = 0
+# -1 uses GraphSdfModelConfig.face_type_vocab_size - 1 as a dedicated SSL mask token.
+# Keep this separate from real face type 0 / padding.
+MASK_FACE_TYPE_ID = -1
 MASK_NORMAL_AND_SDF = True
 MASK_FACE_AREA = True
 
@@ -192,6 +194,8 @@ def main() -> None:
     print(f"[Files] {len(parquet_files)} parquet files")
     print(f"[Rows] total={len(dataset)} train={len(train_indices)} val={len(val_indices)}")
     print(f"[Train] epochs={NUM_EPOCHS} lr={LEARNING_RATE} batch={BATCH_SIZE} mask_ratio={MASK_NODE_RATIO}")
+    resolved_mask_id = MASK_FACE_TYPE_ID if MASK_FACE_TYPE_ID >= 0 else model_config.face_type_vocab_size - 1
+    print(f"[FaceType] vocab={model_config.face_type_vocab_size} mask_id={resolved_mask_id}")
     print(
         f"[Loss] type={TYPE_LOSS_WEIGHT} normal={NORMAL_LOSS_WEIGHT} "
         f"sdf={SDF_LOSS_WEIGHT} area={AREA_LOSS_WEIGHT} edge={EDGE_LOSS_WEIGHT}"
@@ -242,4 +246,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
