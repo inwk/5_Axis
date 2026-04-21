@@ -23,7 +23,7 @@ Current action order is `macro process + action face + tool choice`.  The axis i
 
 - `state_points`: `[B, N, P, F]`; channel 6 remains the current-state SDF/residual input feature.
 - optional `node_process_state`: `[B, N, 2]` where channels are `rough_done`, `finish_ready`.
-- optional `global_process_state`: `[B, 11]` where features are `prev_macro_onehot(5) + rough_ratio + finish_ratio + bbox_extent_xyz + log_ref_scale`.
+- optional `global_process_state`: `[B, 11]` where features are `prev_macro_onehot(5) + cumulative_removed_ratio + remaining_volume_ratio + bbox_extent_xyz + log_ref_scale`.
 - optional `node_centrality`: `[B, N]`.
 - optional `spatial_pos`: `[B, N, N]`.
 - optional `face_area`: `[B, N, 1]`.

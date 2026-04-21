@@ -17,7 +17,7 @@ Each row stores:
 - `node_process_state`
   `[512, 2] = rough_done(1) + finish_ready(1)`
 - `global_process_state`
-  `[9] = prev_macro_onehot(7) + rough_ratio + finish_ratio`
+  `[11] = prev_macro_onehot(5) + cumulative_removed_ratio + remaining_volume_ratio + bbox_extent_xyz(3) + log_ref_scale`
 - `macro_class_id`
   `0..6` for:
   `3-axis rough`, `3-axis finish`, `3+2 rough`, `3+2 finish`, `5-axis point`, `5-axis flank`, `STOP`

@@ -769,18 +769,19 @@ def build_macro_class_mask_5(
 
 def build_global_process_state(
     prev_macro_class_id: int,
-    rough_rows_emitted: int,
-    finish_rows_emitted: int,
+    current_volume: float,
+    initial_volume: float,
     bbox_extent_xyz: np.ndarray,
     reference_scale: float,
 ) -> np.ndarray:
-    """Builds a compact global context vector with process history and part scale."""
+    """Builds a compact global context vector with coarse progress and part scale."""
     out = np.zeros((11,), dtype=np.float32)
     if 0 <= int(prev_macro_class_id) < len(MACRO_CLASS_TO_ID):
         out[int(prev_macro_class_id)] = 1.0
-    total = max(rough_rows_emitted + finish_rows_emitted, 1)
-    out[5] = float(rough_rows_emitted / total)
-    out[6] = float(finish_rows_emitted / total)
+    init_vol = float(max(initial_volume, 1e-9))
+    cur_vol = float(max(min(current_volume, init_vol), 0.0))
+    out[5] = float(max(min((init_vol - cur_vol) / init_vol, 1.0), 0.0))  # cumulative removed ratio
+    out[6] = float(max(min(cur_vol / init_vol, 1.0), 0.0))                # remaining volume ratio
     ref_scale = float(max(reference_scale, 1e-6))
     out[7:10] = np.asarray(bbox_extent_xyz, dtype=np.float32).reshape(3) / ref_scale
     out[10] = float(np.log1p(ref_scale))
@@ -979,6 +980,7 @@ def generate_action_candidates(
     max_rough_targets: int = 5,
     max_finish_targets: int = 5,
     max_tools_per_class: int = 7,
+    allow_finish: bool = True,
     rng: np.random.Generator | None = None,
 ) -> List[Dict[str, Any]]:
     """Generates action candidates as (macro_class, action_face, tool).
@@ -1020,16 +1022,17 @@ def generate_action_candidates(
             for tk, td in sample_valid_tools_for_macro("indexed_rough", max_tools_per_class, rng=rng):
                 _add("indexed_rough", face_id, tk, td, axis)
 
-    for face_id in targets["finish"]:
-        axis = derive_axis_direction("indexed_finish", normals[face_id])
-        for tk, td in sample_valid_tools_for_macro("indexed_finish", max_tools_per_class, rng=rng):
-            _add("indexed_finish", face_id, tk, td, axis)
+    if allow_finish:
+        for face_id in targets["finish"]:
+            axis = derive_axis_direction("indexed_finish", normals[face_id])
+            for tk, td in sample_valid_tools_for_macro("indexed_finish", max_tools_per_class, rng=rng):
+                _add("indexed_finish", face_id, tk, td, axis)
 
-        for tk, td in sample_valid_tools_for_macro("point_finish", max_tools_per_class, rng=rng):
-            _add("point_finish", face_id, tk, td, axis)
+            for tk, td in sample_valid_tools_for_macro("point_finish", max_tools_per_class, rng=rng):
+                _add("point_finish", face_id, tk, td, axis)
 
-        for tk, td in sample_valid_tools_for_macro("flank_finish", max_tools_per_class, rng=rng):
-            _add("flank_finish", face_id, tk, td, axis)
+            for tk, td in sample_valid_tools_for_macro("flank_finish", max_tools_per_class, rng=rng):
+                _add("flank_finish", face_id, tk, td, axis)
 
     return candidates
 
@@ -1966,6 +1969,12 @@ def _to_safe_float(x, default=0.0) -> float:
     """Performs: safe float."""
     return float(x)
 
+def _compute_removed_ratio(current_volume: float, reference_volume: float) -> float:
+    """Returns cumulative removed-material ratio w.r.t. the episode's initial stock."""
+    ref = float(max(reference_volume, 1e-9))
+    cur = float(current_volume)
+    return float(max(min((ref - cur) / ref, 1.0), 0.0))
+
 def _iter_row_batches(rows: List[Dict[str, Any]], batch_size: int):
     """Yields fixed-size row batches to cap peak memory during parquet writes."""
     batch_size = max(1, int(batch_size))
@@ -2151,9 +2160,12 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     MAX_TOTAL_DECISION_STEPS = int(os.getenv("MAX_TOTAL_DECISION_STEPS", "64"))
     if FIXED_DECISION_STEPS <= 0 or MAX_TOTAL_DECISION_STEPS <= 0:
         raise ValueError("FIXED_DECISION_STEPS and MAX_TOTAL_DECISION_STEPS must be positive")
+    EARLY_ROUGH_ONLY_STEPS = max(0, int(os.getenv("EARLY_ROUGH_ONLY_STEPS", "3")))
     MAX_NO_EFFECT_STREAK = max(0, int(os.getenv("MAX_NO_EFFECT_STREAK", "4")))
     NO_EFFECT_REMOVED_VOLUME_EPS = float(os.getenv("NO_EFFECT_REMOVED_VOLUME_EPS", "1e-4"))
-    NO_EFFECT_DONE_GAIN_EPS = float(os.getenv("NO_EFFECT_DONE_GAIN_EPS", "1e-4"))
+    NO_EFFECT_REMOVED_RATIO_GAIN_EPS = float(
+        os.getenv("NO_EFFECT_REMOVED_RATIO_GAIN_EPS", os.getenv("NO_EFFECT_DONE_GAIN_EPS", "1e-4"))
+    )
     planned_decision_steps = (
         FIXED_DECISION_STEPS
         if ROLLOUT_MODE == "fixed_steps"
@@ -2178,7 +2190,9 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     MIN_EFFECTIVE_REMOVED_VOLUME = float(os.getenv("MIN_EFFECTIVE_REMOVED_VOLUME", "0.1"))
     MIN_EFFECTIVE_REMOVED_RATIO = float(os.getenv("MIN_EFFECTIVE_REMOVED_RATIO", "0.0"))
     MIN_EFFECTIVE_MAX_NODE_DELTA = float(os.getenv("MIN_EFFECTIVE_MAX_NODE_DELTA", "0.0"))
-    MIN_EFFECTIVE_DONE_GAIN = float(os.getenv("MIN_EFFECTIVE_DONE_GAIN", "0.0"))
+    MIN_EFFECTIVE_REMOVED_RATIO_GAIN = float(
+        os.getenv("MIN_EFFECTIVE_REMOVED_RATIO_GAIN", os.getenv("MIN_EFFECTIVE_DONE_GAIN", "0.0"))
+    )
     FAIL_ON_CANDIDATE_ERROR = bool(int(os.getenv("FAIL_ON_CANDIDATE_ERROR", "0")))
     SAVE_PART_ON_CANDIDATE_ERROR = bool(int(os.getenv("SAVE_PART_ON_CANDIDATE_ERROR", "0")))
     # Save all simulated candidates (not just the chosen one) so that every
@@ -2194,9 +2208,9 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         removed: float,
         removed_ratio: float,
         max_delta: float,
-        done_gain: float,
+        removed_ratio_gain: float,
     ) -> bool:
-        if removed <= 1e-6 and max_delta <= 1e-6 and done_gain <= 1e-9:
+        if removed <= 1e-6 and max_delta <= 1e-6 and removed_ratio_gain <= 1e-9:
             return False
         checks = []
         if MIN_EFFECTIVE_REMOVED_VOLUME > 0.0:
@@ -2205,8 +2219,8 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             checks.append(removed_ratio >= MIN_EFFECTIVE_REMOVED_RATIO)
         if MIN_EFFECTIVE_MAX_NODE_DELTA > 0.0:
             checks.append(max_delta >= MIN_EFFECTIVE_MAX_NODE_DELTA)
-        if MIN_EFFECTIVE_DONE_GAIN > 0.0:
-            checks.append(done_gain >= MIN_EFFECTIVE_DONE_GAIN)
+        if MIN_EFFECTIVE_REMOVED_RATIO_GAIN > 0.0:
+            checks.append(removed_ratio_gain >= MIN_EFFECTIVE_REMOVED_RATIO_GAIN)
         return any(checks) if checks else True
 
     def _save_candidate_error_part(t: int, branch_id: str, candidate_index: int, action: Dict[str, Any], exc: Exception) -> str:
@@ -2316,11 +2330,12 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 "mode": str(ROLLOUT_MODE),
                 "fixed_decision_steps": int(FIXED_DECISION_STEPS),
                 "max_total_decision_steps": int(MAX_TOTAL_DECISION_STEPS),
+                "early_rough_only_steps": int(EARLY_ROUGH_ONLY_STEPS),
                 "beam_width": int(BEAM_WIDTH),
                 "sampled_branches": int(SAMPLED_BRANCHES),
                 "max_no_effect_streak": int(MAX_NO_EFFECT_STREAK),
                 "no_effect_removed_volume_eps": float(NO_EFFECT_REMOVED_VOLUME_EPS),
-                "no_effect_done_gain_eps": float(NO_EFFECT_DONE_GAIN_EPS),
+                "no_effect_removed_ratio_gain_eps": float(NO_EFFECT_REMOVED_RATIO_GAIN_EPS),
             },
             "node_process_state_channels": ["rough_done", "finish_ready"],
             "face_type_schema": {
@@ -2333,8 +2348,8 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             },
             "global_process_state_channels": [
                 "prev_macro_onehot_5",
-                "rough_ratio",
-                "finish_ratio",
+                "cumulative_removed_ratio",
+                "remaining_volume_ratio",
                 "bbox_extent_over_scale_xyz",
                 "log_ref_scale",
             ],
@@ -2349,7 +2364,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 "min_removed_volume": float(MIN_EFFECTIVE_REMOVED_VOLUME),
                 "min_removed_ratio": float(MIN_EFFECTIVE_REMOVED_RATIO),
                 "min_max_node_delta": float(MIN_EFFECTIVE_MAX_NODE_DELTA),
-                "min_done_gain": float(MIN_EFFECTIVE_DONE_GAIN),
+                "min_removed_ratio_gain": float(MIN_EFFECTIVE_REMOVED_RATIO_GAIN),
             },
             "fail_on_candidate_error": bool(FAIL_ON_CANDIDATE_ERROR),
             "save_part_on_candidate_error": bool(SAVE_PART_ON_CANDIDATE_ERROR),
@@ -2377,7 +2392,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         "min_effective_removed_volume": float(MIN_EFFECTIVE_REMOVED_VOLUME),
         "min_effective_removed_ratio": float(MIN_EFFECTIVE_REMOVED_RATIO),
         "min_effective_max_node_delta": float(MIN_EFFECTIVE_MAX_NODE_DELTA),
-        "min_effective_done_gain": float(MIN_EFFECTIVE_DONE_GAIN),
+        "min_effective_removed_ratio_gain": float(MIN_EFFECTIVE_REMOVED_RATIO_GAIN),
         "fail_on_candidate_error": bool(FAIL_ON_CANDIDATE_ERROR),
         "save_part_on_candidate_error": bool(SAVE_PART_ON_CANDIDATE_ERROR),
         "error_part_snapshot_dir": os.path.abspath(ERROR_PART_SNAPSHOT_DIR or os.path.join(out_dir, "error_prt_snapshots")),
@@ -2418,7 +2433,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         "max_total_decision_steps": int(MAX_TOTAL_DECISION_STEPS),
         "max_no_effect_streak": int(MAX_NO_EFFECT_STREAK),
         "no_effect_removed_volume_eps": float(NO_EFFECT_REMOVED_VOLUME_EPS),
-        "no_effect_done_gain_eps": float(NO_EFFECT_DONE_GAIN_EPS),
+        "no_effect_removed_ratio_gain_eps": float(NO_EFFECT_REMOVED_RATIO_GAIN_EPS),
         "surface_finish_tol": float(SURFACE_FINISH_TOL),
         "row_unit": "one_executed_nx_operation",
         "steps": [],
@@ -2556,8 +2571,8 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
 
         global_process_state = build_global_process_state(
             prev_macro_class_id=prev_macro_class_id_for_row,
-            rough_rows_emitted=rough_rows_emitted_for_row,
-            finish_rows_emitted=finish_rows_emitted_for_row,
+            current_volume=vol_before,
+            initial_volume=float(initial_stock_volume if initial_stock_volume is not None else max(vol_before, 1e-9)),
             bbox_extent_xyz=bbox_extent_xyz,
             reference_scale=normalization_scale,
         )
@@ -2754,7 +2769,8 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         }]
         t = 0
         no_effect_streak = 0
-        last_selected_done_ratio = None
+        initial_stock_volume = None
+        last_selected_removed_ratio = None
         termination_reason = "max_total_steps"
         while t < planned_decision_steps:
             depth_children: List[Dict[str, Any]] = []
@@ -2786,11 +2802,14 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                     base_object_blank=base_object_blank,
                 )
                 state_volume = float(branch_before_state["volume"])
+                if initial_stock_volume is None:
+                    initial_stock_volume = float(max(state_volume, 1e-9))
                 state_dev_red_512 = np.asarray(branch_before_state["dev_red_512"], dtype=np.float32).reshape(512)
                 state_done_mask_512, all_done = compute_done_mask_from_dev_red_with_K(
                     state_dev_red_512, SURFACE_FINISH_TOL, K_groups,
                 )
                 state_done_ratio = float(state_done_mask_512[:K_groups].mean()) if K_groups > 0 else 1.0
+                state_removed_ratio = _compute_removed_ratio(state_volume, initial_stock_volume)
                 if all_done:
                     done_branch_count += 1
                     depth_record["branch_records"].append({
@@ -2798,6 +2817,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                         "stopped": True,
                         "reason": "all_faces_done",
                         "state_volume": float(state_volume),
+                        "state_removed_ratio": float(state_removed_ratio),
                         "state_done_ratio": float(state_done_ratio),
                     })
                     continue
@@ -2819,6 +2839,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                     max_rough_targets=MAX_ROUGH_TARGETS,
                     max_finish_targets=MAX_FINISH_TARGETS,
                     max_tools_per_class=MAX_TOOLS_PER_CLASS,
+                    allow_finish=bool(t >= EARLY_ROUGH_ONLY_STEPS),
                     rng=rng,
                 )
                 candidate_tools = sorted({
@@ -2827,7 +2848,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 candidate_macros = sorted({str(c["macro_class_name"]) for c in candidates})
                 print(
                     f"[INFO] t={t} branch={branch['id']}: {len(candidates)} candidates "
-                    f"(done={state_done_ratio:.2f}, macros={candidate_macros}, tools={candidate_tools})",
+                    f"(removed={state_removed_ratio:.2f}, macros={candidate_macros}, tools={candidate_tools})",
                     flush=True,
                 )
 
@@ -2837,6 +2858,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                         "stopped": True,
                         "reason": "no_candidates",
                         "state_volume": float(state_volume),
+                        "state_removed_ratio": float(state_removed_ratio),
                         "state_done_ratio": float(state_done_ratio),
                     })
                     continue
@@ -2949,18 +2971,15 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                     max_abs_delta = float(np.nanmax(np.abs(after_sdf - state_dev_red_512))) if after_sdf.size else 0.0
                     vol_before = float(result.get("volume_before", 1.0) or 1.0)
                     removed_ratio = removed / max(vol_before, 1e-9)
+                    volume_after = float(result.get("volume_after", vol_before) or vol_before)
+                    removed_ratio_after = _compute_removed_ratio(volume_after, initial_stock_volume)
+                    removed_ratio_gain = max(float(removed_ratio_after - state_removed_ratio), 0.0)
                     next_done_mask, next_done_ratio = compute_done_mask_from_dev_red(
                         np.asarray(result["dev_after_red_512"], dtype=np.float32),
                         SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
                     )
-                    cur_done_ratio = float(
-                        compute_done_mask_from_dev_red(
-                            state_dev_red_512, SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
-                        )[1]
-                    )
-                    done_gain = max(float(next_done_ratio) - cur_done_ratio, 0.0)
-                    is_zero_effect = removed <= 1e-6 and max_delta <= 1e-6 and done_gain <= 1e-9
-                    is_effective = _is_effective_transition(removed, removed_ratio, max_delta, done_gain)
+                    is_zero_effect = removed <= 1e-6 and max_delta <= 1e-6 and removed_ratio_gain <= 1e-9
+                    is_effective = _is_effective_transition(removed, removed_ratio, max_delta, removed_ratio_gain)
                     if is_zero_effect or not is_effective:
                         stat_key = "no_effect" if is_zero_effect else "below_min_effect"
                         reject_stats[stat_key] += 1
@@ -2972,14 +2991,14 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                                 f"vol={float(result.get('volume_before', 0.0) or 0.0):.6f}"
                                 f"->{float(result.get('volume_after', 0.0) or 0.0):.6f} "
                                 f"removed={removed:.6g} ratio={removed_ratio:.6g} "
-                                f"max_delta={max_delta:.6g} done_gain={done_gain:.6g} "
+                                f"max_delta={max_delta:.6g} removed_gain={removed_ratio_gain:.6g} "
                                 f"max_abs_delta={max_abs_delta:.6g} "
                                 f"ct={float(result.get('cycle_time', 0.0) or 0.0):.6g}"
                             )
                         continue
 
                     cycle_time = float(result.get("cycle_time", 0.0) or 0.0)
-                    action_score = 4.0 * removed_ratio + 2.0 * done_gain - 0.002 * cycle_time
+                    action_score = 6.0 * removed_ratio_gain - 0.002 * cycle_time
                     child_score = float(branch["score"]) + float(action_score)
                     child_id = f"{branch['id']}.{t}.{ci}"
                     child_branch = _make_child_branch(
@@ -3007,6 +3026,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 branch_record: Dict[str, Any] = {
                     "scenario_id": str(branch["id"]),
                     "state_volume_before": float(state_volume),
+                    "state_removed_ratio_before": float(state_removed_ratio),
                     "state_done_ratio_before": float(state_done_ratio),
                     "num_candidates": int(len(candidates)),
                     "num_effective": int(len(scored)),
@@ -3044,6 +3064,12 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                             "action_face": int(action["action_face_id"]),
                             "removed_volume": float(result.get("removed_volume", 0.0) or 0.0),
                             "state_volume_after": float(result.get("volume_after", state_volume)),
+                            "state_removed_ratio_after": float(
+                                _compute_removed_ratio(
+                                    float(result.get("volume_after", state_volume) or state_volume),
+                                    initial_stock_volume,
+                                )
+                            ),
                             "state_done_ratio_after": float(
                                 compute_done_mask_from_dev_red(
                                     np.asarray(result["dev_after_red_512"], dtype=np.float32),
@@ -3083,6 +3109,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                     "action_face": int(child["action_face"]),
                     "score": float(child["score"]),
                     "state_volume_after": float(child["state_volume_after"]),
+                    "state_removed_ratio_after": float(child["state_removed_ratio_after"]),
                     "state_done_ratio_after": float(child["state_done_ratio_after"]),
                 })
 
@@ -3099,23 +3126,25 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 "selected_branches": selected_records,
             })
             selected_removed_mean = float(np.mean([float(x["removed_volume"]) for x in selected_children])) if selected_children else 0.0
+            selected_removed_ratio_mean = float(np.mean([float(x["state_removed_ratio_after"]) for x in selected_children])) if selected_children else 0.0
             selected_done_ratio_mean = float(np.mean([float(x["state_done_ratio_after"]) for x in selected_children])) if selected_children else 0.0
-            if last_selected_done_ratio is None:
-                selected_done_gain = 0.0
+            if last_selected_removed_ratio is None:
+                selected_removed_ratio_gain = 0.0
             else:
-                selected_done_gain = float(selected_done_ratio_mean - last_selected_done_ratio)
-            last_selected_done_ratio = selected_done_ratio_mean
+                selected_removed_ratio_gain = float(selected_removed_ratio_mean - last_selected_removed_ratio)
+            last_selected_removed_ratio = selected_removed_ratio_mean
 
             if (
                 selected_removed_mean <= float(NO_EFFECT_REMOVED_VOLUME_EPS)
-                and selected_done_gain <= float(NO_EFFECT_DONE_GAIN_EPS)
+                and selected_removed_ratio_gain <= float(NO_EFFECT_REMOVED_RATIO_GAIN_EPS)
             ):
                 no_effect_streak += 1
             else:
                 no_effect_streak = 0
             depth_record["selected_removed_mean"] = float(selected_removed_mean)
+            depth_record["selected_removed_ratio_mean"] = float(selected_removed_ratio_mean)
+            depth_record["selected_removed_ratio_gain"] = float(selected_removed_ratio_gain)
             depth_record["selected_done_ratio_mean"] = float(selected_done_ratio_mean)
-            depth_record["selected_done_gain"] = float(selected_done_gain)
             depth_record["no_effect_streak"] = int(no_effect_streak)
             episode_record["steps"].append(depth_record)
             _flush_pending_transition_rows()
@@ -3124,7 +3153,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 termination_reason = "max_no_effect_streak"
                 print(
                     f"[INFO] stop: t={t} no_effect_streak={no_effect_streak} "
-                    f"(removed_mean={selected_removed_mean:.6g}, done_gain={selected_done_gain:.6g})",
+                    f"(removed_mean={selected_removed_mean:.6g}, removed_ratio_gain={selected_removed_ratio_gain:.6g})",
                     flush=True,
                 )
                 break
