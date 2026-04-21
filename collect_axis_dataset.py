@@ -2031,10 +2031,12 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     # Rollout settings:
     # - fixed_steps: bounded horizon for quick data collection.
     # - until_done: continue until all branches are done, with safety caps.
-    ROLLOUT_MODE = os.getenv("ROLLOUT_MODE", "until_done").strip().lower()
+    # - fixed_steps: bounded horizon; preferred for shape-transition dataset
+    #   collection where full process completion is unnecessary.
+    ROLLOUT_MODE = os.getenv("ROLLOUT_MODE", "fixed_steps").strip().lower()
     if ROLLOUT_MODE not in {"until_done", "fixed_steps"}:
         raise ValueError(f"Unsupported ROLLOUT_MODE: {ROLLOUT_MODE!r}")
-    FIXED_DECISION_STEPS = int(os.getenv("FIXED_DECISION_STEPS", "8"))
+    FIXED_DECISION_STEPS = int(os.getenv("FIXED_DECISION_STEPS", "3"))
     MAX_TOTAL_DECISION_STEPS = int(os.getenv("MAX_TOTAL_DECISION_STEPS", "64"))
     if FIXED_DECISION_STEPS <= 0 or MAX_TOTAL_DECISION_STEPS <= 0:
         raise ValueError("FIXED_DECISION_STEPS and MAX_TOTAL_DECISION_STEPS must be positive")
@@ -2048,7 +2050,13 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     )
 
     # Candidate generation / beam settings.
-    MAX_ROUGH_TARGETS = int(os.getenv("MAX_ROUGH_TARGETS", "5"))
+    # With FIXED_DECISION_STEPS=3 and BEAM_WIDTH=3 the expected row count is:
+    #   step0: 1 branch × candidates  +
+    #   step1: 3 branches × candidates  +
+    #   step2: 3 branches × candidates
+    # ≈ (1+3+3) × (MAX_ROUGH_TARGETS × MAX_TOOLS_PER_CLASS) ≈ 7 × 18 = 126 rows,
+    # giving a comfortable buffer above the 100-row target even after NX failures.
+    MAX_ROUGH_TARGETS = int(os.getenv("MAX_ROUGH_TARGETS", "6"))
     MAX_FINISH_TARGETS = int(os.getenv("MAX_FINISH_TARGETS", "5"))
     MAX_TOOLS_PER_CLASS = int(os.getenv("MAX_TOOLS_PER_CLASS", "3"))
     BEAM_WIDTH = max(1, int(os.getenv("BEAM_WIDTH", "3")))
@@ -2062,7 +2070,10 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     MIN_EFFECTIVE_DONE_GAIN = float(os.getenv("MIN_EFFECTIVE_DONE_GAIN", "0.0"))
     FAIL_ON_CANDIDATE_ERROR = bool(int(os.getenv("FAIL_ON_CANDIDATE_ERROR", "0")))
     SAVE_PART_ON_CANDIDATE_ERROR = bool(int(os.getenv("SAVE_PART_ON_CANDIDATE_ERROR", "0")))
-    SAVE_CHOSEN_ONLY_PARQUET = bool(int(os.getenv("SAVE_CHOSEN_ONLY_PARQUET", "1")))
+    # Save all simulated candidates (not just the chosen one) so that every
+    # (before, operation, after) triple becomes a training sample, maximising
+    # data yield per NX simulation run.
+    SAVE_CHOSEN_ONLY_PARQUET = bool(int(os.getenv("SAVE_CHOSEN_ONLY_PARQUET", "0")))
     ERROR_PART_SNAPSHOT_DIR = os.getenv("ERROR_PART_SNAPSHOT_DIR", "")
 
     def _is_effective_transition(
