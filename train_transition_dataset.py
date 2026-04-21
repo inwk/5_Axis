@@ -37,6 +37,13 @@ NUM_EPOCHS = 50
 LEARNING_RATE = 1e-4
 PRINT_EVERY = 1
 
+# Optional StateEncoder initialization from SSL pretraining.
+# Set this to ssl_pretraining/train_state_encoder_ssl.py's best.pt.
+PRETRAINED_ENCODER_CHECKPOINT = r""
+PRETRAINED_ENCODER_STRICT = True
+FREEZE_STATE_ENCODER = False
+STATE_ENCODER_LR_MULTIPLIER = 1.0
+
 # For batched training this should stay fixed and positive.
 OCTREE_QUERY_NODES = 2048
 OCTREE_POS_WEIGHT_FACTOR = 2.0
@@ -124,6 +131,113 @@ def _macro_distribution(dataset: ProcessSkeletonParquetDataset, indices: list[in
         name = str(dataset.df.iloc[int(idx)].get("macro_class_name", "unknown"))
         out[name] = out.get(name, 0) + 1
     return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def _strip_prefix_state_dict(state_dict: dict, prefix: str) -> dict:
+    """Strips a module prefix from every key that has the prefix."""
+    return {
+        key[len(prefix):]: value
+        for key, value in state_dict.items()
+        if str(key).startswith(prefix)
+    }
+
+
+def _extract_encoder_state_dict(checkpoint: object) -> tuple[dict, str]:
+    """Extracts a StateEncoder state dict from supported checkpoint formats."""
+    if isinstance(checkpoint, dict):
+        if "encoder_state_dict" in checkpoint:
+            return checkpoint["encoder_state_dict"], "encoder_state_dict"
+
+        if "model_state_dict" in checkpoint:
+            model_state = checkpoint["model_state_dict"]
+            state_encoder_state = _strip_prefix_state_dict(model_state, "state_encoder.")
+            if state_encoder_state:
+                return state_encoder_state, "model_state_dict:state_encoder."
+            ssl_encoder_state = _strip_prefix_state_dict(model_state, "encoder.")
+            if ssl_encoder_state:
+                return ssl_encoder_state, "model_state_dict:encoder."
+
+        # Allow a raw state dict saved directly from StateEncoder.state_dict().
+        if (
+            checkpoint
+            and all(isinstance(key, str) for key in checkpoint.keys())
+            and all(torch.is_tensor(value) for value in checkpoint.values())
+        ):
+            return checkpoint, "raw_state_dict"
+
+    raise ValueError(
+        "Could not find an encoder state dict. Expected one of: "
+        "'encoder_state_dict', 'model_state_dict' with 'encoder.' prefix, "
+        "'model_state_dict' with 'state_encoder.' prefix, or a raw state dict."
+    )
+
+
+def _load_pretrained_encoder(
+    model: GraphSdfPlanningModel,
+    checkpoint_path: str,
+    strict: bool,
+) -> dict[str, object]:
+    """Loads a pretrained SSL StateEncoder into the transition model."""
+    path = Path(checkpoint_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"PRETRAINED_ENCODER_CHECKPOINT not found: {path}")
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location="cpu")
+    encoder_state, source_key = _extract_encoder_state_dict(checkpoint)
+    result = model.state_encoder.load_state_dict(encoder_state, strict=bool(strict))
+    missing = list(getattr(result, "missing_keys", []))
+    unexpected = list(getattr(result, "unexpected_keys", []))
+    return {
+        "checkpoint_path": str(path),
+        "source_key": source_key,
+        "strict": bool(strict),
+        "num_tensors": len(encoder_state),
+        "missing_keys": missing,
+        "unexpected_keys": unexpected,
+    }
+
+
+def _set_state_encoder_trainability(model: GraphSdfPlanningModel, freeze: bool) -> None:
+    """Freezes/unfreezes the StateEncoder parameters."""
+    for param in model.state_encoder.parameters():
+        param.requires_grad = not bool(freeze)
+
+
+def _build_optimizer(
+    model: GraphSdfPlanningModel,
+    learning_rate: float,
+    encoder_lr_multiplier: float,
+    freeze_state_encoder: bool,
+) -> torch.optim.Optimizer:
+    """Builds AdamW with optional lower LR for pretrained encoder parameters."""
+    _set_state_encoder_trainability(model, freeze=freeze_state_encoder)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise ValueError("No trainable parameters remain after applying freeze settings.")
+
+    if freeze_state_encoder or abs(float(encoder_lr_multiplier) - 1.0) < 1e-12:
+        return torch.optim.AdamW(trainable_params, lr=learning_rate)
+
+    encoder_param_ids = {id(param) for param in model.state_encoder.parameters()}
+    encoder_params = [
+        param for param in model.parameters()
+        if param.requires_grad and id(param) in encoder_param_ids
+    ]
+    other_params = [
+        param for param in model.parameters()
+        if param.requires_grad and id(param) not in encoder_param_ids
+    ]
+    param_groups = []
+    if encoder_params:
+        param_groups.append({
+            "params": encoder_params,
+            "lr": float(learning_rate) * float(encoder_lr_multiplier),
+        })
+    if other_params:
+        param_groups.append({"params": other_params, "lr": float(learning_rate)})
+    return torch.optim.AdamW(param_groups)
 
 
 @torch.no_grad()
@@ -230,7 +344,30 @@ def main() -> None:
     model_cfg = replace(GraphSdfModelConfig(), octree_query_nodes=int(OCTREE_QUERY_NODES))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GraphSdfPlanningModel(model_cfg).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    pretrained_encoder_info: dict[str, object] | None = None
+    if PRETRAINED_ENCODER_CHECKPOINT.strip():
+        pretrained_encoder_info = _load_pretrained_encoder(
+            model,
+            PRETRAINED_ENCODER_CHECKPOINT,
+            strict=PRETRAINED_ENCODER_STRICT,
+        )
+        print(
+            "[Pretrained Encoder] "
+            f"loaded={pretrained_encoder_info['checkpoint_path']} "
+            f"source={pretrained_encoder_info['source_key']} "
+            f"tensors={pretrained_encoder_info['num_tensors']} "
+            f"strict={pretrained_encoder_info['strict']}"
+        )
+        if pretrained_encoder_info["missing_keys"] or pretrained_encoder_info["unexpected_keys"]:
+            print(f"[Pretrained Encoder] missing={pretrained_encoder_info['missing_keys']}")
+            print(f"[Pretrained Encoder] unexpected={pretrained_encoder_info['unexpected_keys']}")
+
+    optimizer = _build_optimizer(
+        model,
+        learning_rate=LEARNING_RATE,
+        encoder_lr_multiplier=STATE_ENCODER_LR_MULTIPLIER,
+        freeze_state_encoder=FREEZE_STATE_ENCODER,
+    )
 
     run_dir = _make_run_dir()
     if run_dir is not None:
@@ -248,6 +385,11 @@ def main() -> None:
                 "octree_pos_weight_factor": OCTREE_POS_WEIGHT_FACTOR,
                 "octree_depth_weight_base": OCTREE_DEPTH_WEIGHT_BASE,
                 "monotonicity_weight": MONOTONICITY_WEIGHT,
+                "pretrained_encoder_checkpoint": PRETRAINED_ENCODER_CHECKPOINT,
+                "pretrained_encoder_strict": PRETRAINED_ENCODER_STRICT,
+                "pretrained_encoder_info": pretrained_encoder_info,
+                "freeze_state_encoder": FREEZE_STATE_ENCODER,
+                "state_encoder_lr_multiplier": STATE_ENCODER_LR_MULTIPLIER,
                 "model_config": asdict(model_cfg),
                 "train_rows": len(train_indices),
                 "val_rows": len(val_indices),
@@ -258,6 +400,10 @@ def main() -> None:
     print(f"[Files] {len(parquet_files)} parquet files")
     print(f"[Rows] total_valid={len(valid_indices)} train={len(train_indices)} val={len(val_indices)}")
     print(f"[Train] epochs={NUM_EPOCHS} lr={LEARNING_RATE} batch={BATCH_SIZE} octree_query_nodes={OCTREE_QUERY_NODES}")
+    print(
+        f"[Encoder] pretrained={bool(PRETRAINED_ENCODER_CHECKPOINT.strip())} "
+        f"freeze={FREEZE_STATE_ENCODER} lr_multiplier={STATE_ENCODER_LR_MULTIPLIER}"
+    )
     print(
         f"[Loss] pos_weight={OCTREE_POS_WEIGHT_FACTOR} "
         f"depth_weight_base={OCTREE_DEPTH_WEIGHT_BASE} "
