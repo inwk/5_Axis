@@ -2028,21 +2028,33 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         os.path.join(out_dir, "target_body.obj"),
     )
 
-    # NUM_DECISION_STEPS = int(os.getenv("NUM_DECISION_STEPS", "8"))
-    # SURFACE_FINISH_TOL = 0.01
-    # MAX_ROUGH_TARGETS = int(os.getenv("MAX_ROUGH_TARGETS", "5"))
-    # MAX_FINISH_TARGETS = int(os.getenv("MAX_FINISH_TARGETS", "5"))
-    # MAX_TOOLS_PER_CLASS = int(os.getenv("MAX_TOOLS_PER_CLASS", "2"))
-    # BEAM_WIDTH = max(1, int(os.getenv("BEAM_WIDTH", "3")))
-    # SAMPLED_BRANCHES = max(0, int(os.getenv("SAMPLED_BRANCHES", "1")))
+    # Rollout settings:
+    # - fixed_steps: bounded horizon for quick data collection.
+    # - until_done: continue until all branches are done, with safety caps.
+    ROLLOUT_MODE = os.getenv("ROLLOUT_MODE", "until_done").strip().lower()
+    if ROLLOUT_MODE not in {"until_done", "fixed_steps"}:
+        raise ValueError(f"Unsupported ROLLOUT_MODE: {ROLLOUT_MODE!r}")
+    FIXED_DECISION_STEPS = int(os.getenv("FIXED_DECISION_STEPS", "8"))
+    MAX_TOTAL_DECISION_STEPS = int(os.getenv("MAX_TOTAL_DECISION_STEPS", "64"))
+    if FIXED_DECISION_STEPS <= 0 or MAX_TOTAL_DECISION_STEPS <= 0:
+        raise ValueError("FIXED_DECISION_STEPS and MAX_TOTAL_DECISION_STEPS must be positive")
+    MAX_NO_EFFECT_STREAK = max(0, int(os.getenv("MAX_NO_EFFECT_STREAK", "4")))
+    NO_EFFECT_REMOVED_VOLUME_EPS = float(os.getenv("NO_EFFECT_REMOVED_VOLUME_EPS", "1e-4"))
+    NO_EFFECT_DONE_GAIN_EPS = float(os.getenv("NO_EFFECT_DONE_GAIN_EPS", "1e-4"))
+    planned_decision_steps = (
+        FIXED_DECISION_STEPS
+        if ROLLOUT_MODE == "fixed_steps"
+        else MAX_TOTAL_DECISION_STEPS
+    )
 
-    NUM_DECISION_STEPS=8     
-    MAX_ROUGH_TARGETS=5    
-    MAX_FINISH_TARGETS=5  
-    MAX_TOOLS_PER_CLASS=3  
-    BEAM_WIDTH=3          
-    SAMPLED_BRANCHES=1   
-    FINISH_READY_TOL=1.0   
+    # Candidate generation / beam settings.
+    MAX_ROUGH_TARGETS = int(os.getenv("MAX_ROUGH_TARGETS", "5"))
+    MAX_FINISH_TARGETS = int(os.getenv("MAX_FINISH_TARGETS", "5"))
+    MAX_TOOLS_PER_CLASS = int(os.getenv("MAX_TOOLS_PER_CLASS", "3"))
+    BEAM_WIDTH = max(1, int(os.getenv("BEAM_WIDTH", "3")))
+    SAMPLED_BRANCHES = max(0, int(os.getenv("SAMPLED_BRANCHES", "1")))
+    finish_ready_tol_default = float(globals().get("FINISH_READY_TOL", 1.0))
+    FINISH_READY_TOL = float(os.getenv("FINISH_READY_TOL", str(finish_ready_tol_default)))
     SURFACE_FINISH_TOL = 0.01
     MIN_EFFECTIVE_REMOVED_VOLUME = float(os.getenv("MIN_EFFECTIVE_REMOVED_VOLUME", "0.1"))
     MIN_EFFECTIVE_REMOVED_RATIO = float(os.getenv("MIN_EFFECTIVE_REMOVED_RATIO", "0.0"))
@@ -2050,6 +2062,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     MIN_EFFECTIVE_DONE_GAIN = float(os.getenv("MIN_EFFECTIVE_DONE_GAIN", "0.0"))
     FAIL_ON_CANDIDATE_ERROR = bool(int(os.getenv("FAIL_ON_CANDIDATE_ERROR", "0")))
     SAVE_PART_ON_CANDIDATE_ERROR = bool(int(os.getenv("SAVE_PART_ON_CANDIDATE_ERROR", "0")))
+    SAVE_CHOSEN_ONLY_PARQUET = bool(int(os.getenv("SAVE_CHOSEN_ONLY_PARQUET", "1")))
     ERROR_PART_SNAPSHOT_DIR = os.getenv("ERROR_PART_SNAPSHOT_DIR", "")
 
     def _is_effective_transition(
@@ -2175,8 +2188,14 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             "candidate_strategy": "beam_sampled_action_transition",
             "decision_order": "macro_face_tool_then_axis_derived",
             "rollout": {
+                "mode": str(ROLLOUT_MODE),
+                "fixed_decision_steps": int(FIXED_DECISION_STEPS),
+                "max_total_decision_steps": int(MAX_TOTAL_DECISION_STEPS),
                 "beam_width": int(BEAM_WIDTH),
                 "sampled_branches": int(SAMPLED_BRANCHES),
+                "max_no_effect_streak": int(MAX_NO_EFFECT_STREAK),
+                "no_effect_removed_volume_eps": float(NO_EFFECT_REMOVED_VOLUME_EPS),
+                "no_effect_done_gain_eps": float(NO_EFFECT_DONE_GAIN_EPS),
             },
             "node_process_state_channels": ["rough_done", "finish_ready"],
             "face_type_schema": {
@@ -2225,7 +2244,13 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     parquet_rows: List[Dict[str, Any]] = []
     episode_record = {
         "part_name": part_name, "seed": int(seed),
-        "num_decision_steps": int(NUM_DECISION_STEPS),
+        "num_decision_steps": int(planned_decision_steps),
+        "rollout_mode": str(ROLLOUT_MODE),
+        "fixed_decision_steps": int(FIXED_DECISION_STEPS),
+        "max_total_decision_steps": int(MAX_TOTAL_DECISION_STEPS),
+        "max_no_effect_streak": int(MAX_NO_EFFECT_STREAK),
+        "no_effect_removed_volume_eps": float(NO_EFFECT_REMOVED_VOLUME_EPS),
+        "no_effect_done_gain_eps": float(NO_EFFECT_DONE_GAIN_EPS),
         "surface_finish_tol": float(SURFACE_FINISH_TOL),
         "row_unit": "one_executed_nx_operation",
         "steps": [],
@@ -2569,14 +2594,18 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             "finish_rows": finish_rows_emitted,
             "score": 0.0,
         }]
-
-        for t in range(NUM_DECISION_STEPS):
+        t = 0
+        no_effect_streak = 0
+        last_selected_done_ratio = None
+        termination_reason = "max_total_steps"
+        while t < planned_decision_steps:
             depth_children: List[Dict[str, Any]] = []
             depth_record: Dict[str, Any] = {
                 "t": int(t),
                 "num_input_branches": int(len(branches)),
                 "branch_records": [],
             }
+            done_branch_count = 0
 
             for bi, branch in enumerate(branches):
                 _restore_to_root()
@@ -2605,6 +2634,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 )
                 state_done_ratio = float(state_done_mask_512[:K_groups].mean()) if K_groups > 0 else 1.0
                 if all_done:
+                    done_branch_count += 1
                     depth_record["branch_records"].append({
                         "scenario_id": str(branch["id"]),
                         "stopped": True,
@@ -2855,6 +2885,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                             "macro": str(action["macro_class_name"]),
                             "tool": f"{action['tool_kind']}_{action['tool_diameter']}",
                             "action_face": int(action["action_face_id"]),
+                            "removed_volume": float(result.get("removed_volume", 0.0) or 0.0),
                             "state_volume_after": float(result.get("volume_after", state_volume)),
                             "state_done_ratio_after": float(
                                 compute_done_mask_from_dev_red(
@@ -2867,12 +2898,14 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 depth_record["branch_records"].append(branch_record)
 
             if not depth_children:
+                reason = "all_faces_done" if done_branch_count >= len(branches) and len(branches) > 0 else "no_next_branches"
                 depth_record.update({
                     "stopped": True,
-                    "reason": "no_next_branches",
+                    "reason": reason,
                     "num_next_branches": 0,
                 })
                 episode_record["steps"].append(depth_record)
+                termination_reason = reason
                 break
 
             selected_children = _select_next_children(depth_children)
@@ -2908,18 +2941,58 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 "sampled_branches": int(SAMPLED_BRANCHES),
                 "selected_branches": selected_records,
             })
+            selected_removed_mean = float(np.mean([float(x["removed_volume"]) for x in selected_children])) if selected_children else 0.0
+            selected_done_ratio_mean = float(np.mean([float(x["state_done_ratio_after"]) for x in selected_children])) if selected_children else 0.0
+            if last_selected_done_ratio is None:
+                selected_done_gain = 0.0
+            else:
+                selected_done_gain = float(selected_done_ratio_mean - last_selected_done_ratio)
+            last_selected_done_ratio = selected_done_ratio_mean
+
+            if (
+                selected_removed_mean <= float(NO_EFFECT_REMOVED_VOLUME_EPS)
+                and selected_done_gain <= float(NO_EFFECT_DONE_GAIN_EPS)
+            ):
+                no_effect_streak += 1
+            else:
+                no_effect_streak = 0
+            depth_record["selected_removed_mean"] = float(selected_removed_mean)
+            depth_record["selected_done_ratio_mean"] = float(selected_done_ratio_mean)
+            depth_record["selected_done_gain"] = float(selected_done_gain)
+            depth_record["no_effect_streak"] = int(no_effect_streak)
             episode_record["steps"].append(depth_record)
+
+            if MAX_NO_EFFECT_STREAK > 0 and no_effect_streak >= MAX_NO_EFFECT_STREAK:
+                termination_reason = "max_no_effect_streak"
+                print(
+                    f"[INFO] stop: t={t} no_effect_streak={no_effect_streak} "
+                    f"(removed_mean={selected_removed_mean:.6g}, done_gain={selected_done_gain:.6g})",
+                    flush=True,
+                )
+                break
             branches = next_branches
+            t += 1
+
+        episode_record["termination"] = {
+            "reason": str(termination_reason),
+            "executed_steps": int(len(episode_record["steps"])),
+            "planned_max_steps": int(planned_decision_steps),
+        }
 
     except Exception as exc:
         _save_fatal_error_part("episode", exc)
         raise
     finally:
         parquet_path = os.path.join(out_dir, f"{part_name}_seed{int(seed)}_process_skeleton_dataset.parquet")
+        chosen_parquet_path = os.path.join(out_dir, f"{part_name}_seed{int(seed)}_process_skeleton_dataset_chosen_only.parquet")
         if parquet_rows:
             df = pd.DataFrame(parquet_rows)
             _ensure_dir(os.path.dirname(parquet_path))
             df.to_parquet(parquet_path, index=False)
+
+            if bool(SAVE_CHOSEN_ONLY_PARQUET):
+                chosen_df = df[df["is_chosen"] == 1].copy()
+                chosen_df.to_parquet(chosen_parquet_path, index=False)
             
             if global_parquet_dir:
                 _ensure_dir(global_parquet_dir)
@@ -2927,6 +3000,12 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 global_path = os.path.join(global_parquet_dir, global_filename)
                 df.to_parquet(global_path, index=False)
                 print(f"[INFO] Copied parquet to: {global_path}")
+                if bool(SAVE_CHOSEN_ONLY_PARQUET):
+                    global_chosen_filename = f"{run_name}_chosen_only.parquet"
+                    global_chosen_path = os.path.join(global_parquet_dir, global_chosen_filename)
+                    chosen_df = df[df["is_chosen"] == 1].copy()
+                    chosen_df.to_parquet(global_chosen_path, index=False)
+                    print(f"[INFO] Copied chosen-only parquet to: {global_chosen_path}")
 
         _json_dump(os.path.join(out_dir, "episode_record.json"), episode_record)
         _restore_to_root(strict=False)
@@ -2938,9 +3017,13 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
 
     return {
         "out_dir": out_dir, "parquet_path": parquet_path,
+        "chosen_parquet_path": chosen_parquet_path if bool(SAVE_CHOSEN_ONLY_PARQUET) else "",
         "num_rows": int(len(parquet_rows)),
+        "num_chosen_rows": int(sum(1 for row in parquet_rows if int(row.get("is_chosen", 0)) == 1)),
         "num_operation_rows": int(len(parquet_rows)),
-        "num_decision_steps": int(NUM_DECISION_STEPS),
+        "num_decision_steps": int(len(episode_record["steps"])),
+        "planned_max_steps": int(planned_decision_steps),
+        "rollout_mode": str(ROLLOUT_MODE),
     }
 
 if __name__ == "__main__":
