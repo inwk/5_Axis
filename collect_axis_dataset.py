@@ -4,6 +4,7 @@ import json
 import math
 import gc
 import sys
+import shutil
 from typing import Any, Dict, Tuple, List
 from datetime import datetime
 import argparse
@@ -1965,6 +1966,116 @@ def _to_safe_float(x, default=0.0) -> float:
     """Performs: safe float."""
     return float(x)
 
+def _iter_row_batches(rows: List[Dict[str, Any]], batch_size: int):
+    """Yields fixed-size row batches to cap peak memory during parquet writes."""
+    batch_size = max(1, int(batch_size))
+    total = len(rows)
+    for start in range(0, total, batch_size):
+        yield rows[start:start + batch_size]
+
+def _serialize_for_parquet(value: Any) -> Any:
+    """Converts numpy-heavy cells into parquet-friendly Python values."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.integer, np.floating, np.bool_)):
+        return value.item()
+    if isinstance(value, tuple):
+        return [_serialize_for_parquet(v) for v in value]
+    if isinstance(value, list):
+        return [_serialize_for_parquet(v) for v in value]
+    return value
+
+def _make_parquet_stream_state(
+    parquet_path: str,
+    chosen_only_path: str | None = None,
+) -> Dict[str, Any]:
+    """Creates append-only parquet writer state for one episode."""
+    _ensure_dir(os.path.dirname(parquet_path))
+    if chosen_only_path:
+        _ensure_dir(os.path.dirname(chosen_only_path))
+    return {
+        "parquet_path": parquet_path,
+        "chosen_only_path": chosen_only_path,
+        "writer": None,
+        "chosen_writer": None,
+        "schema": None,
+        "engine": None,
+        "pa": None,
+        "pq": None,
+        "fallback_rows": [],
+        "fallback_chosen_rows": [],
+        "num_rows": 0,
+        "num_chosen_rows": 0,
+    }
+
+def _append_serialized_rows_to_parquet_stream(
+    state: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+) -> None:
+    """Appends already-serialized row dicts to the episode parquet stream."""
+    if not rows:
+        return
+
+    state["num_rows"] = int(state["num_rows"]) + int(len(rows))
+    chosen_rows = [row for row in rows if int(row.get("is_chosen", 0)) == 1]
+    state["num_chosen_rows"] = int(state["num_chosen_rows"]) + int(len(chosen_rows))
+
+    if state["engine"] is None:
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+            state["engine"] = "pyarrow"
+            state["pa"] = pa
+            state["pq"] = pq
+        except Exception:
+            state["engine"] = "fallback"
+
+    if state["engine"] == "fallback":
+        state["fallback_rows"].extend(rows)
+        if state["chosen_only_path"]:
+            state["fallback_chosen_rows"].extend(chosen_rows)
+        return
+
+    pa = state["pa"]
+    pq = state["pq"]
+    table = pa.Table.from_pylist(rows)
+    if state["writer"] is None:
+        state["schema"] = table.schema
+        state["writer"] = pq.ParquetWriter(state["parquet_path"], state["schema"], compression="snappy")
+    state["writer"].write_table(table, row_group_size=len(rows))
+    del table
+
+    if state["chosen_only_path"] and chosen_rows:
+        chosen_table = pa.Table.from_pylist(chosen_rows, schema=state["schema"])
+        if state["chosen_writer"] is None:
+            state["chosen_writer"] = pq.ParquetWriter(state["chosen_only_path"], state["schema"], compression="snappy")
+        state["chosen_writer"].write_table(chosen_table, row_group_size=len(chosen_rows))
+        del chosen_table
+
+    gc.collect()
+
+def _close_parquet_stream(state: Dict[str, Any]) -> Tuple[int, int]:
+    """Closes the parquet stream and writes any fallback buffers if needed."""
+    try:
+        if state["engine"] == "fallback":
+            if state["fallback_rows"]:
+                df = pd.DataFrame(state["fallback_rows"])
+                df.to_parquet(state["parquet_path"], index=False)
+            if state["chosen_only_path"]:
+                chosen_df = pd.DataFrame(state["fallback_chosen_rows"])
+                chosen_df.to_parquet(state["chosen_only_path"], index=False)
+        elif state["engine"] == "pyarrow":
+            if state["chosen_only_path"] and state["chosen_writer"] is None and state["schema"] is not None:
+                empty_table = state["pa"].Table.from_batches([], schema=state["schema"])
+                state["pq"].write_table(empty_table, state["chosen_only_path"], compression="snappy")
+    finally:
+        if state["writer"] is not None:
+            state["writer"].close()
+        if state["chosen_writer"] is not None:
+            state["chosen_writer"].close()
+
+    return int(state["num_rows"]), int(state["num_chosen_rows"])
+
 # ----------------------------
 # ----------------------------
 def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, global_parquet_dir: str = None):
@@ -2074,6 +2185,9 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     # (before, operation, after) triple becomes a training sample, maximising
     # data yield per NX simulation run.
     SAVE_CHOSEN_ONLY_PARQUET = bool(int(os.getenv("SAVE_CHOSEN_ONLY_PARQUET", "0")))
+    # Rows are appended in small finalized batches so parquet export never
+    # needs the full episode table in memory. Keep the default conservative.
+    PARQUET_WRITE_BATCH_ROWS = max(1, int(os.getenv("PARQUET_WRITE_BATCH_ROWS", "20")))
     ERROR_PART_SNAPSHOT_DIR = os.getenv("ERROR_PART_SNAPSHOT_DIR", "")
 
     def _is_effective_transition(
@@ -2252,7 +2366,50 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     prev_macro_class_id = -1
     rough_rows_emitted = 0
     finish_rows_emitted = 0
-    parquet_rows: List[Dict[str, Any]] = []
+    parquet_path = os.path.join(out_dir, f"{part_name}_seed{int(seed)}_process_skeleton_dataset.parquet")
+    chosen_parquet_path = os.path.join(out_dir, f"{part_name}_seed{int(seed)}_process_skeleton_dataset_chosen_only.parquet")
+    shared_info_json = json.dumps({
+        "surface_finish_tol": float(SURFACE_FINISH_TOL),
+        "candidate_strategy": "beam_sampled_action_transition",
+        "normalization": "part_bbox_center_and_diagonal",
+        "rough_done_delta_eps": float(ROUGH_DONE_DELTA_EPS),
+        "finish_ready_tol": float(FINISH_READY_TOL),
+        "min_effective_removed_volume": float(MIN_EFFECTIVE_REMOVED_VOLUME),
+        "min_effective_removed_ratio": float(MIN_EFFECTIVE_REMOVED_RATIO),
+        "min_effective_max_node_delta": float(MIN_EFFECTIVE_MAX_NODE_DELTA),
+        "min_effective_done_gain": float(MIN_EFFECTIVE_DONE_GAIN),
+        "fail_on_candidate_error": bool(FAIL_ON_CANDIDATE_ERROR),
+        "save_part_on_candidate_error": bool(SAVE_PART_ON_CANDIDATE_ERROR),
+        "error_part_snapshot_dir": os.path.abspath(ERROR_PART_SNAPSHOT_DIR or os.path.join(out_dir, "error_prt_snapshots")),
+        "octree_enabled": bool(OCTREE_ENABLED),
+        "octree_coarse_depth": int(OCTREE_COARSE_DEPTH),
+        "octree_fine_depth": int(OCTREE_FINE_DEPTH),
+        "octree_max_nodes": int(OCTREE_MAX_NODES),
+        "octree_bbox_padding": float(OCTREE_BBOX_PADDING),
+        "row_unit": "one_executed_nx_operation",
+    }, ensure_ascii=False)
+    shared_row_payload: Dict[str, Any] = {
+        "part_name": part_name,
+        "prt_file_path": os.path.abspath(prt_file_path),
+        "target_body_mesh_path": target_body_mesh_path,
+        "graph_nx_json": json.dumps(graph_json),
+        "seed": int(seed),
+        "node_mask": node_mask_512.astype(np.int16),
+        "point_mask": point_mask_512x100.astype(np.int16),
+        "centrality_512": np.asarray(centrality, dtype=np.int16),
+        "spatial_pos_512x512": np.asarray(spatial_pos, dtype=np.int16),
+        "face_area_512x1": np.asarray(face_area, dtype=np.float32),
+        "face_type_512": np.asarray(face_type_512, dtype=np.int16),
+        "normalization_center_xyz": normalization_center_xyz.astype(np.float32),
+        "normalization_scale": float(normalization_scale),
+        "bbox_extent_xyz": bbox_extent_xyz.astype(np.float32),
+        "info_json": shared_info_json,
+    }
+    parquet_stream = _make_parquet_stream_state(
+        parquet_path,
+        chosen_only_path=chosen_parquet_path if bool(SAVE_CHOSEN_ONLY_PARQUET) else None,
+    )
+    pending_transition_rows: List[Dict[str, Any]] = []
     episode_record = {
         "part_name": part_name, "seed": int(seed),
         "num_decision_steps": int(planned_decision_steps),
@@ -2267,7 +2424,44 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         "steps": [],
     }
 
-    def _build_parquet_row(
+    def _materialize_parquet_row(transition_row: Dict[str, Any]) -> Dict[str, Any]:
+        """Builds the final parquet row only at flush time to avoid row duplication in memory."""
+        state_point_sdf_raw = np.asarray(transition_row["state_point_sdf_raw_512x100"], dtype=np.float32)
+        next_node_sdf_raw = np.asarray(transition_row["next_node_sdf_raw_512"], dtype=np.float32)
+        next_point_sdf_raw = np.asarray(transition_row["next_point_sdf_raw_512x100"], dtype=np.float32)
+
+        row = dict(shared_row_payload)
+        row.update(transition_row)
+        row["state_points"] = build_state_points_tensor(
+            face_pc,
+            face_normal_512,
+            state_point_sdf_raw,
+            normalization_scale,
+        ).astype(np.float32)
+        row["next_node_sdf"] = build_normalized_node_sdf_512x1(
+            next_node_sdf_raw,
+            normalization_scale,
+        ).reshape(512).astype(np.float32)
+        row["next_point_sdf"] = build_normalized_point_sdf_512x100(
+            next_point_sdf_raw,
+            normalization_scale,
+        ).astype(np.float32)
+        return {key: _serialize_for_parquet(value) for key, value in row.items()}
+
+    def _flush_pending_transition_rows() -> None:
+        """Flushes finalized transition rows and frees Python-side row memory."""
+        nonlocal pending_transition_rows
+        if not pending_transition_rows:
+            return
+        for batch_rows in _iter_row_batches(pending_transition_rows, PARQUET_WRITE_BATCH_ROWS):
+            serialized_rows = [_materialize_parquet_row(row) for row in batch_rows]
+            _append_serialized_rows_to_parquet_stream(parquet_stream, serialized_rows)
+            del serialized_rows
+            gc.collect()
+        pending_transition_rows = []
+        gc.collect()
+
+    def _build_transition_row(
         action: Dict[str, Any],
         result: Dict[str, Any],
         state_node_sdf_raw: np.ndarray,
@@ -2282,7 +2476,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         scenario_id: str = "root",
         parent_scenario_id: str = "",
     ) -> Dict[str, Any] | None:
-        """Assembles one parquet row from a simulated action result."""
+        """Assembles one transition row payload; shared fields are added only on flush."""
         macro_class_name = action["macro_class_name"]
         macro_class_id = int(MACRO_CLASS_TO_ID[macro_class_name])
         tool_kind = action["tool_kind"]
@@ -2293,7 +2487,6 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         axis_visible_512 = np.asarray(result["visible_512"], dtype=np.int16)
 
         next_node_sdf_raw = np.asarray(result["dev_after_red_512"], dtype=np.float32)
-        delta_node_sdf = np.maximum(state_node_sdf_raw - next_node_sdf_raw, 0.0)
 
         state_done_mask_512, state_done_ratio = compute_done_mask_from_dev_red(
             state_node_sdf_raw, SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
@@ -2361,13 +2554,6 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             dtype=np.float32,
         )
 
-        state_points_tensor = build_state_points_tensor(
-            face_pc, face_normal_512, state_point_sdf_raw, normalization_scale,
-        )
-        # Note: shape must be [512] (not [512, 1]) to match dataset.py expectations.
-        next_node_sdf_norm = build_normalized_node_sdf_512x1(next_node_sdf_raw, normalization_scale).reshape(512)
-        next_point_sdf_norm = build_normalized_point_sdf_512x100(next_point_sdf_raw, normalization_scale)
-
         global_process_state = build_global_process_state(
             prev_macro_class_id=prev_macro_class_id_for_row,
             rough_rows_emitted=rough_rows_emitted_for_row,
@@ -2409,11 +2595,6 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 octree_bbox_max_norm = (raw_bbox_max - normalization_center_xyz) / octree_scale
 
         return {
-            "part_name": part_name,
-            "prt_file_path": os.path.abspath(prt_file_path),
-            "target_body_mesh_path": target_body_mesh_path,
-            "graph_nx_json": json.dumps(graph_json),
-            "seed": int(seed),
             "decision_step": int(decision_step),
             "candidate_index": int(candidate_index),
             "is_chosen": int(is_chosen),
@@ -2430,31 +2611,21 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             "target_face_id": -1 if macro_class_name == "indexed_rough" else int(target_node_id),
             "tool_choice_valid": int(tool_choice_valid),
 
-            "state_points": _to_serializable_list(state_points_tensor.astype(np.float32)),
-            "node_process_state": _to_serializable_list(node_process_state.astype(np.float32)),
-            "global_process_state": _to_serializable_list(global_process_state.astype(np.float32)),
-            "next_node_sdf": _to_serializable_list(next_node_sdf_norm.astype(np.float32)),
-            "next_point_sdf": _to_serializable_list(next_point_sdf_norm.astype(np.float32)),
-            "node_mask": _to_serializable_list(node_mask_512.astype(np.int16)),
-            "point_mask": _to_serializable_list(point_mask_512x100.astype(np.int16)),
-            "macro_class_mask": _to_serializable_list(macro_class_mask.astype(np.int16)),
-            "tool_choice_mask": _to_serializable_list(tool_choice_mask.astype(np.int16)),
-            "action_face_mask": _to_serializable_list(action_face_mask_512.astype(np.int16)),
+            "node_process_state": node_process_state.astype(np.float32),
+            "global_process_state": global_process_state.astype(np.float32),
+            "macro_class_mask": macro_class_mask.astype(np.int16),
+            "tool_choice_mask": tool_choice_mask.astype(np.int16),
+            "action_face_mask": action_face_mask_512.astype(np.int16),
 
-            "centrality_512": _to_serializable_list(np.asarray(centrality, dtype=np.int16)),
-            "spatial_pos_512x512": _to_serializable_list(np.asarray(spatial_pos, dtype=np.int16)),
-            "face_area_512x1": _to_serializable_list(np.asarray(face_area, dtype=np.float32)),
-            "face_type_512": _to_serializable_list(np.asarray(face_type_512, dtype=np.int16)),
-
-            "axis_visible_512": _to_serializable_list(axis_visible_512.astype(np.int16)),
-            "state_node_sdf_raw_512": _to_serializable_list(state_node_sdf_raw.astype(np.float32)),
-            "next_node_sdf_raw_512": _to_serializable_list(next_node_sdf_raw.astype(np.float32)),
-            "state_point_sdf_raw_512x100": _to_serializable_list(state_point_sdf_raw.astype(np.float32)),
-            "next_point_sdf_raw_512x100": _to_serializable_list(next_point_sdf_raw.astype(np.float32)),
-            "state_done_mask_512": _to_serializable_list(state_done_mask_512.astype(np.int16)),
-            "next_done_mask_512": _to_serializable_list(next_done_mask_512.astype(np.int16)),
-            "rough_done_mask_512": _to_serializable_list(rough_done_mask.astype(np.int16)),
-            "finish_ready_mask_512": _to_serializable_list(finish_ready_mask.astype(np.int16)),
+            "axis_visible_512": axis_visible_512.astype(np.int16),
+            "state_node_sdf_raw_512": np.asarray(state_node_sdf_raw, dtype=np.float32),
+            "next_node_sdf_raw_512": next_node_sdf_raw.astype(np.float32),
+            "state_point_sdf_raw_512x100": state_point_sdf_raw.astype(np.float32),
+            "next_point_sdf_raw_512x100": next_point_sdf_raw.astype(np.float32),
+            "state_done_mask_512": state_done_mask_512.astype(np.int16),
+            "next_done_mask_512": next_done_mask_512.astype(np.int16),
+            "rough_done_mask_512": rough_done_mask.astype(np.int16),
+            "finish_ready_mask_512": finish_ready_mask.astype(np.int16),
             "state_done_ratio": _to_safe_float(state_done_ratio),
             "next_done_ratio": _to_safe_float(next_done_ratio),
 
@@ -2469,42 +2640,18 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             "out_removed_ratio": _to_safe_float(removed_volume / max(vol_before, 1e-9)),
             "out_cycle_time": _to_safe_float(result.get("cycle_time", 0.0)),
             "out_ok": bool(result.get("ok", True)),
-            "normalization_center_xyz": _to_serializable_list(normalization_center_xyz.astype(np.float32)),
-            "normalization_scale": _to_safe_float(normalization_scale),
-            "bbox_extent_xyz": _to_serializable_list(bbox_extent_xyz.astype(np.float32)),
 
             # ── Octree occupancy transition target
-            "octree_centers": _to_serializable_list(octree_centers_norm.reshape(-1).astype(np.float32)) if octree_centers_norm is not None else None,
-            "octree_depths": _to_serializable_list(octree_depths.astype(np.int16)) if octree_depths is not None else None,
+            "octree_centers": octree_centers_norm.reshape(-1).astype(np.float32) if octree_centers_norm is not None else None,
+            "octree_depths": octree_depths.astype(np.int16) if octree_depths is not None else None,
             # After-operation occupancy (primary training target).
-            "octree_occ_labels": _to_serializable_list(octree_occ_labels.astype(np.float32)) if octree_occ_labels is not None else None,
+            "octree_occ_labels": octree_occ_labels.astype(np.float32) if octree_occ_labels is not None else None,
             # Before-operation occupancy at the same cell positions.
             # Used for the monotonicity training constraint:
             #   once a cell is empty (before=0) it must remain empty (after=0).
-            "octree_occ_labels_before": _to_serializable_list(octree_occ_labels_before.astype(np.float32)) if octree_occ_labels_before is not None else None,
-            "octree_bbox_min": _to_serializable_list(octree_bbox_min_norm.astype(np.float32)) if octree_bbox_min_norm is not None else None,
-            "octree_bbox_max": _to_serializable_list(octree_bbox_max_norm.astype(np.float32)) if octree_bbox_max_norm is not None else None,
-
-            "info_json": json.dumps({
-                "surface_finish_tol": float(SURFACE_FINISH_TOL),
-                "candidate_strategy": "beam_sampled_action_transition",
-                "normalization": "part_bbox_center_and_diagonal",
-                "rough_done_delta_eps": float(ROUGH_DONE_DELTA_EPS),
-                "finish_ready_tol": float(FINISH_READY_TOL),
-                "min_effective_removed_volume": float(MIN_EFFECTIVE_REMOVED_VOLUME),
-                "min_effective_removed_ratio": float(MIN_EFFECTIVE_REMOVED_RATIO),
-                "min_effective_max_node_delta": float(MIN_EFFECTIVE_MAX_NODE_DELTA),
-                "min_effective_done_gain": float(MIN_EFFECTIVE_DONE_GAIN),
-                "fail_on_candidate_error": bool(FAIL_ON_CANDIDATE_ERROR),
-                "save_part_on_candidate_error": bool(SAVE_PART_ON_CANDIDATE_ERROR),
-                "error_part_snapshot_dir": os.path.abspath(ERROR_PART_SNAPSHOT_DIR or os.path.join(out_dir, "error_prt_snapshots")),
-                "octree_enabled": bool(OCTREE_ENABLED),
-                "octree_coarse_depth": int(OCTREE_COARSE_DEPTH),
-                "octree_fine_depth": int(OCTREE_FINE_DEPTH),
-                "octree_max_nodes": int(OCTREE_MAX_NODES),
-                "octree_bbox_padding": float(OCTREE_BBOX_PADDING),
-                "row_unit": "one_executed_nx_operation",
-            }, ensure_ascii=False),
+            "octree_occ_labels_before": octree_occ_labels_before.astype(np.float32) if octree_occ_labels_before is not None else None,
+            "octree_bbox_min": octree_bbox_min_norm.astype(np.float32) if octree_bbox_min_norm is not None else None,
+            "octree_bbox_max": octree_bbox_max_norm.astype(np.float32) if octree_bbox_max_norm is not None else None,
         }
 
     rng = np.random.default_rng(int(seed))
@@ -2839,7 +2986,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                         branch, action, result, state_dev_red_512, child_score, child_id,
                     )
 
-                    row = _build_parquet_row(
+                    row = _build_transition_row(
                         action=action,
                         result=result,
                         state_node_sdf_raw=state_dev_red_512,
@@ -2854,9 +3001,8 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                         scenario_id=child_id,
                         parent_scenario_id=str(branch["id"]),
                     )
-                    row_index = len(parquet_rows)
-                    parquet_rows.append(row)
-                    scored.append((child_score, ci, action, result, row_index, child_branch))
+                    pending_transition_rows.append(row)
+                    scored.append((child_score, ci, action, result, row, child_branch))
 
                 branch_record: Dict[str, Any] = {
                     "scenario_id": str(branch["id"]),
@@ -2887,10 +3033,10 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                         "best_action_face": int(best_for_branch[2]["action_face_id"]),
                         "best_score": float(best_for_branch[0]),
                     })
-                    for child_score, ci, action, result, row_index, child_branch in scored:
+                    for child_score, ci, action, result, row, child_branch in scored:
                         depth_children.append({
                             "score": float(child_score),
-                            "row_index": int(row_index),
+                            "row_ref": row,
                             "branch": child_branch,
                             "candidate_index": int(ci),
                             "macro": str(action["macro_class_name"]),
@@ -2923,9 +3069,9 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             next_branches: List[Dict[str, Any]] = []
             selected_records: List[Dict[str, Any]] = []
             for child in selected_children:
-                row_index = int(child["row_index"])
-                if 0 <= row_index < len(parquet_rows):
-                    parquet_rows[row_index]["is_chosen"] = 1
+                child_row = child.get("row_ref")
+                if child_row is not None:
+                    child_row["is_chosen"] = 1
                 next_branch = child["branch"]
                 next_branches.append(next_branch)
                 selected_records.append({
@@ -2972,6 +3118,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             depth_record["selected_done_gain"] = float(selected_done_gain)
             depth_record["no_effect_streak"] = int(no_effect_streak)
             episode_record["steps"].append(depth_record)
+            _flush_pending_transition_rows()
 
             if MAX_NO_EFFECT_STREAK > 0 and no_effect_streak >= MAX_NO_EFFECT_STREAK:
                 termination_reason = "max_no_effect_streak"
@@ -2994,29 +3141,19 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         _save_fatal_error_part("episode", exc)
         raise
     finally:
-        parquet_path = os.path.join(out_dir, f"{part_name}_seed{int(seed)}_process_skeleton_dataset.parquet")
-        chosen_parquet_path = os.path.join(out_dir, f"{part_name}_seed{int(seed)}_process_skeleton_dataset_chosen_only.parquet")
-        if parquet_rows:
-            df = pd.DataFrame(parquet_rows)
-            _ensure_dir(os.path.dirname(parquet_path))
-            df.to_parquet(parquet_path, index=False)
-
+        _flush_pending_transition_rows()
+        num_rows, num_chosen_rows = _close_parquet_stream(parquet_stream)
+        if num_rows > 0 and global_parquet_dir:
+            _ensure_dir(global_parquet_dir)
+            global_filename = f"{run_name}.parquet"
+            global_path = os.path.join(global_parquet_dir, global_filename)
+            shutil.copy2(parquet_path, global_path)
+            print(f"[INFO] Copied parquet to: {global_path}")
             if bool(SAVE_CHOSEN_ONLY_PARQUET):
-                chosen_df = df[df["is_chosen"] == 1].copy()
-                chosen_df.to_parquet(chosen_parquet_path, index=False)
-            
-            if global_parquet_dir:
-                _ensure_dir(global_parquet_dir)
-                global_filename = f"{run_name}.parquet"
-                global_path = os.path.join(global_parquet_dir, global_filename)
-                df.to_parquet(global_path, index=False)
-                print(f"[INFO] Copied parquet to: {global_path}")
-                if bool(SAVE_CHOSEN_ONLY_PARQUET):
-                    global_chosen_filename = f"{run_name}_chosen_only.parquet"
-                    global_chosen_path = os.path.join(global_parquet_dir, global_chosen_filename)
-                    chosen_df = df[df["is_chosen"] == 1].copy()
-                    chosen_df.to_parquet(global_chosen_path, index=False)
-                    print(f"[INFO] Copied chosen-only parquet to: {global_chosen_path}")
+                global_chosen_filename = f"{run_name}_chosen_only.parquet"
+                global_chosen_path = os.path.join(global_parquet_dir, global_chosen_filename)
+                shutil.copy2(chosen_parquet_path, global_chosen_path)
+                print(f"[INFO] Copied chosen-only parquet to: {global_chosen_path}")
 
         _json_dump(os.path.join(out_dir, "episode_record.json"), episode_record)
         _restore_to_root(strict=False)
@@ -3029,9 +3166,9 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     return {
         "out_dir": out_dir, "parquet_path": parquet_path,
         "chosen_parquet_path": chosen_parquet_path if bool(SAVE_CHOSEN_ONLY_PARQUET) else "",
-        "num_rows": int(len(parquet_rows)),
-        "num_chosen_rows": int(sum(1 for row in parquet_rows if int(row.get("is_chosen", 0)) == 1)),
-        "num_operation_rows": int(len(parquet_rows)),
+        "num_rows": int(num_rows),
+        "num_chosen_rows": int(num_chosen_rows),
+        "num_operation_rows": int(num_rows),
         "num_decision_steps": int(len(episode_record["steps"])),
         "planned_max_steps": int(planned_decision_steps),
         "rollout_mode": str(ROLLOUT_MODE),

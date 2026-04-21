@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>Journal Paper Outline - Post-Operation Geometry Prediction</title>
+  <style>
+    body {
+      font-family: "Malgun Gothic", "맑은 고딕", sans-serif;
+      margin: 36px 42px;
+      color: #111;
+      line-height: 1.45;
+      font-size: 11pt;
+    }
+    h1, h2, h3 {
+      margin-top: 18px;
+      margin-bottom: 8px;
+    }
+    h1 {
+      font-size: 18pt;
+      border-bottom: 2px solid #222;
+      padding-bottom: 8px;
+    }
+    h2 {
+      font-size: 14pt;
+      border-left: 5px solid #444;
+      padding-left: 10px;
+    }
+    h3 {
+      font-size: 11.5pt;
+    }
+    p {
+      margin: 6px 0 10px 0;
+    }
+    ul {
+      margin: 6px 0 12px 18px;
+      padding-left: 14px;
+    }
+    li {
+      margin: 3px 0;
+    }
+    .meta {
+      color: #444;
+      margin-bottom: 18px;
+    }
+    .section-note {
+      color: #333;
+      font-style: italic;
+      margin-top: -2px;
+      margin-bottom: 10px;
+    }
+  </style>
+</head>
+<body>
+  <h1>공학 저널 제출용 논문 목차 초안</h1>
+  <p class="meta"><strong>제목(가안)</strong>: A Neural Surrogate for Post-Operation Workpiece Geometry Prediction in CNC Machining from B-Rep Face Graphs</p>
+  <p>아래 구성은 불필요한 부가 섹션을 줄이고, 문제 정의, 방법, 데이터, 실험의 흐름만 남긴 최소 저널형 목차이다. 각 하위섹션 아래에는 반드시 포함해야 할 핵심 내용을 정리했다.</p>
+
+  <h2>1. Introduction</h2>
+  <p class="section-note">연구 필요성과 문제 범위를 명확히 고정하는 장</p>
+
+  <h3>1.1 Background and Motivation</h3>
+  <ul>
+    <li>다축 CNC 가공에서 intermediate workpiece geometry를 아는 것이 왜 중요한지 설명</li>
+    <li>공정 검증, 후속 operation planning, candidate evaluation에서 형상 상태 정보가 필요한 이유 제시</li>
+    <li>기존 CAM simulation은 정확하지만 반복 탐색에는 계산 비용이 크다는 점 명시</li>
+    <li>본 연구가 겨냥하는 실제 사용 맥락이 무엇인지 한 문단으로 정리</li>
+  </ul>
+
+  <h3>1.2 Problem Statement and Scope</h3>
+  <ul>
+    <li>입력이 <strong>current workpiece의 B-rep face graph + next operation descriptor</strong>임을 명확히 정의</li>
+    <li>출력이 다음 operation 이후의 workpiece geometry 또는 occupancy field 예측임을 명시</li>
+    <li>본 연구가 toolpath generation, cutting force, chatter, deflection 예측을 다루지 않는다는 범위 제한 명시</li>
+    <li>명시적 CAM simulation을 대체하기보다 빠른 surrogate로 활용하는 목적을 분명히 적시</li>
+  </ul>
+
+  <h3>1.3 Contributions</h3>
+  <ul>
+    <li>문제 정식화에 대한 기여 1개</li>
+    <li>B-rep graph 기반 operation-conditioned 모델 제안에 대한 기여 1개</li>
+    <li>NX CAM 기반 데이터 수집 파이프라인 또는 transition dataset 구축에 대한 기여 1개</li>
+    <li>정확도와 속도 측면의 실험 검증에 대한 기여 1개</li>
+  </ul>
+
+  <h2>2. Related Work</h2>
+  <p class="section-note">기존 방법을 넓게 나열하지 말고, 본 논문의 연구 공백으로 수렴시키는 장</p>
+
+  <h3>2.1 Machining Simulation and Workpiece Representation</h3>
+  <ul>
+    <li>dexel, voxel, octree, level-set 등 대표적인 workpiece representation을 간단히 정리</li>
+    <li>각 방법의 공통 장점은 정확한 재료 제거 시뮬레이션임을 인정</li>
+    <li>공통 한계로 explicit toolpath 기반 계산 비용과 반복 탐색 부적합성을 제시</li>
+    <li>마지막 문장에서 본 연구가 geometry surrogate를 겨냥한다는 점으로 연결</li>
+  </ul>
+
+  <h3>2.2 Learning-Based 3D Geometry Modeling for CAD and Manufacturing</h3>
+  <ul>
+    <li>PointNet류, voxel CNN류, mesh 기반 모델, B-rep graph 계열 연구를 짧게 정리</li>
+    <li>제조 응용으로 feature recognition, manufacturability, accessibility analysis 등을 언급</li>
+    <li>기존 연구가 형상 이해나 분류/분할에 집중했다는 점을 강조</li>
+    <li>machining state transition prediction 문제는 직접 다루지 않았다는 공백을 분명히 적시</li>
+  </ul>
+
+  <h3>2.3 Neural Implicit Shape Representations</h3>
+  <ul>
+    <li>Occupancy Networks, DeepSDF, ConvONet 등 implicit representation 계열을 요약</li>
+    <li>조건부 shape prediction과의 연관성을 설명</li>
+    <li>본 논문은 CAD-native state encoding과 operation conditioning을 결합한다는 차별점을 명시</li>
+    <li>마지막 문장에서 본 방법의 decoder 설계로 자연스럽게 연결</li>
+  </ul>
+
+  <h2>3. Problem Definition and Dataset Generation</h2>
+  <p class="section-note">문제 정의와 데이터 생성 절차를 한 장에 묶어 읽는 흐름을 단순화하는 장</p>
+
+  <h3>3.1 Problem Definition</h3>
+  <ul>
+    <li>입력 변수와 출력 변수를 수식으로 정의</li>
+    <li>query point 또는 cell 단위 occupancy prediction 설정을 명확히 기술</li>
+    <li>subtractive process라는 물리적 전제와 monotonicity 조건을 수식으로 제시</li>
+    <li>one-step transition prediction 문제인지 분명히 적시</li>
+  </ul>
+
+  <h3>3.2 NX CAM-Based Dataset Generation</h3>
+  <ul>
+    <li>NX Journal API 또는 자동화 인터페이스를 이용한 데이터 수집 절차 설명</li>
+    <li>blank 상태와 partial-machining 상태를 모두 포함했다는 점 명시</li>
+    <li>각 operation 적용 전후의 geometry 또는 occupancy label을 어떻게 수집했는지 설명</li>
+    <li>한 CAD part에서 여러 transition sample을 생성하는 방식과 그 이유를 기술</li>
+    <li>본문에서는 구현 플래그명이 아니라 개념 중심으로 설명</li>
+  </ul>
+
+  <h3>3.3 Dataset Composition and Split</h3>
+  <ul>
+    <li>CAD part 수, 총 transition sample 수, train/val/test 규모 제시</li>
+    <li>operation type 분포와 blank 대 partial state 비율을 요약</li>
+    <li>데이터 분할은 반드시 part-level split임을 명시하여 leakage 우려를 차단</li>
+    <li>필요하면 형상 다양성에 대한 간단한 기술 통계 추가</li>
+  </ul>
+
+  <h2>4. Method</h2>
+  <p class="section-note">모델 구성요소만 설명하고 데이터 수집 내용은 다시 반복하지 않는 장</p>
+
+  <h3>4.1 Overall Framework</h3>
+  <ul>
+    <li>전체 파이프라인 그림 1개 필수</li>
+    <li>StateEncoder, ActionEmbedding, Occupancy Decoder의 입력과 출력을 한 번에 보여줄 것</li>
+    <li>current state와 next operation이 어떻게 결합되는지 개념적으로 설명</li>
+    <li>예측 결과가 occupancy field 또는 post-operation geometry reconstruction으로 이어지는 흐름 제시</li>
+  </ul>
+
+  <h3>4.2 StateEncoder</h3>
+  <ul>
+    <li>face별 UV sampling, geometric attributes, node features 구성을 명시</li>
+    <li>face adjacency graph가 어떻게 구성되는지 설명</li>
+    <li>Graph Transformer 또는 동등한 encoder가 per-face embedding을 만드는 과정을 기술</li>
+    <li>process-state 관련 feature가 있다면 여기에서 정의</li>
+  </ul>
+
+  <h3>4.3 Action Embedding</h3>
+  <ul>
+    <li>operation class, tool descriptor, target face 정보가 어떻게 인코딩되는지 설명</li>
+    <li>각 입력이 categorical인지 continuous인지 구분하여 적시</li>
+    <li>최종 action context vector가 decoder conditioning에 어떻게 사용되는지 연결</li>
+  </ul>
+
+  <h3>4.4 Occupancy Decoder</h3>
+  <ul>
+    <li>query point 또는 octree cell center와 depth 정보의 표현 방식을 설명</li>
+    <li>cross-attention 또는 대응 모듈을 통해 face embedding을 참조하는 구조를 기술</li>
+    <li>FiLM conditioning 또는 동등한 action conditioning 방식 설명</li>
+    <li>최종 occupancy logit 산출 방식과 reconstruction 절차를 명시</li>
+  </ul>
+
+  <h3>4.5 Training Objective</h3>
+  <ul>
+    <li>depth-weighted BCE 또는 사용한 주 손실을 수식으로 제시</li>
+    <li>fine boundary region을 더 강하게 학습시키는 이유 설명</li>
+    <li>monotonicity loss를 정의하고 subtractive process와의 연결을 설명</li>
+    <li>최종 loss 조합과 주요 하이퍼파라미터를 명시</li>
+  </ul>
+
+  <h2>5. Experiments</h2>
+  <p class="section-note">부가 장을 늘리지 않고, 설정-정량 결과-정성 결과만 남기는 장</p>
+
+  <h3>5.1 Experimental Setup</h3>
+  <ul>
+    <li>학습 장비, optimizer, batch size, learning rate 등 재현 가능한 설정 제시</li>
+    <li>query resolution, depth range, threshold 등 평가에 필요한 설정 명시</li>
+    <li>비교 baseline이 있다면 입력 정보와 출력 형식을 제안 방법과 가능한 한 맞춰 설명</li>
+  </ul>
+
+  <h3>5.2 Evaluation Metrics</h3>
+  <ul>
+    <li>Volumetric IoU 정의</li>
+    <li>boundary-region accuracy 또는 boundary cell accuracy 정의</li>
+    <li>monotonicity violation rate 정의</li>
+    <li>inference time, CAM simulation time, speedup 정의</li>
+    <li>속도 지표는 별도 섹션 없이 여기서 정의하고 정량 결과 표에 포함</li>
+  </ul>
+
+  <h3>5.3 Quantitative Results</h3>
+  <ul>
+    <li>제안 방법과 baseline의 정량 비교 표 제시</li>
+    <li>정확도 지표와 시간 지표를 한 표 또는 인접한 표에 함께 제시</li>
+    <li>가능하면 state-only, no-graph 등 최소한의 비교 모델을 포함하여 핵심 설계의 타당성을 보일 것</li>
+    <li>결과 해석에서는 어떤 조건에서 성능 차이가 크게 나는지 짧게 설명</li>
+  </ul>
+
+  <h3>5.4 Qualitative Results</h3>
+  <ul>
+    <li>blank에서 첫 operation 이후, 이후 단계 등 공정 진행에 따른 예시 시각화 포함</li>
+    <li>예측 형상과 CAM ground truth를 같은 시점에서 비교한 그림 제시</li>
+    <li>성공 사례와 실패 사례를 모두 포함</li>
+    <li>실패 사례에서는 어떤 형상 또는 operation 조건이 어려운지 해석 제공</li>
+  </ul>
+
+  <h2>6. Conclusion</h2>
+  <p class="section-note">요약과 한계를 짧게 정리하고 마무리하는 장</p>
+
+  <h3>6.1 Summary</h3>
+  <ul>
+    <li>연구 문제, 제안 방법, 데이터, 핵심 결과를 한 번에 요약</li>
+    <li>CAM simulation 대비 surrogate로서의 의미를 정리</li>
+    <li>공학적 활용 가능성을 짧게 언급</li>
+  </ul>
+
+  <h3>6.2 Limitations and Future Work</h3>
+  <ul>
+    <li>operation descriptor가 주어진다는 가정 명시</li>
+    <li>NX CAM 기반 데이터 수집 의존성 명시</li>
+    <li>복잡 형상이나 누적 오차 가능성 등 현재 한계를 짧게 적시</li>
+    <li>향후 다른 CAM 환경 확장, multi-step planning 연계, 경량화 방향 제시</li>
+  </ul>
+</body>
+</html>
