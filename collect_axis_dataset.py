@@ -3216,8 +3216,9 @@ if __name__ == "__main__":
         current_seed = args.seed
     else:
         print("[Warning] No arguments provided. Using hardcoded default paths.")
-        prt_file_path = r"C:\Users\inwoo\Desktop\3+2_Variable_Axis\test_bracket_step.prt"
-        out_root_dir = r"D:\axis_dataset_out"
+        default_base_dir = r"\\165.132.180.130\04_개별폴더\22. 통합과정 오인욱"
+        prt_file_path = os.path.join(default_base_dir, "prt_dataset", "test_bracket_step.prt")
+        out_root_dir = os.path.join(default_base_dir, "sdf_dataset_out")
         current_seed = 0
 
     prt_path = os.path.abspath(prt_file_path)
