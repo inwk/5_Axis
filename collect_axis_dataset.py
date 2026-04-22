@@ -374,8 +374,8 @@ OCTREE_COARSE_DEPTH: int = int(os.getenv("OCTREE_COARSE_DEPTH", "3"))
 OCTREE_FINE_DEPTH: int = int(os.getenv("OCTREE_FINE_DEPTH", "5"))
 OCTREE_MAX_NODES: int = int(os.getenv("OCTREE_MAX_NODES", "4096"))
 OCTREE_BBOX_PADDING: float = float(os.getenv("OCTREE_BBOX_PADDING", "0.05"))
-MEMORY_DEBUG: bool = bool(int(os.getenv("MEMORY_DEBUG", "0")))
-MEMORY_DEBUG_CANDIDATE_EVERY: int = max(1, int(os.getenv("MEMORY_DEBUG_CANDIDATE_EVERY", "10")))
+MEMORY_DEBUG: bool = bool(int(os.getenv("MEMORY_DEBUG", "1")))
+MEMORY_DEBUG_CANDIDATE_EVERY: int = max(1, int(os.getenv("MEMORY_DEBUG_CANDIDATE_EVERY", "1")))
 
 
 if os.name == "nt":
@@ -409,6 +409,19 @@ if os.name == "nt":
         ]
 
 
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    _kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    _psapi.GetProcessMemoryInfo.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_PROCESS_MEMORY_COUNTERS_EX),
+        ctypes.c_ulong,
+    ]
+    _psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+    _kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MEMORYSTATUSEX)]
+    _kernel32.GlobalMemoryStatusEx.restype = ctypes.c_int
+
+
 def _format_gb(num_bytes: int | float | None) -> str:
     if num_bytes is None:
         return "n/a"
@@ -420,12 +433,10 @@ def _get_memory_snapshot() -> Dict[str, Any] | None:
     if os.name != "nt":
         return None
     try:
-        kernel32 = ctypes.windll.kernel32
-        psapi = ctypes.windll.psapi
         counters = _PROCESS_MEMORY_COUNTERS_EX()
         counters.cb = ctypes.sizeof(_PROCESS_MEMORY_COUNTERS_EX)
-        ok = psapi.GetProcessMemoryInfo(
-            kernel32.GetCurrentProcess(),
+        ok = _psapi.GetProcessMemoryInfo(
+            _kernel32.GetCurrentProcess(),
             ctypes.byref(counters),
             counters.cb,
         )
@@ -434,7 +445,7 @@ def _get_memory_snapshot() -> Dict[str, Any] | None:
 
         mem_status = _MEMORYSTATUSEX()
         mem_status.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
-        if not kernel32.GlobalMemoryStatusEx(ctypes.byref(mem_status)):
+        if not _kernel32.GlobalMemoryStatusEx(ctypes.byref(mem_status)):
             return None
 
         return {
@@ -2714,6 +2725,10 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             dtype=np.float32,
         )
 
+        removed_volume = float(result.get("removed_volume", 0.0) or 0.0)
+        vol_before = float(result.get("volume_before", 0.0) or 0.0)
+        axis_dir = tuple(action["axis_dir"])
+
         global_process_state = build_global_process_state(
             prev_macro_class_id=prev_macro_class_id_for_row,
             current_volume=vol_before,
@@ -2721,10 +2736,6 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             bbox_extent_xyz=bbox_extent_xyz,
             reference_scale=normalization_scale,
         )
-
-        removed_volume = float(result.get("removed_volume", 0.0) or 0.0)
-        vol_before = float(result.get("volume_before", 0.0) or 0.0)
-        axis_dir = tuple(action["axis_dir"])
 
         # ── Adaptive octree occupancy ground truth ────────────────────────
         # Octree leaf centers were sampled inside simulate_single_action while
@@ -2832,6 +2843,20 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         restore_workpiece_chain(workpiece_name_chain, root_chain_snapshot)
         return True
 
+    def _refresh_root_mark() -> None:
+        """Drops the current root undo mark and recreates it at the clean root state."""
+        nonlocal beam_root_mark
+        try:
+            session.DeleteUndoMark(beam_root_mark, "beam_root")
+        except Exception as exc:
+            print(f"[WARN] Could not delete beam_root undo mark during refresh: {exc!r}", flush=True)
+        beam_root_mark = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "beam_root")
+
+    def _reset_root_mark_to_initial_state() -> None:
+        """Restores the initial state and recreates the root undo mark to cap undo growth."""
+        _restore_to_root()
+        _refresh_root_mark()
+
     def _replay_history(history: List[Dict[str, Any]]) -> Tuple[bool, str | None]:
         """Replays a scenario action sequence from the current root state."""
         for hi, hist_action in enumerate(history):
@@ -2936,6 +2961,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                         "reason": "replay_failed",
                         "error": replay_error,
                     })
+                    _reset_root_mark_to_initial_state()
                     continue
 
                 K_groups = len(groups_face)
@@ -2965,6 +2991,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                         "state_removed_ratio": float(state_removed_ratio),
                         "state_done_ratio": float(state_done_ratio),
                     })
+                    _reset_root_mark_to_initial_state()
                     continue
 
                 finish_ready_current_512 = build_finish_ready_mask_512(
@@ -3013,6 +3040,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                         "state_removed_ratio": float(state_removed_ratio),
                         "state_done_ratio": float(state_done_ratio),
                     })
+                    _reset_root_mark_to_initial_state()
                     continue
 
                 # Branch-invariant octree bbox.  Candidate simulations can reuse
@@ -3243,6 +3271,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 )
 
                 depth_record["branch_records"].append(branch_record)
+                _reset_root_mark_to_initial_state()
 
             if not depth_children:
                 reason = "all_faces_done" if done_branch_count >= len(branches) and len(branches) > 0 else "no_next_branches"
