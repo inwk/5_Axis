@@ -15,7 +15,7 @@ PYTHON_EXE = sys.executable
 WORKER_SCRIPT = "collect_axis_dataset.py"
 
 # Shared network paths for distributed collection machines.
-SHARED_BASE_DIR = r"Y:\04_개별폴더\22. 통합과정 오인욱"
+SHARED_BASE_DIR = r"\\165.132.180.130\04_개별폴더\22. 통합과정 오인욱"
 SHARED_INPUT_DIR = os.path.join(SHARED_BASE_DIR, "prt_dataset")
 SHARED_OUTPUT_DIR = os.path.join(SHARED_BASE_DIR, "sdf_dataset_out")
 CURRENT_SEED = 0
