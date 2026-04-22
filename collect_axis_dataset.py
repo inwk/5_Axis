@@ -5,6 +5,7 @@ import math
 import gc
 import sys
 import shutil
+import ctypes
 from typing import Any, Dict, Tuple, List
 from datetime import datetime
 import argparse
@@ -373,6 +374,115 @@ OCTREE_COARSE_DEPTH: int = int(os.getenv("OCTREE_COARSE_DEPTH", "3"))
 OCTREE_FINE_DEPTH: int = int(os.getenv("OCTREE_FINE_DEPTH", "5"))
 OCTREE_MAX_NODES: int = int(os.getenv("OCTREE_MAX_NODES", "4096"))
 OCTREE_BBOX_PADDING: float = float(os.getenv("OCTREE_BBOX_PADDING", "0.05"))
+MEMORY_DEBUG: bool = bool(int(os.getenv("MEMORY_DEBUG", "0")))
+MEMORY_DEBUG_CANDIDATE_EVERY: int = max(1, int(os.getenv("MEMORY_DEBUG_CANDIDATE_EVERY", "10")))
+
+
+if os.name == "nt":
+    class _PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+        _fields_ = [
+            ("cb", ctypes.c_ulong),
+            ("PageFaultCount", ctypes.c_ulong),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+            ("PrivateUsage", ctypes.c_size_t),
+        ]
+
+
+    class _MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+
+def _format_gb(num_bytes: int | float | None) -> str:
+    if num_bytes is None:
+        return "n/a"
+    return f"{float(num_bytes) / (1024.0 ** 3):.2f}GB"
+
+
+def _get_memory_snapshot() -> Dict[str, Any] | None:
+    """Returns a lightweight process/system memory snapshot for debug logging."""
+    if os.name != "nt":
+        return None
+    try:
+        kernel32 = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
+        counters = _PROCESS_MEMORY_COUNTERS_EX()
+        counters.cb = ctypes.sizeof(_PROCESS_MEMORY_COUNTERS_EX)
+        ok = psapi.GetProcessMemoryInfo(
+            kernel32.GetCurrentProcess(),
+            ctypes.byref(counters),
+            counters.cb,
+        )
+        if not ok:
+            return None
+
+        mem_status = _MEMORYSTATUSEX()
+        mem_status.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+        if not kernel32.GlobalMemoryStatusEx(ctypes.byref(mem_status)):
+            return None
+
+        return {
+            "pid": int(os.getpid()),
+            "working_set": int(counters.WorkingSetSize),
+            "peak_working_set": int(counters.PeakWorkingSetSize),
+            "private_bytes": int(counters.PrivateUsage),
+            "commit_bytes": int(counters.PagefileUsage),
+            "peak_commit_bytes": int(counters.PeakPagefileUsage),
+            "avail_phys": int(mem_status.ullAvailPhys),
+            "total_phys": int(mem_status.ullTotalPhys),
+            "system_commit_total": int(mem_status.ullTotalPageFile),
+            "system_commit_avail": int(mem_status.ullAvailPageFile),
+            "memory_load_pct": int(mem_status.dwMemoryLoad),
+        }
+    except Exception:
+        return None
+
+
+def _log_memory(stage: str, **extra: Any) -> None:
+    """Prints current process memory so log files reveal peak phases."""
+    if not MEMORY_DEBUG:
+        return
+    snap = _get_memory_snapshot()
+    if snap is None:
+        print(f"[MEM] stage={stage} pid={os.getpid()} snapshot=unavailable", flush=True)
+        return
+    extra_text = " ".join(
+        f"{key}={value}"
+        for key, value in extra.items()
+        if value is not None
+    )
+    sys_commit_used = snap["system_commit_total"] - snap["system_commit_avail"]
+    parts = [
+        f"stage={stage}",
+        f"pid={snap['pid']}",
+        f"rss={_format_gb(snap['working_set'])}",
+        f"peak_rss={_format_gb(snap['peak_working_set'])}",
+        f"private={_format_gb(snap['private_bytes'])}",
+        f"commit={_format_gb(snap['commit_bytes'])}",
+        f"peak_commit={_format_gb(snap['peak_commit_bytes'])}",
+        f"avail_phys={_format_gb(snap['avail_phys'])}",
+        f"sys_commit={_format_gb(sys_commit_used)}/{_format_gb(snap['system_commit_total'])}",
+        f"mem_load={snap['memory_load_pct']}%",
+    ]
+    if extra_text:
+        parts.append(extra_text)
+    print("[MEM] " + " ".join(parts), flush=True)
 
 
 def build_node_mask_512(num_valid_nodes: int, max_nodes: int = 512) -> np.ndarray:
@@ -1061,6 +1171,7 @@ def simulate_single_action(
     octree_max_nodes: int = 4096,
     octree_bbox_padding: float = 0.05,
     octree_enabled: bool = False,
+    memory_log_label: str | None = None,
 ) -> Dict[str, Any]:
     """Simulates one action and returns transition data.
 
@@ -1091,6 +1202,14 @@ def simulate_single_action(
     state_chain = workpiece_name_chain
     if state_chain is None:
         state_chain = []
+    if memory_log_label is not None:
+        _log_memory(
+            f"{memory_log_label}:start",
+            macro=action.get("macro_class_name"),
+            optype=optype,
+            face=action_face_id,
+            depth=operation_depth,
+        )
 
     # ── Measure BEFORE ──
     pw_before = None
@@ -1143,6 +1262,8 @@ def simulate_single_action(
             restore_workpiece_chain(state_chain, m_bef_chain_snapshot)
 
         dev_bef_red_512 = pad_1d_float(dev_bef_red, 512)
+    if memory_log_label is not None:
+        _log_memory(f"{memory_log_label}:after_before_measure", volume_before=float(vol_before))
     result: Dict[str, Any] = {
         "ok": True, "error": None,
         "optype": optype, "tool_kind": tool_kind, "tool_diameter": tool_diameter,
@@ -1227,6 +1348,8 @@ def simulate_single_action(
                 points_array, norm_vecs_array, lines_array,
             )
             dev_aft_red = reduce_scalar_by_groups(np.asarray(dev_after, dtype=np.float32), groups_face, weights=face_areas)
+        if memory_log_label is not None:
+            _log_memory(f"{memory_log_label}:after_after_measure", volume_after=float(vol_after))
 
         # ── Adaptive octree occupancy target (inside try while obj_a is live) ──
         if octree_enabled and octree_bbox_min_raw is not None and octree_bbox_max_raw is not None:
@@ -1247,6 +1370,11 @@ def simulate_single_action(
             result["octree_occ_labels"] = labels            # [K] float32  (AFTER labels)
             result["octree_bbox_min_raw"] = bbox_min_for_octree.astype(np.float32)
             result["octree_bbox_max_raw"] = bbox_max_for_octree.astype(np.float32)
+            if memory_log_label is not None:
+                _log_memory(
+                    f"{memory_log_label}:after_octree",
+                    octree_nodes=int(labels.size),
+                )
             if labels.size > 0:
                 occ_ratio = float(np.mean(labels >= 0.5))
                 if occ_ratio <= 0.001 or occ_ratio >= 0.999:
@@ -1279,6 +1407,11 @@ def simulate_single_action(
                         centers_xyz=centers_raw,
                     )
                     result["octree_occ_labels_before"] = before_labels  # [K] float32
+                    if memory_log_label is not None:
+                        _log_memory(
+                            f"{memory_log_label}:after_before_occ",
+                            before_nodes=int(before_labels.size),
+                        )
                     before_ratio = float(np.mean(before_labels >= 0.5)) if before_labels.size > 0 else float("nan")
                     after_ratio  = float(np.mean(labels >= 0.5)) if labels.size > 0 else float("nan")
                     if before_ratio < after_ratio - 0.01:
@@ -1672,6 +1805,7 @@ def measure_current_state_for_branch(
     cache avoids repeated GetInputIpw/deviation queries inside every candidate
     simulation while preserving the same raw and reduced state tensors.
     """
+    _log_memory("branch_measure:start", depth=state_depth)
     if workpiece_name_chain is None:
         workpiece_name_chain = []
     m = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "measure_branch_state")
@@ -1719,6 +1853,7 @@ def measure_current_state_for_branch(
             "dev_raw": np.asarray(dev_raw, dtype=np.float32).reshape(-1),
             "dev_red_512": np.asarray(dev_red_512, dtype=np.float32).reshape(512),
         })
+        _log_memory("branch_measure:end", depth=state_depth, volume=float(vol))
         return out
     finally:
         session.UndoToMark(m, "measure_branch_state")
@@ -2091,6 +2226,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     """Collects one full dataset episode for a single part file."""
     session, work_part = cam_session.create_session(input_file_dir=prt_file_path)
     theUfSession = NXOpen.UF.UFSession.GetUFSession()  # noqa: kept for legacy helpers
+    _log_memory("episode:start", part=os.path.basename(prt_file_path), seed=int(seed))
 
     origin_body = max(work_part.Bodies, key=get_body_volume)
     origin_faces = origin_body.GetFaces()
@@ -2130,6 +2266,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         points_array.append(pts)
         norm_vecs_array.append(norms)
         lines_array.append(lines)
+    _log_memory("episode:after_static_prep", raw_faces=raw_face_count)
 
     mill_tool_types = ["MILL", "BALL_MILL"]
     flat_tools, ball_tools = [], []
@@ -2141,6 +2278,11 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     part_name = os.path.splitext(os.path.basename(prt_file_path))[0]
     out_dir = create_run_output_dir(out_root, part_name, seed)
     run_name = os.path.basename(out_dir)
+    parquet_path = ""
+    chosen_parquet_path = ""
+    num_rows = 0
+    num_chosen_rows = 0
+    episode_completed = False
     target_body_mesh_path = export_body_to_obj(
         session,
         work_part,
@@ -2383,6 +2525,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     finish_rows_emitted = 0
     parquet_path = os.path.join(out_dir, f"{part_name}_seed{int(seed)}_process_skeleton_dataset.parquet")
     chosen_parquet_path = os.path.join(out_dir, f"{part_name}_seed{int(seed)}_process_skeleton_dataset_chosen_only.parquet")
+
     shared_info_json = json.dumps({
         "surface_finish_tol": float(SURFACE_FINISH_TOL),
         "candidate_strategy": "beam_sampled_action_transition",
@@ -2468,6 +2611,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         nonlocal pending_transition_rows
         if not pending_transition_rows:
             return
+        _log_memory("parquet_flush:start", pending_rows=len(pending_transition_rows))
         for batch_rows in _iter_row_batches(pending_transition_rows, PARQUET_WRITE_BATCH_ROWS):
             serialized_rows = [_materialize_parquet_row(row) for row in batch_rows]
             _append_serialized_rows_to_parquet_stream(parquet_stream, serialized_rows)
@@ -2475,6 +2619,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             gc.collect()
         pending_transition_rows = []
         gc.collect()
+        _log_memory("parquet_flush:end", pending_rows=0)
 
     def _build_transition_row(
         action: Dict[str, Any],
@@ -2851,6 +2996,13 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                     f"(removed={state_removed_ratio:.2f}, macros={candidate_macros}, tools={candidate_tools})",
                     flush=True,
                 )
+                _log_memory(
+                    "branch:before_candidates",
+                    t=int(t),
+                    branch=str(branch["id"]),
+                    candidates=int(len(candidates)),
+                    removed_ratio=f"{state_removed_ratio:.4f}",
+                )
 
                 if not candidates:
                     depth_record["branch_records"].append({
@@ -2878,6 +3030,9 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 reject_examples: List[str] = []
 
                 for ci, action in enumerate(candidates):
+                    memory_log_label = None
+                    if MEMORY_DEBUG and (ci % MEMORY_DEBUG_CANDIDATE_EVERY == 0 or ci == len(candidates) - 1):
+                        memory_log_label = f"candidate:t{t}:b{branch['id']}:c{ci}"
                     cand_chain_snapshot = list(workpiece_name_chain)
                     cand_mark = session.SetUndoMark(
                         NXOpen.Session.MarkVisibility.Invisible,
@@ -2910,6 +3065,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                             octree_max_nodes=OCTREE_MAX_NODES,
                             octree_bbox_padding=OCTREE_BBOX_PADDING,
                             octree_enabled=OCTREE_ENABLED,
+                            memory_log_label=memory_log_label,
                         )
                     except Exception as exc:
                         candidate_error_snapshot_path = _save_candidate_error_part(
@@ -3078,6 +3234,14 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                             ),
                         })
 
+                _log_memory(
+                    "branch:after_candidates",
+                    t=int(t),
+                    branch=str(branch["id"]),
+                    effective=int(len(scored)),
+                    pending_rows=int(len(pending_transition_rows)),
+                )
+
                 depth_record["branch_records"].append(branch_record)
 
             if not depth_children:
@@ -3165,6 +3329,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             "executed_steps": int(len(episode_record["steps"])),
             "planned_max_steps": int(planned_decision_steps),
         }
+        episode_completed = True
 
     except Exception as exc:
         _save_fatal_error_part("episode", exc)
@@ -3172,19 +3337,20 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     finally:
         _flush_pending_transition_rows()
         num_rows, num_chosen_rows = _close_parquet_stream(parquet_stream)
-        if num_rows > 0 and global_parquet_dir:
-            _ensure_dir(global_parquet_dir)
-            global_filename = f"{run_name}.parquet"
-            global_path = os.path.join(global_parquet_dir, global_filename)
-            shutil.copy2(parquet_path, global_path)
-            print(f"[INFO] Copied parquet to: {global_path}")
-            if bool(SAVE_CHOSEN_ONLY_PARQUET):
-                global_chosen_filename = f"{run_name}_chosen_only.parquet"
-                global_chosen_path = os.path.join(global_parquet_dir, global_chosen_filename)
-                shutil.copy2(chosen_parquet_path, global_chosen_path)
-                print(f"[INFO] Copied chosen-only parquet to: {global_chosen_path}")
+        if episode_completed:
+            if num_rows > 0 and global_parquet_dir:
+                _ensure_dir(global_parquet_dir)
+                global_filename = f"{run_name}.parquet"
+                global_path = os.path.join(global_parquet_dir, global_filename)
+                shutil.copy2(parquet_path, global_path)
+                print(f"[INFO] Copied parquet to: {global_path}")
+                if bool(SAVE_CHOSEN_ONLY_PARQUET):
+                    global_chosen_filename = f"{run_name}_chosen_only.parquet"
+                    global_chosen_path = os.path.join(global_parquet_dir, global_chosen_filename)
+                    shutil.copy2(chosen_parquet_path, global_chosen_path)
+                    print(f"[INFO] Copied chosen-only parquet to: {global_chosen_path}")
 
-        _json_dump(os.path.join(out_dir, "episode_record.json"), episode_record)
+            _json_dump(os.path.join(out_dir, "episode_record.json"), episode_record)
         _restore_to_root(strict=False)
         try:
             session.DeleteUndoMark(beam_root_mark, "beam_root")

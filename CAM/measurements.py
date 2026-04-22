@@ -230,18 +230,20 @@ def convert_facet_to_body(body, option=2):
     theSession = NXOpen.Session.GetSession()
     work_part = theSession.Parts.Work
     convertFacetBodyBuilder = work_part.FacetedBodies.FacetModelingCollection.CreateConvertFacetBodyBuilder()
-    if option == 0:
-        convertFacetBodyBuilder.OriginalBodyOption = NXOpen.Facet.ConvertFacetBodyBuilder.OriginalBodyOptions.Keep
-    elif option == 1:
-        convertFacetBodyBuilder.OriginalBodyOption = NXOpen.Facet.ConvertFacetBodyBuilder.OriginalBodyOptions.Hide
-    else:       
-        convertFacetBodyBuilder.OriginalBodyOption = NXOpen.Facet.ConvertFacetBodyBuilder.OriginalBodyOptions.Delete
-    convertFacetBodyBuilder.OutputType = NXOpen.Facet.ConvertFacetBodyBuilder.OutputTypes.ConvergentBody
-    convertFacetBodyBuilder.FacetedBodiesToConvert.Add(body)
-    nXObject = convertFacetBodyBuilder.Commit()
-    objects = convertFacetBodyBuilder.GetCommittedObjects()
-    #convertFacetBodyBuilder.Destroy()
-    return objects
+    try:
+        if option == 0:
+            convertFacetBodyBuilder.OriginalBodyOption = NXOpen.Facet.ConvertFacetBodyBuilder.OriginalBodyOptions.Keep
+        elif option == 1:
+            convertFacetBodyBuilder.OriginalBodyOption = NXOpen.Facet.ConvertFacetBodyBuilder.OriginalBodyOptions.Hide
+        else:
+            convertFacetBodyBuilder.OriginalBodyOption = NXOpen.Facet.ConvertFacetBodyBuilder.OriginalBodyOptions.Delete
+        convertFacetBodyBuilder.OutputType = NXOpen.Facet.ConvertFacetBodyBuilder.OutputTypes.ConvergentBody
+        convertFacetBodyBuilder.FacetedBodiesToConvert.Add(body)
+        convertFacetBodyBuilder.Commit()
+        objects = convertFacetBodyBuilder.GetCommittedObjects()
+        return objects
+    finally:
+        convertFacetBodyBuilder.Destroy()
 # def classify_shape(points, plane_thresh=0.01, sphere_thresh=0.05, cylinder_thresh=0.05):
 
 #     # Fit a plane and count inliers

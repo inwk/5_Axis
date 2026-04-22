@@ -2,6 +2,7 @@
 
 import argparse
 import glob
+import json
 import multiprocessing
 import os
 import random
@@ -20,11 +21,76 @@ SHARED_OUTPUT_DIR = os.path.join(SHARED_BASE_DIR, "sdf_dataset_out")
 CURRENT_SEED = 0
 
 
+def _is_completed_run_dir(run_dir: str) -> bool:
+    """Returns True only for fully completed episode output directories."""
+    if not os.path.isdir(run_dir):
+        return False
+    episode_record_path = os.path.join(run_dir, "episode_record.json")
+    if not os.path.isfile(episode_record_path):
+        return False
+    local_parquets = glob.glob(os.path.join(run_dir, "*_process_skeleton_dataset.parquet"))
+    if not local_parquets:
+        return False
+    try:
+        with open(episode_record_path, "r", encoding="utf-8") as f:
+            episode_record = json.load(f)
+    except Exception:
+        return False
+    termination = episode_record.get("termination")
+    if not isinstance(termination, dict):
+        return False
+    return bool(termination.get("reason"))
+
+
+def _global_parquet_run_name(filename: str) -> str:
+    """Extracts the run directory stem from a global parquet filename."""
+    if filename.endswith("_chosen_only.parquet"):
+        return filename[: -len("_chosen_only.parquet")]
+    if filename.endswith(".parquet"):
+        return filename[: -len(".parquet")]
+    return filename
+
+
+def _cleanup_incomplete_global_parquets(part_name: str, output_dir: str) -> dict[str, int]:
+    """Removes only stale global parquet files for incomplete runs.
+
+    Incomplete local run directories are intentionally preserved so interrupted
+    debug sessions keep their logs and partial artifacts.
+    """
+    pattern = os.path.join(output_dir, f"{part_name}_seed{CURRENT_SEED}_*")
+    completed_run_names: set[str] = set()
+    removed_global_parquets = 0
+
+    for folder in glob.glob(pattern):
+        if not os.path.isdir(folder):
+            continue
+        run_name = os.path.basename(folder)
+        if _is_completed_run_dir(folder):
+            completed_run_names.add(run_name)
+
+    global_dir = os.path.join(output_dir, "_ALL_PARQUET_FILES")
+    if os.path.isdir(global_dir):
+        for parquet_path in glob.glob(os.path.join(global_dir, f"{part_name}_seed{CURRENT_SEED}_*.parquet")):
+            run_name = _global_parquet_run_name(os.path.basename(parquet_path))
+            run_dir = os.path.join(output_dir, run_name)
+            if run_name in completed_run_names or _is_completed_run_dir(run_dir):
+                continue
+            try:
+                os.remove(parquet_path)
+                removed_global_parquets += 1
+            except OSError as exc:
+                print(f"[Warn] Failed to remove incomplete parquet {parquet_path}: {exc}")
+
+    return {
+        "removed_global_parquets": removed_global_parquets,
+    }
+
+
 def _already_collected(part_name: str, output_dir: str) -> bool:
-    """Checks whether a part already has a completed parquet dataset."""
+    """Checks whether a part already has a fully completed dataset run."""
     pattern = os.path.join(output_dir, f"{part_name}_seed{CURRENT_SEED}_*")
     for folder in glob.glob(pattern):
-        if glob.glob(os.path.join(folder, "*.parquet")):
+        if _is_completed_run_dir(folder):
             return True
     return False
 
@@ -33,6 +99,12 @@ def process_file_safe(file_info: tuple[str, str]) -> None:
     """Processes one part with lock-file protection to avoid duplicate work."""
     prt_path, output_dir = file_info
     part_name = os.path.splitext(os.path.basename(prt_path))[0]
+
+    cleanup_stats = _cleanup_incomplete_global_parquets(part_name, output_dir)
+    if cleanup_stats["removed_global_parquets"]:
+        print(
+            f"[Cleanup] {part_name}: removed {cleanup_stats['removed_global_parquets']} stale global parquet files"
+        )
 
     if _already_collected(part_name, output_dir):
         return
