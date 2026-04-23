@@ -2329,10 +2329,10 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     # Fixed-step collection now prefers a longer horizon so roughing can open
     # up finish-ready states before the rollout terminates. Search width is
     # still controlled separately by target/tool/beam limits.
-    MAX_ROUGH_TARGETS = int(os.getenv("MAX_ROUGH_TARGETS", "6"))
-    MAX_FINISH_TARGETS = int(os.getenv("MAX_FINISH_TARGETS", "5"))
-    MAX_TOOLS_PER_CLASS = int(os.getenv("MAX_TOOLS_PER_CLASS", "3"))
-    BEAM_WIDTH = max(1, int(os.getenv("BEAM_WIDTH", "3")))
+    MAX_ROUGH_TARGETS = int(os.getenv("MAX_ROUGH_TARGETS", "3"))
+    MAX_FINISH_TARGETS = int(os.getenv("MAX_FINISH_TARGETS", "2"))
+    MAX_TOOLS_PER_CLASS = int(os.getenv("MAX_TOOLS_PER_CLASS", "2"))
+    BEAM_WIDTH = max(1, int(os.getenv("BEAM_WIDTH", "2")))
     SAMPLED_BRANCHES = max(0, int(os.getenv("SAMPLED_BRANCHES", "1")))
     finish_ready_tol_default = float(globals().get("FINISH_READY_TOL", 1.0))
     FINISH_READY_TOL = float(os.getenv("FINISH_READY_TOL", str(finish_ready_tol_default)))
