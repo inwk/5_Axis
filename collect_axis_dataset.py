@@ -2309,7 +2309,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     ROLLOUT_MODE = os.getenv("ROLLOUT_MODE", "fixed_steps").strip().lower()
     if ROLLOUT_MODE not in {"until_done", "fixed_steps"}:
         raise ValueError(f"Unsupported ROLLOUT_MODE: {ROLLOUT_MODE!r}")
-    FIXED_DECISION_STEPS = int(os.getenv("FIXED_DECISION_STEPS", "3"))
+    FIXED_DECISION_STEPS = int(os.getenv("FIXED_DECISION_STEPS", "6"))
     MAX_TOTAL_DECISION_STEPS = int(os.getenv("MAX_TOTAL_DECISION_STEPS", "64"))
     if FIXED_DECISION_STEPS <= 0 or MAX_TOTAL_DECISION_STEPS <= 0:
         raise ValueError("FIXED_DECISION_STEPS and MAX_TOTAL_DECISION_STEPS must be positive")
@@ -2326,12 +2326,9 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     )
 
     # Candidate generation / beam settings.
-    # With FIXED_DECISION_STEPS=3 and BEAM_WIDTH=3 the expected row count is:
-    #   step0: 1 branch × candidates  +
-    #   step1: 3 branches × candidates  +
-    #   step2: 3 branches × candidates
-    # ≈ (1+3+3) × (MAX_ROUGH_TARGETS × MAX_TOOLS_PER_CLASS) ≈ 7 × 18 = 126 rows,
-    # giving a comfortable buffer above the 100-row target even after NX failures.
+    # Fixed-step collection now prefers a longer horizon so roughing can open
+    # up finish-ready states before the rollout terminates. Search width is
+    # still controlled separately by target/tool/beam limits.
     MAX_ROUGH_TARGETS = int(os.getenv("MAX_ROUGH_TARGETS", "6"))
     MAX_FINISH_TARGETS = int(os.getenv("MAX_FINISH_TARGETS", "5"))
     MAX_TOOLS_PER_CLASS = int(os.getenv("MAX_TOOLS_PER_CLASS", "3"))
