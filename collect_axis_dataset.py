@@ -257,6 +257,96 @@ def compute_done_mask_from_dev_red(
         ratio = 0.0
     return done, ratio
 
+
+FINISH_MACRO_CLASS_NAMES = frozenset({"indexed_finish", "point_finish", "flank_finish"})
+
+
+def is_finish_macro_class(macro_class_name: str) -> bool:
+    """Returns whether the macro uses local finishing logic."""
+    return str(macro_class_name) in FINISH_MACRO_CLASS_NAMES
+
+
+def compute_action_face_local_sdf_change(
+    before_sdf_512: np.ndarray,
+    after_sdf_512: np.ndarray,
+    action_face_id: int,
+) -> Dict[str, float]:
+    """Computes local residual change metrics on the selected action face/group."""
+    before = np.asarray(before_sdf_512, dtype=np.float32).reshape(-1)
+    after = np.asarray(after_sdf_512, dtype=np.float32).reshape(-1)
+    face_id = int(action_face_id)
+    local_before = 0.0
+    local_after = 0.0
+    if 0 <= face_id < len(before) and np.isfinite(before[face_id]):
+        local_before = float(before[face_id])
+        local_after = local_before
+        if face_id < len(after) and np.isfinite(after[face_id]):
+            local_after = float(after[face_id])
+    local_drop = max(local_before - local_after, 0.0)
+    local_drop_ratio = local_drop / max(abs(local_before), 1e-9) if local_before > 1e-9 else 0.0
+    return {
+        "local_face_before": float(local_before),
+        "local_face_after": float(local_after),
+        "local_face_drop": float(local_drop),
+        "local_face_drop_ratio": float(local_drop_ratio),
+    }
+
+
+def evaluate_transition_effectiveness(
+    action: Dict[str, Any],
+    before_sdf_512: np.ndarray,
+    after_sdf_512: np.ndarray,
+    removed: float,
+    removed_ratio: float,
+    max_delta: float,
+    removed_ratio_gain: float,
+    min_removed_volume: float,
+    min_removed_ratio: float,
+    min_max_node_delta: float,
+    min_removed_ratio_gain: float,
+    min_finish_local_drop_ratio: float,
+) -> Dict[str, Any]:
+    """Evaluates candidate effectiveness with macro-specific acceptance logic."""
+    local_metrics = compute_action_face_local_sdf_change(
+        before_sdf_512=before_sdf_512,
+        after_sdf_512=after_sdf_512,
+        action_face_id=int(action.get("action_face_id", -1)),
+    )
+    is_zero_effect = (
+        float(removed) <= 1e-6
+        and float(max_delta) <= 1e-6
+        and float(removed_ratio_gain) <= 1e-9
+        and float(local_metrics["local_face_drop"]) <= 1e-9
+    )
+
+    checks: List[bool] = []
+    macro_name = str(action.get("macro_class_name", ""))
+    criterion = "global_removed_metrics"
+    if is_finish_macro_class(macro_name):
+        criterion = "finish_local_drop_ratio"
+        if float(min_finish_local_drop_ratio) > 0.0:
+            checks.append(float(local_metrics["local_face_drop_ratio"]) >= float(min_finish_local_drop_ratio))
+        else:
+            checks.append(float(local_metrics["local_face_drop"]) > 1e-6)
+    else:
+        if float(min_removed_volume) > 0.0:
+            checks.append(float(removed) >= float(min_removed_volume))
+        if float(min_removed_ratio) > 0.0:
+            checks.append(float(removed_ratio) >= float(min_removed_ratio))
+        if float(min_max_node_delta) > 0.0:
+            checks.append(float(max_delta) >= float(min_max_node_delta))
+        if float(min_removed_ratio_gain) > 0.0:
+            checks.append(float(removed_ratio_gain) >= float(min_removed_ratio_gain))
+
+    passes_threshold = any(checks) if checks else True
+    return {
+        **local_metrics,
+        "criterion": criterion,
+        "is_zero_effect": bool(is_zero_effect),
+        "is_effective": bool((not is_zero_effect) and passes_threshold),
+    }
+
+
 def compute_done_mask_from_dev_red_with_K(dev_red_512: np.ndarray, tol: float, K: int) -> Tuple[np.ndarray, bool]:
     """Performs: compute done mask from dev red with k."""
     dev = np.asarray(dev_red_512, dtype=np.float32).reshape(-1)
@@ -2343,6 +2433,9 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     MIN_EFFECTIVE_REMOVED_RATIO_GAIN = float(
         os.getenv("MIN_EFFECTIVE_REMOVED_RATIO_GAIN", os.getenv("MIN_EFFECTIVE_DONE_GAIN", "0.0"))
     )
+    MIN_EFFECTIVE_FINISH_LOCAL_DROP_RATIO = float(
+        os.getenv("MIN_EFFECTIVE_FINISH_LOCAL_DROP_RATIO", "0.05")
+    )
     FAIL_ON_CANDIDATE_ERROR = bool(int(os.getenv("FAIL_ON_CANDIDATE_ERROR", "0")))
     SAVE_PART_ON_CANDIDATE_ERROR = bool(int(os.getenv("SAVE_PART_ON_CANDIDATE_ERROR", "0")))
     # Save all simulated candidates (not just the chosen one) so that every
@@ -2353,25 +2446,6 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     # needs the full episode table in memory. Keep the default conservative.
     PARQUET_WRITE_BATCH_ROWS = max(1, int(os.getenv("PARQUET_WRITE_BATCH_ROWS", "20")))
     ERROR_PART_SNAPSHOT_DIR = os.getenv("ERROR_PART_SNAPSHOT_DIR", "")
-
-    def _is_effective_transition(
-        removed: float,
-        removed_ratio: float,
-        max_delta: float,
-        removed_ratio_gain: float,
-    ) -> bool:
-        if removed <= 1e-6 and max_delta <= 1e-6 and removed_ratio_gain <= 1e-9:
-            return False
-        checks = []
-        if MIN_EFFECTIVE_REMOVED_VOLUME > 0.0:
-            checks.append(removed >= MIN_EFFECTIVE_REMOVED_VOLUME)
-        if MIN_EFFECTIVE_REMOVED_RATIO > 0.0:
-            checks.append(removed_ratio >= MIN_EFFECTIVE_REMOVED_RATIO)
-        if MIN_EFFECTIVE_MAX_NODE_DELTA > 0.0:
-            checks.append(max_delta >= MIN_EFFECTIVE_MAX_NODE_DELTA)
-        if MIN_EFFECTIVE_REMOVED_RATIO_GAIN > 0.0:
-            checks.append(removed_ratio_gain >= MIN_EFFECTIVE_REMOVED_RATIO_GAIN)
-        return any(checks) if checks else True
 
     def _save_candidate_error_part(t: int, branch_id: str, candidate_index: int, action: Dict[str, Any], exc: Exception) -> str:
         if not bool(SAVE_PART_ON_CANDIDATE_ERROR):
@@ -2515,6 +2589,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 "min_removed_ratio": float(MIN_EFFECTIVE_REMOVED_RATIO),
                 "min_max_node_delta": float(MIN_EFFECTIVE_MAX_NODE_DELTA),
                 "min_removed_ratio_gain": float(MIN_EFFECTIVE_REMOVED_RATIO_GAIN),
+                "min_finish_local_drop_ratio": float(MIN_EFFECTIVE_FINISH_LOCAL_DROP_RATIO),
             },
             "fail_on_candidate_error": bool(FAIL_ON_CANDIDATE_ERROR),
             "save_part_on_candidate_error": bool(SAVE_PART_ON_CANDIDATE_ERROR),
@@ -2544,6 +2619,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         "min_effective_removed_ratio": float(MIN_EFFECTIVE_REMOVED_RATIO),
         "min_effective_max_node_delta": float(MIN_EFFECTIVE_MAX_NODE_DELTA),
         "min_effective_removed_ratio_gain": float(MIN_EFFECTIVE_REMOVED_RATIO_GAIN),
+        "min_effective_finish_local_drop_ratio": float(MIN_EFFECTIVE_FINISH_LOCAL_DROP_RATIO),
         "fail_on_candidate_error": bool(FAIL_ON_CANDIDATE_ERROR),
         "save_part_on_candidate_error": bool(SAVE_PART_ON_CANDIDATE_ERROR),
         "error_part_snapshot_dir": os.path.abspath(ERROR_PART_SNAPSHOT_DIR or os.path.join(out_dir, "error_prt_snapshots")),
@@ -2586,6 +2662,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         "no_effect_removed_volume_eps": float(NO_EFFECT_REMOVED_VOLUME_EPS),
         "no_effect_removed_ratio_gain_eps": float(NO_EFFECT_REMOVED_RATIO_GAIN_EPS),
         "surface_finish_tol": float(SURFACE_FINISH_TOL),
+        "min_effective_finish_local_drop_ratio": float(MIN_EFFECTIVE_FINISH_LOCAL_DROP_RATIO),
         "row_unit": "one_executed_nx_operation",
         "steps": [],
     }
@@ -3159,8 +3236,22 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                         np.asarray(result["dev_after_red_512"], dtype=np.float32),
                         SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
                     )
-                    is_zero_effect = removed <= 1e-6 and max_delta <= 1e-6 and removed_ratio_gain <= 1e-9
-                    is_effective = _is_effective_transition(removed, removed_ratio, max_delta, removed_ratio_gain)
+                    effect_eval = evaluate_transition_effectiveness(
+                        action=action,
+                        before_sdf_512=state_dev_red_512,
+                        after_sdf_512=after_sdf,
+                        removed=removed,
+                        removed_ratio=removed_ratio,
+                        max_delta=max_delta,
+                        removed_ratio_gain=removed_ratio_gain,
+                        min_removed_volume=MIN_EFFECTIVE_REMOVED_VOLUME,
+                        min_removed_ratio=MIN_EFFECTIVE_REMOVED_RATIO,
+                        min_max_node_delta=MIN_EFFECTIVE_MAX_NODE_DELTA,
+                        min_removed_ratio_gain=MIN_EFFECTIVE_REMOVED_RATIO_GAIN,
+                        min_finish_local_drop_ratio=MIN_EFFECTIVE_FINISH_LOCAL_DROP_RATIO,
+                    )
+                    is_zero_effect = bool(effect_eval["is_zero_effect"])
+                    is_effective = bool(effect_eval["is_effective"])
                     if is_zero_effect or not is_effective:
                         stat_key = "no_effect" if is_zero_effect else "below_min_effect"
                         reject_stats[stat_key] += 1
@@ -3173,6 +3264,11 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                                 f"->{float(result.get('volume_after', 0.0) or 0.0):.6f} "
                                 f"removed={removed:.6g} ratio={removed_ratio:.6g} "
                                 f"max_delta={max_delta:.6g} removed_gain={removed_ratio_gain:.6g} "
+                                f"local_sdf={float(effect_eval['local_face_before']):.6g}"
+                                f"->{float(effect_eval['local_face_after']):.6g} "
+                                f"local_drop={float(effect_eval['local_face_drop']):.6g} "
+                                f"local_drop_ratio={float(effect_eval['local_face_drop_ratio']):.6g} "
+                                f"criterion={effect_eval['criterion']} "
                                 f"max_abs_delta={max_abs_delta:.6g} "
                                 f"ct={float(result.get('cycle_time', 0.0) or 0.0):.6g}"
                             )
