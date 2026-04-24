@@ -134,14 +134,9 @@ def _build_shared_row_payload(
         "part_name": part_name,
         "prt_file_path": os.path.abspath(prt_file_path),
         "target_body_mesh_path": target_body_mesh_path,
-        "graph_nx_json": json.dumps(graph_json),
         "seed": int(seed),
-        "node_mask": np.asarray(node_mask_512, dtype=np.int16),
-        "point_mask": np.asarray(point_mask_512x100, dtype=np.int16),
-        "centrality_512": np.asarray(centrality, dtype=np.int16),
-        "spatial_pos_512x512": np.asarray(spatial_pos, dtype=np.int16),
-        "face_area_512x1": np.asarray(face_area, dtype=np.float32),
-        "face_type_512": np.asarray(face_type_512, dtype=np.int16),
+        "static_feature_dir": os.path.abspath(os.path.dirname(target_body_mesh_path)),
+        "graph_nx_json_path": os.path.abspath(os.path.join(os.path.dirname(target_body_mesh_path), "graph_nx.json")),
         "normalization_center_xyz": np.asarray(normalization_center_xyz, dtype=np.float32),
         "normalization_scale": float(normalization_scale),
         "bbox_extent_xyz": np.asarray(bbox_extent_xyz, dtype=np.float32),
@@ -165,8 +160,6 @@ def _build_transition_row(
     normalization_center_xyz: np.ndarray,
     normalization_scale: float,
     bbox_extent_xyz: np.ndarray,
-    face_pc: np.ndarray,
-    face_normal_512: np.ndarray,
     surface_finish_tol: float,
     finish_ready_tol: float,
     initial_stock_volume: float,
@@ -178,9 +171,9 @@ def _build_transition_row(
     tool_diameter = float(action["tool_diameter"])
     tool_choice_name = cad.tool_choice_key(tool_kind, tool_diameter)
     tool_choice_id = int(cad.TOOL_CHOICE_TO_ID.get(tool_choice_name, -1))
-    axis_visible_512 = np.asarray(result["visible_512"], dtype=np.int16)
+    axis_visible_512 = cad._as_i16(result["visible_512"])
 
-    next_node_sdf_raw = np.asarray(result["dev_after_red_512"], dtype=np.float32)
+    next_node_sdf_raw = cad._as_f32(result["dev_after_red_512"])
     state_done_mask_512, state_done_ratio = cad.compute_done_mask_from_dev_red(
         state_node_sdf_raw,
         surface_finish_tol,
@@ -191,7 +184,7 @@ def _build_transition_row(
         surface_finish_tol,
         node_mask_512=node_mask_512,
     )
-    rough_done_mask = np.asarray(rough_done_mask_for_row, dtype=np.int16).copy()
+    rough_done_mask = cad._as_i16(rough_done_mask_for_row).copy()
     finish_ready_mask = cad.build_finish_ready_mask_512(
         node_sdf_512=state_node_sdf_raw,
         rough_done_mask_512=rough_done_mask,
@@ -234,19 +227,17 @@ def _build_transition_row(
         [rough_done_mask.astype(np.float32), finish_ready_mask.astype(np.float32)],
         axis=-1,
     )
-    state_point_sdf_raw = np.asarray(
+    state_point_sdf_raw = cad._as_f32(
         result.get(
             "point_sdf_before_512x100",
-            np.broadcast_to(np.asarray(state_node_sdf_raw, dtype=np.float32).reshape(512, 1), (512, 100)),
-        ),
-        dtype=np.float32,
+            np.broadcast_to(cad._as_f32(state_node_sdf_raw).reshape(512, 1), (512, 100)),
+        )
     )
-    next_point_sdf_raw = np.asarray(
+    next_point_sdf_raw = cad._as_f32(
         result.get(
             "point_sdf_after_512x100",
             np.broadcast_to(next_node_sdf_raw.reshape(512, 1), (512, 100)),
-        ),
-        dtype=np.float32,
+        )
     )
 
     removed_volume = float(result.get("removed_volume", 0.0) or 0.0)
@@ -301,20 +292,20 @@ def _build_transition_row(
             "anchor_face_id": int(target_node_id) if macro_class_name == "indexed_rough" else -1,
             "target_face_id": -1 if macro_class_name == "indexed_rough" else int(target_node_id),
             "tool_choice_valid": int(tool_choice_id >= 0),
-            "node_process_state": node_process_state.astype(np.float32),
-            "global_process_state": global_process_state.astype(np.float32),
-            "macro_class_mask": macro_class_mask.astype(np.int16),
-            "tool_choice_mask": tool_choice_mask.astype(np.int16),
-            "action_face_mask": action_face_mask_512.astype(np.int16),
-            "axis_visible_512": axis_visible_512.astype(np.int16),
-            "state_node_sdf_raw_512": np.asarray(state_node_sdf_raw, dtype=np.float32),
-            "next_node_sdf_raw_512": next_node_sdf_raw.astype(np.float32),
-            "state_point_sdf_raw_512x100": state_point_sdf_raw.astype(np.float32),
-            "next_point_sdf_raw_512x100": next_point_sdf_raw.astype(np.float32),
-            "state_done_mask_512": state_done_mask_512.astype(np.int16),
-            "next_done_mask_512": next_done_mask_512.astype(np.int16),
-            "rough_done_mask_512": rough_done_mask.astype(np.int16),
-            "finish_ready_mask_512": finish_ready_mask.astype(np.int16),
+            "node_process_state": cad._as_f32(node_process_state),
+            "global_process_state": cad._as_f32(global_process_state),
+            "macro_class_mask": cad._as_i16(macro_class_mask),
+            "tool_choice_mask": cad._as_i16(tool_choice_mask),
+            "action_face_mask": cad._as_i16(action_face_mask_512),
+            "axis_visible_512": cad._as_i16(axis_visible_512),
+            "state_node_sdf_raw_512": cad._as_f32(state_node_sdf_raw),
+            "next_node_sdf_raw_512": cad._as_f32(next_node_sdf_raw),
+            "state_point_sdf_raw_512x100": cad._as_f32(state_point_sdf_raw),
+            "next_point_sdf_raw_512x100": cad._as_f32(next_point_sdf_raw),
+            "state_done_mask_512": cad._as_i16(state_done_mask_512),
+            "next_done_mask_512": cad._as_i16(next_done_mask_512),
+            "rough_done_mask_512": cad._as_i16(rough_done_mask),
+            "finish_ready_mask_512": cad._as_i16(finish_ready_mask),
             "state_done_ratio": cad._to_safe_float(state_done_ratio),
             "next_done_ratio": cad._to_safe_float(next_done_ratio),
             "axis_dir": list(map(float, axis_dir)),
@@ -328,28 +319,14 @@ def _build_transition_row(
             "out_removed_ratio": cad._to_safe_float(removed_volume / max(vol_before, 1e-9)),
             "out_cycle_time": cad._to_safe_float(result.get("cycle_time", 0.0)),
             "out_ok": bool(result.get("ok", True)),
-            "octree_centers": octree_centers_norm.reshape(-1).astype(np.float32) if octree_centers_norm is not None else None,
-            "octree_depths": octree_depths.astype(np.int16) if octree_depths is not None else None,
-            "octree_occ_labels": octree_occ_labels.astype(np.float32) if octree_occ_labels is not None else None,
-            "octree_occ_labels_before": octree_occ_labels_before.astype(np.float32) if octree_occ_labels_before is not None else None,
-            "octree_bbox_min": octree_bbox_min_norm.astype(np.float32) if octree_bbox_min_norm is not None else None,
-            "octree_bbox_max": octree_bbox_max_norm.astype(np.float32) if octree_bbox_max_norm is not None else None,
+            "octree_centers": cad._as_f32(octree_centers_norm).reshape(-1) if octree_centers_norm is not None else None,
+            "octree_depths": cad._as_i16(octree_depths) if octree_depths is not None else None,
+            "octree_occ_labels": cad._as_f32(octree_occ_labels) if octree_occ_labels is not None else None,
+            "octree_occ_labels_before": cad._as_f32(octree_occ_labels_before) if octree_occ_labels_before is not None else None,
+            "octree_bbox_min": cad._as_f32(octree_bbox_min_norm) if octree_bbox_min_norm is not None else None,
+            "octree_bbox_max": cad._as_f32(octree_bbox_max_norm) if octree_bbox_max_norm is not None else None,
         }
     )
-    row["state_points"] = cad.build_state_points_tensor(
-        face_pc,
-        face_normal_512,
-        state_point_sdf_raw,
-        normalization_scale,
-    ).astype(np.float32)
-    row["next_node_sdf"] = cad.build_normalized_node_sdf_512x1(
-        next_node_sdf_raw,
-        normalization_scale,
-    ).reshape(512).astype(np.float32)
-    row["next_point_sdf"] = cad.build_normalized_point_sdf_512x100(
-        next_point_sdf_raw,
-        normalization_scale,
-    ).astype(np.float32)
     return {key: cad._serialize_for_parquet(value) for key, value in row.items()}
 
 
@@ -587,6 +564,10 @@ def collect_single_scenario_debug(prt_file_path: str, out_root: str, seed: int, 
         cad._np_save(os.path.join(out_dir, "embed_face_area.npy"), face_area)
         cad._np_save(os.path.join(out_dir, "embed_face_type.npy"), face_type_512)
         cad._np_save(os.path.join(out_dir, "embed_face_pc.npy"), face_pc)
+        cad._np_save(os.path.join(out_dir, "embed_face_normal.npy"), face_normal_512)
+        cad._np_save(os.path.join(out_dir, "embed_node_mask.npy"), node_mask_512)
+        cad._np_save(os.path.join(out_dir, "embed_point_mask.npy"), point_mask_512x100)
+        cad._json_dump(os.path.join(out_dir, "graph_nx.json"), graph_json)
 
         shared_row_payload = _build_shared_row_payload(
             part_name=part_name,
@@ -958,8 +939,6 @@ def collect_single_scenario_debug(prt_file_path: str, out_root: str, seed: int, 
                 normalization_center_xyz=normalization_center_xyz,
                 normalization_scale=normalization_scale,
                 bbox_extent_xyz=bbox_extent_xyz,
-                face_pc=face_pc,
-                face_normal_512=face_normal_512,
                 surface_finish_tol=float(settings["surface_finish_tol"]),
                 finish_ready_tol=float(settings["finish_ready_tol"]),
                 initial_stock_volume=float(initial_stock_volume),

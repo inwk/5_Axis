@@ -16,6 +16,17 @@ from .schema import TOOL_CHOICE_TO_ID, tool_choice_key
 class ProcessSkeletonParquetDataset(Dataset):
     """Loads process-skeleton rows from one or more parquet files."""
 
+    _STATIC_FEATURE_FILES = {
+        "face_pc": "embed_face_pc.npy",
+        "face_normal": "embed_face_normal.npy",
+        "node_mask": "embed_node_mask.npy",
+        "point_mask": "embed_point_mask.npy",
+        "centrality_512": "embed_centrality.npy",
+        "spatial_pos_512x512": "embed_spatial_pos.npy",
+        "face_area_512x1": "embed_face_area.npy",
+        "face_type_512": "embed_face_type.npy",
+    }
+
     def __init__(self, parquet_files: Iterable[str | Path], octree_query_nodes: int | None = 2048) -> None:
         """Reads parquet files into a single dataframe index."""
         files = [str(Path(path)) for path in parquet_files]
@@ -25,10 +36,54 @@ class ProcessSkeletonParquetDataset(Dataset):
         frames = [pd.read_parquet(path) for path in files]
         self.df = pd.concat(frames, ignore_index=True)
         self.octree_query_nodes = octree_query_nodes
+        self._static_feature_cache: dict[str, dict[str, np.ndarray]] = {}
 
     def __len__(self) -> int:
         """Returns the number of operation rows."""
         return int(len(self.df))
+
+    def _resolve_static_feature_dir(self, row) -> str | None:
+        """Returns the static feature directory for a row when available."""
+        if "static_feature_dir" not in row.index:
+            return None
+        raw_value = row["static_feature_dir"]
+        if self._is_missing(raw_value):
+            return None
+        return str(Path(str(raw_value)).expanduser().resolve())
+
+    def _load_static_feature(self, row, key: str, dtype=None) -> np.ndarray:
+        """Loads a cached per-part static feature from sidecar files."""
+        static_dir = self._resolve_static_feature_dir(row)
+        if static_dir is None:
+            raise KeyError(f"Row is missing static_feature_dir for static feature '{key}'")
+        if key not in self._STATIC_FEATURE_FILES:
+            raise KeyError(f"Unsupported static feature key: {key}")
+
+        cache = self._static_feature_cache.setdefault(static_dir, {})
+        if key not in cache:
+            path = Path(static_dir) / self._STATIC_FEATURE_FILES[key]
+            if not path.exists():
+                raise FileNotFoundError(f"Static feature file not found: {path}")
+            cache[key] = np.load(path, allow_pickle=False)
+        arr = cache[key]
+        if dtype is None:
+            return np.asarray(arr)
+        return np.asarray(arr, dtype=dtype)
+
+    def _row_array_or_static(self, row, row_key: str, static_key: str | None, dtype, default_shape: tuple[int, ...] | None = None) -> np.ndarray:
+        """Loads an array from the row when present, otherwise from sidecar files."""
+        if row_key in row.index and not self._is_missing(row[row_key]):
+            arr = self._array(row[row_key], dtype)
+        elif static_key is not None:
+            arr = self._load_static_feature(row, static_key, dtype=dtype)
+        elif default_shape is not None:
+            arr = np.zeros(default_shape, dtype=dtype)
+        else:
+            raise KeyError(f"Missing required field '{row_key}' and no static fallback is configured")
+
+        if default_shape is not None and arr.size == 0:
+            return np.zeros(default_shape, dtype=dtype)
+        return np.asarray(arr, dtype=dtype)
 
     @staticmethod
     def _array(value, dtype) -> np.ndarray:
@@ -129,7 +184,22 @@ class ProcessSkeletonParquetDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         """Converts one dataframe row into the training batch schema."""
         row = self.df.iloc[int(index)]
-        state_points = self._array(row["state_points"], np.float32).reshape(512, 100, 7)
+        if "state_points" in row.index and not self._is_missing(row["state_points"]):
+            state_points = self._array(row["state_points"], np.float32).reshape(512, 100, 7)
+        else:
+            face_pc = self._row_array_or_static(row, "face_pc_512x100x3", "face_pc", np.float32).reshape(512, 100, 3)
+            face_normal = self._row_array_or_static(row, "face_normal_512x3", "face_normal", np.float32).reshape(512, 3)
+            point_sdf_raw = self._optional_array(
+                row["state_point_sdf_raw_512x100"] if "state_point_sdf_raw_512x100" in row.index else None,
+                np.float32,
+                (512, 100),
+            ).reshape(512, 100)
+            scale = float(row["normalization_scale"]) if "normalization_scale" in row.index and not self._is_missing(row["normalization_scale"]) else 1.0
+            scale = max(scale, 1e-6)
+            state_points = np.zeros((512, 100, 7), dtype=np.float32)
+            state_points[:, :, 0:3] = face_pc
+            state_points[:, :, 3:6] = np.broadcast_to(face_normal[:, None, :], (512, 100, 3))
+            state_points[:, :, 6] = point_sdf_raw / scale
         num_nodes = int(state_points.shape[0])
         points_per_node = int(state_points.shape[1])
         node_process_state = self._optional_array(
@@ -137,13 +207,23 @@ class ProcessSkeletonParquetDataset(Dataset):
             np.float32,
             (num_nodes, 2),
         ).reshape(num_nodes, 2)
+        scale = float(row["normalization_scale"]) if "normalization_scale" in row.index and not self._is_missing(row["normalization_scale"]) else 1.0
+        scale = max(scale, 1e-6)
         next_point_sdf = None
-        if "next_point_sdf" in row.index:
+        if "next_point_sdf" in row.index and not self._is_missing(row["next_point_sdf"]):
             next_point_sdf = self._optional_array(
                 row["next_point_sdf"],
                 np.float32,
                 (num_nodes, points_per_node),
             ).reshape(num_nodes, points_per_node)
+        elif "next_point_sdf_raw_512x100" in row.index and not self._is_missing(row["next_point_sdf_raw_512x100"]):
+            next_point_sdf = (
+                self._optional_array(
+                    row["next_point_sdf_raw_512x100"],
+                    np.float32,
+                    (num_nodes, points_per_node),
+                ).reshape(num_nodes, points_per_node) / scale
+            ).astype(np.float32, copy=False)
         elif "next_state_points" in row.index:
             next_state_points = self._optional_array(
                 row["next_state_points"],
@@ -153,8 +233,12 @@ class ProcessSkeletonParquetDataset(Dataset):
             next_point_sdf = next_state_points[..., 6]
 
         next_node_sdf = None
-        if "next_node_sdf" in row.index:
+        if "next_node_sdf" in row.index and not self._is_missing(row["next_node_sdf"]):
             next_node_sdf = self._optional_array(row["next_node_sdf"], np.float32, (num_nodes,)).reshape(num_nodes)
+        elif "next_node_sdf_raw_512" in row.index and not self._is_missing(row["next_node_sdf_raw_512"]):
+            next_node_sdf = (
+                self._optional_array(row["next_node_sdf_raw_512"], np.float32, (num_nodes,)).reshape(num_nodes) / scale
+            ).astype(np.float32, copy=False)
         elif next_point_sdf is not None:
             next_node_sdf = next_point_sdf.mean(axis=1, dtype=np.float32)
         else:
@@ -197,9 +281,11 @@ class ProcessSkeletonParquetDataset(Dataset):
             "state_points": torch.from_numpy(state_points),
             "node_process_state": torch.from_numpy(node_process_state),
             "next_node_sdf": torch.from_numpy(next_node_sdf),
-            "node_mask": torch.from_numpy(self._array(row["node_mask"], np.int16).reshape(num_nodes).astype(np.bool_)),
+            "node_mask": torch.from_numpy(
+                self._row_array_or_static(row, "node_mask", "node_mask", np.int16).reshape(num_nodes).astype(np.bool_, copy=False)
+            ),
             "point_mask": torch.from_numpy(
-                self._array(row["point_mask"], np.int16).reshape(num_nodes, points_per_node).astype(np.bool_)
+                self._row_array_or_static(row, "point_mask", "point_mask", np.int16).reshape(num_nodes, points_per_node).astype(np.bool_, copy=False)
             ),
             "macro_class_id": torch.tensor(int(row["macro_class_id"]), dtype=torch.long),
             "tool_choice_id": torch.tensor(int(max(int(tool_choice_id), 0)), dtype=torch.long),
@@ -233,20 +319,28 @@ class ProcessSkeletonParquetDataset(Dataset):
             batch["tool_choice_mask"] = torch.from_numpy(
                 self._array(row["tool_choice_mask"], np.int16).reshape(-1).astype(np.bool_)
             )
-        if "centrality_512" in row.index:
-            node_centrality = torch.from_numpy(self._array(row["centrality_512"], np.int16).reshape(num_nodes))
+        if "centrality_512" in row.index or self._resolve_static_feature_dir(row) is not None:
+            node_centrality = torch.from_numpy(
+                self._row_array_or_static(row, "centrality_512", "centrality_512", np.int16).reshape(num_nodes)
+            )
             batch["centrality_512"] = node_centrality
             batch["node_centrality"] = node_centrality
-        if "spatial_pos_512x512" in row.index:
-            spatial_pos = torch.from_numpy(self._array(row["spatial_pos_512x512"], np.int16).reshape(num_nodes, num_nodes))
+        if "spatial_pos_512x512" in row.index or self._resolve_static_feature_dir(row) is not None:
+            spatial_pos = torch.from_numpy(
+                self._row_array_or_static(row, "spatial_pos_512x512", "spatial_pos_512x512", np.int16).reshape(num_nodes, num_nodes)
+            )
             batch["spatial_pos_512x512"] = spatial_pos
             batch["spatial_pos"] = spatial_pos
-        if "face_area_512x1" in row.index:
-            face_area = torch.from_numpy(self._array(row["face_area_512x1"], np.float32).reshape(num_nodes, 1))
+        if "face_area_512x1" in row.index or self._resolve_static_feature_dir(row) is not None:
+            face_area = torch.from_numpy(
+                self._row_array_or_static(row, "face_area_512x1", "face_area_512x1", np.float32).reshape(num_nodes, 1)
+            )
             batch["face_area_512x1"] = face_area
             batch["face_area"] = face_area
-        if "face_type_512" in row.index:
-            face_type = torch.from_numpy(self._array(row["face_type_512"], np.int16).reshape(num_nodes))
+        if "face_type_512" in row.index or self._resolve_static_feature_dir(row) is not None:
+            face_type = torch.from_numpy(
+                self._row_array_or_static(row, "face_type_512", "face_type_512", np.int16).reshape(num_nodes)
+            )
         else:
             face_type = torch.zeros((num_nodes,), dtype=torch.int16)
         batch["face_type_512"] = face_type

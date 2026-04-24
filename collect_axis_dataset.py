@@ -2205,6 +2205,16 @@ def _to_safe_float(x, default=0.0) -> float:
     """Performs: safe float."""
     return float(x)
 
+
+def _as_f32(value: Any) -> np.ndarray:
+    """Returns a float32 view/copy only when needed."""
+    return np.asarray(value, dtype=np.float32)
+
+
+def _as_i16(value: Any) -> np.ndarray:
+    """Returns an int16 view/copy only when needed."""
+    return np.asarray(value, dtype=np.int16)
+
 def _compute_removed_ratio(current_volume: float, reference_volume: float) -> float:
     """Returns cumulative removed-material ratio w.r.t. the episode's initial stock."""
     ref = float(max(reference_volume, 1e-9))
@@ -2298,6 +2308,10 @@ def _append_serialized_rows_to_parquet_stream(
         del chosen_table
 
     gc.collect()
+    try:
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
 
 def _close_parquet_stream(state: Dict[str, Any]) -> Tuple[int, int]:
     """Closes the parquet stream and writes any fallback buffers if needed."""
@@ -2601,6 +2615,10 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
     _np_save(os.path.join(out_dir, "embed_face_area.npy"), face_area)
     _np_save(os.path.join(out_dir, "embed_face_type.npy"), face_type_512)
     _np_save(os.path.join(out_dir, "embed_face_pc.npy"), face_pc)
+    _np_save(os.path.join(out_dir, "embed_face_normal.npy"), face_normal_512)
+    _np_save(os.path.join(out_dir, "embed_node_mask.npy"), node_mask_512)
+    _np_save(os.path.join(out_dir, "embed_point_mask.npy"), point_mask_512x100)
+    _json_dump(os.path.join(out_dir, "graph_nx.json"), graph_json)
 
     rough_done_cumulative_512 = np.zeros((512,), dtype=np.int16)
     prev_macro_class_id = -1
@@ -2634,14 +2652,9 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         "part_name": part_name,
         "prt_file_path": os.path.abspath(prt_file_path),
         "target_body_mesh_path": target_body_mesh_path,
-        "graph_nx_json": json.dumps(graph_json),
         "seed": int(seed),
-        "node_mask": node_mask_512.astype(np.int16),
-        "point_mask": point_mask_512x100.astype(np.int16),
-        "centrality_512": np.asarray(centrality, dtype=np.int16),
-        "spatial_pos_512x512": np.asarray(spatial_pos, dtype=np.int16),
-        "face_area_512x1": np.asarray(face_area, dtype=np.float32),
-        "face_type_512": np.asarray(face_type_512, dtype=np.int16),
+        "static_feature_dir": os.path.abspath(out_dir),
+        "graph_nx_json_path": os.path.abspath(os.path.join(out_dir, "graph_nx.json")),
         "normalization_center_xyz": normalization_center_xyz.astype(np.float32),
         "normalization_scale": float(normalization_scale),
         "bbox_extent_xyz": bbox_extent_xyz.astype(np.float32),
@@ -2669,26 +2682,8 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
 
     def _materialize_parquet_row(transition_row: Dict[str, Any]) -> Dict[str, Any]:
         """Builds the final parquet row only at flush time to avoid row duplication in memory."""
-        state_point_sdf_raw = np.asarray(transition_row["state_point_sdf_raw_512x100"], dtype=np.float32)
-        next_node_sdf_raw = np.asarray(transition_row["next_node_sdf_raw_512"], dtype=np.float32)
-        next_point_sdf_raw = np.asarray(transition_row["next_point_sdf_raw_512x100"], dtype=np.float32)
-
         row = dict(shared_row_payload)
         row.update(transition_row)
-        row["state_points"] = build_state_points_tensor(
-            face_pc,
-            face_normal_512,
-            state_point_sdf_raw,
-            normalization_scale,
-        ).astype(np.float32)
-        row["next_node_sdf"] = build_normalized_node_sdf_512x1(
-            next_node_sdf_raw,
-            normalization_scale,
-        ).reshape(512).astype(np.float32)
-        row["next_point_sdf"] = build_normalized_point_sdf_512x100(
-            next_point_sdf_raw,
-            normalization_scale,
-        ).astype(np.float32)
         return {key: _serialize_for_parquet(value) for key, value in row.items()}
 
     def _flush_pending_transition_rows() -> None:
@@ -2729,9 +2724,9 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         tool_choice_name = tool_choice_key(tool_kind, tool_diameter)
         tool_choice_id = int(TOOL_CHOICE_TO_ID.get(tool_choice_name, -1))
         tool_choice_valid = int(tool_choice_id >= 0)
-        axis_visible_512 = np.asarray(result["visible_512"], dtype=np.int16)
+        axis_visible_512 = _as_i16(result["visible_512"])
 
-        next_node_sdf_raw = np.asarray(result["dev_after_red_512"], dtype=np.float32)
+        next_node_sdf_raw = _as_f32(result["dev_after_red_512"])
 
         state_done_mask_512, state_done_ratio = compute_done_mask_from_dev_red(
             state_node_sdf_raw, SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
@@ -2739,7 +2734,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         next_done_mask_512, next_done_ratio = compute_done_mask_from_dev_red(
             next_node_sdf_raw, SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
         )
-        rough_done_mask = np.asarray(rough_done_mask_for_row, dtype=np.int16).copy()
+        rough_done_mask = _as_i16(rough_done_mask_for_row).copy()
         finish_ready_mask = build_finish_ready_mask_512(
             node_sdf_512=state_node_sdf_raw,
             rough_done_mask_512=rough_done_mask,
@@ -2784,19 +2779,17 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             axis=-1,
         )
 
-        state_point_sdf_raw = np.asarray(
+        state_point_sdf_raw = _as_f32(
             result.get(
                 "point_sdf_before_512x100",
-                np.broadcast_to(state_node_sdf_raw.reshape(512, 1), (512, 100)),
-            ),
-            dtype=np.float32,
+                np.broadcast_to(_as_f32(state_node_sdf_raw).reshape(512, 1), (512, 100)),
+            )
         )
-        next_point_sdf_raw = np.asarray(
+        next_point_sdf_raw = _as_f32(
             result.get(
                 "point_sdf_after_512x100",
                 np.broadcast_to(next_node_sdf_raw.reshape(512, 1), (512, 100)),
-            ),
-            dtype=np.float32,
+            )
         )
 
         removed_volume = float(result.get("removed_volume", 0.0) or 0.0)
@@ -2856,21 +2849,21 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             "target_face_id": -1 if macro_class_name == "indexed_rough" else int(target_node_id),
             "tool_choice_valid": int(tool_choice_valid),
 
-            "node_process_state": node_process_state.astype(np.float32),
-            "global_process_state": global_process_state.astype(np.float32),
-            "macro_class_mask": macro_class_mask.astype(np.int16),
-            "tool_choice_mask": tool_choice_mask.astype(np.int16),
-            "action_face_mask": action_face_mask_512.astype(np.int16),
+            "node_process_state": _as_f32(node_process_state),
+            "global_process_state": _as_f32(global_process_state),
+            "macro_class_mask": _as_i16(macro_class_mask),
+            "tool_choice_mask": _as_i16(tool_choice_mask),
+            "action_face_mask": _as_i16(action_face_mask_512),
 
-            "axis_visible_512": axis_visible_512.astype(np.int16),
-            "state_node_sdf_raw_512": np.asarray(state_node_sdf_raw, dtype=np.float32),
-            "next_node_sdf_raw_512": next_node_sdf_raw.astype(np.float32),
-            "state_point_sdf_raw_512x100": state_point_sdf_raw.astype(np.float32),
-            "next_point_sdf_raw_512x100": next_point_sdf_raw.astype(np.float32),
-            "state_done_mask_512": state_done_mask_512.astype(np.int16),
-            "next_done_mask_512": next_done_mask_512.astype(np.int16),
-            "rough_done_mask_512": rough_done_mask.astype(np.int16),
-            "finish_ready_mask_512": finish_ready_mask.astype(np.int16),
+            "axis_visible_512": _as_i16(axis_visible_512),
+            "state_node_sdf_raw_512": _as_f32(state_node_sdf_raw),
+            "next_node_sdf_raw_512": _as_f32(next_node_sdf_raw),
+            "state_point_sdf_raw_512x100": _as_f32(state_point_sdf_raw),
+            "next_point_sdf_raw_512x100": _as_f32(next_point_sdf_raw),
+            "state_done_mask_512": _as_i16(state_done_mask_512),
+            "next_done_mask_512": _as_i16(next_done_mask_512),
+            "rough_done_mask_512": _as_i16(rough_done_mask),
+            "finish_ready_mask_512": _as_i16(finish_ready_mask),
             "state_done_ratio": _to_safe_float(state_done_ratio),
             "next_done_ratio": _to_safe_float(next_done_ratio),
 
@@ -2887,16 +2880,16 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
             "out_ok": bool(result.get("ok", True)),
 
             # ── Octree occupancy transition target
-            "octree_centers": octree_centers_norm.reshape(-1).astype(np.float32) if octree_centers_norm is not None else None,
-            "octree_depths": octree_depths.astype(np.int16) if octree_depths is not None else None,
+            "octree_centers": _as_f32(octree_centers_norm).reshape(-1) if octree_centers_norm is not None else None,
+            "octree_depths": _as_i16(octree_depths) if octree_depths is not None else None,
             # After-operation occupancy (primary training target).
-            "octree_occ_labels": octree_occ_labels.astype(np.float32) if octree_occ_labels is not None else None,
+            "octree_occ_labels": _as_f32(octree_occ_labels) if octree_occ_labels is not None else None,
             # Before-operation occupancy at the same cell positions.
             # Used for the monotonicity training constraint:
             #   once a cell is empty (before=0) it must remain empty (after=0).
-            "octree_occ_labels_before": octree_occ_labels_before.astype(np.float32) if octree_occ_labels_before is not None else None,
-            "octree_bbox_min": octree_bbox_min_norm.astype(np.float32) if octree_bbox_min_norm is not None else None,
-            "octree_bbox_max": octree_bbox_max_norm.astype(np.float32) if octree_bbox_max_norm is not None else None,
+            "octree_occ_labels_before": _as_f32(octree_occ_labels_before) if octree_occ_labels_before is not None else None,
+            "octree_bbox_min": _as_f32(octree_bbox_min_norm) if octree_bbox_min_norm is not None else None,
+            "octree_bbox_max": _as_f32(octree_bbox_max_norm) if octree_bbox_max_norm is not None else None,
         }
 
     rng = np.random.default_rng(int(seed))
@@ -3127,7 +3120,7 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                 _oct_raw_min = _oct_raw_min - _oct_pad
                 _oct_raw_max = _oct_raw_max + _oct_pad
 
-                scored: List[Tuple[float, int, Dict[str, Any], Dict[str, Any], int, Dict[str, Any]]] = []
+                scored: List[Dict[str, Any]] = []
                 reject_stats = {"cam_error": 0, "no_effect": 0, "below_min_effect": 0}
                 reject_examples: List[str] = []
 
@@ -3298,7 +3291,20 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                         parent_scenario_id=str(branch["id"]),
                     )
                     pending_transition_rows.append(row)
-                    scored.append((child_score, ci, action, result, row, child_branch))
+                    scored.append({
+                        "score": float(child_score),
+                        "candidate_index": int(ci),
+                        "macro": str(action["macro_class_name"]),
+                        "tool": f"{action['tool_kind']}_{action['tool_diameter']}",
+                        "action_face": int(action["action_face_id"]),
+                        "row_ref": row,
+                        "branch": child_branch,
+                        "removed_volume": float(result.get("removed_volume", 0.0) or 0.0),
+                        "state_volume_after": float(result.get("volume_after", state_volume)),
+                        "state_removed_ratio_after": float(removed_ratio_after),
+                        "state_done_ratio_after": float(next_done_ratio),
+                    })
+                    del result, after_sdf, delta
 
                 branch_record: Dict[str, Any] = {
                     "scenario_id": str(branch["id"]),
@@ -3322,37 +3328,27 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                     branch_record["stopped"] = True
                     branch_record["reason"] = "no_effective_candidates"
                 else:
-                    best_for_branch = max(scored, key=lambda x: x[0])
+                    best_for_branch = max(scored, key=lambda item: float(item["score"]))
                     branch_record.update({
-                        "best_candidate_index": int(best_for_branch[1]),
-                        "best_macro": str(best_for_branch[2]["macro_class_name"]),
-                        "best_tool": f"{best_for_branch[2]['tool_kind']}_{best_for_branch[2]['tool_diameter']}",
-                        "best_action_face": int(best_for_branch[2]["action_face_id"]),
-                        "best_score": float(best_for_branch[0]),
+                        "best_candidate_index": int(best_for_branch["candidate_index"]),
+                        "best_macro": str(best_for_branch["macro"]),
+                        "best_tool": str(best_for_branch["tool"]),
+                        "best_action_face": int(best_for_branch["action_face"]),
+                        "best_score": float(best_for_branch["score"]),
                     })
-                    for child_score, ci, action, result, row, child_branch in scored:
+                    for scored_child in scored:
                         depth_children.append({
-                            "score": float(child_score),
-                            "row_ref": row,
-                            "branch": child_branch,
-                            "candidate_index": int(ci),
-                            "macro": str(action["macro_class_name"]),
-                            "tool": f"{action['tool_kind']}_{action['tool_diameter']}",
-                            "action_face": int(action["action_face_id"]),
-                            "removed_volume": float(result.get("removed_volume", 0.0) or 0.0),
-                            "state_volume_after": float(result.get("volume_after", state_volume)),
-                            "state_removed_ratio_after": float(
-                                _compute_removed_ratio(
-                                    float(result.get("volume_after", state_volume) or state_volume),
-                                    initial_stock_volume,
-                                )
-                            ),
-                            "state_done_ratio_after": float(
-                                compute_done_mask_from_dev_red(
-                                    np.asarray(result["dev_after_red_512"], dtype=np.float32),
-                                    SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
-                                )[1]
-                            ),
+                            "score": float(scored_child["score"]),
+                            "row_ref": scored_child["row_ref"],
+                            "branch": scored_child["branch"],
+                            "candidate_index": int(scored_child["candidate_index"]),
+                            "macro": str(scored_child["macro"]),
+                            "tool": str(scored_child["tool"]),
+                            "action_face": int(scored_child["action_face"]),
+                            "removed_volume": float(scored_child["removed_volume"]),
+                            "state_volume_after": float(scored_child["state_volume_after"]),
+                            "state_removed_ratio_after": float(scored_child["state_removed_ratio_after"]),
+                            "state_done_ratio_after": float(scored_child["state_done_ratio_after"]),
                         })
 
                 _log_memory(

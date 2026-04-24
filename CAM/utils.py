@@ -697,7 +697,7 @@ def get_ipw_property(session=None, work_part=None, object_blank=None, tool_name=
     # Get work part
     session.ApplicationSwitchImmediate("UG_APP_MANUFACTURING")
     work_part = session.Parts.Work
-    session.CAMSession.PathDisplay.SetIpwResolution(NXOpen.CAM.PathDisplay.IpwResolutionType.Fine)
+    session.CAMSession.PathDisplay.SetIpwResolution(NXOpen.CAM.PathDisplay.IpwResolutionType.Coarse)
     
     markId = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "before")
 
@@ -765,7 +765,7 @@ def get_ipw_property_detailed(
 
     session.ApplicationSwitchImmediate("UG_APP_MANUFACTURING")
     work_part = session.Parts.Work
-    session.CAMSession.PathDisplay.SetIpwResolution(NXOpen.CAM.PathDisplay.IpwResolutionType.Fine)
+    session.CAMSession.PathDisplay.SetIpwResolution(NXOpen.CAM.PathDisplay.IpwResolutionType.Coarse)
 
     markId = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "before_detailed")
 
@@ -824,7 +824,7 @@ def sample_ipw_octree_state(
 
     session.ApplicationSwitchImmediate("UG_APP_MANUFACTURING")
     work_part = session.Parts.Work
-    session.CAMSession.PathDisplay.SetIpwResolution(NXOpen.CAM.PathDisplay.IpwResolutionType.Fine)
+    session.CAMSession.PathDisplay.SetIpwResolution(NXOpen.CAM.PathDisplay.IpwResolutionType.Coarse)
 
     markId = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "before_octree")
     try:
@@ -941,6 +941,7 @@ def query_ipw_occupancy_at_positions(
 
     session.ApplicationSwitchImmediate("UG_APP_MANUFACTURING")
     work_part = session.Parts.Work
+    session.CAMSession.PathDisplay.SetIpwResolution(NXOpen.CAM.PathDisplay.IpwResolutionType.Coarse)
 
     markId = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "query_ipw_occ")
     try:
