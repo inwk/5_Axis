@@ -6,6 +6,8 @@ import gc
 import sys
 import shutil
 import ctypes
+import time
+import tempfile
 from typing import Any, Dict, Tuple, List
 from datetime import datetime
 import argparse
@@ -466,6 +468,24 @@ OCTREE_MAX_NODES: int = int(os.getenv("OCTREE_MAX_NODES", "4096"))
 OCTREE_BBOX_PADDING: float = float(os.getenv("OCTREE_BBOX_PADDING", "0.05"))
 MEMORY_DEBUG: bool = bool(int(os.getenv("MEMORY_DEBUG", "1")))
 MEMORY_DEBUG_CANDIDATE_EVERY: int = max(1, int(os.getenv("MEMORY_DEBUG_CANDIDATE_EVERY", "1")))
+MEMORY_GUARD_ENABLED: bool = bool(int(os.getenv("MEMORY_GUARD_ENABLED", "1")))
+MEMORY_GUARD_MIN_AVAIL_GB: float = float(os.getenv("MEMORY_GUARD_MIN_AVAIL_GB", "6.0"))
+MEMORY_GUARD_MIN_COMMIT_AVAIL_GB: float = float(os.getenv("MEMORY_GUARD_MIN_COMMIT_AVAIL_GB", "8.0"))
+MEMORY_GUARD_MAX_LOAD_PCT: int = int(os.getenv("MEMORY_GUARD_MAX_LOAD_PCT", "86"))
+MEMORY_GUARD_POLL_SEC: float = max(1.0, float(os.getenv("MEMORY_GUARD_POLL_SEC", "15")))
+MEMORY_GUARD_LOG_EVERY_SEC: float = max(5.0, float(os.getenv("MEMORY_GUARD_LOG_EVERY_SEC", "60")))
+MEMORY_GUARD_ACTION_BUDGET_GB: float = float(os.getenv("MEMORY_GUARD_ACTION_BUDGET_GB", "1.5"))
+MEMORY_GUARD_CANDIDATE_BUDGET_GB: float = float(
+    os.getenv("MEMORY_GUARD_CANDIDATE_BUDGET_GB", str(MEMORY_GUARD_ACTION_BUDGET_GB))
+)
+MEMORY_GUARD_BRANCH_BUDGET_GB: float = float(os.getenv("MEMORY_GUARD_BRANCH_BUDGET_GB", "1.0"))
+MEMORY_GUARD_MAX_ACTIVE_ACTIONS: int = max(0, int(os.getenv("MEMORY_GUARD_MAX_ACTIVE_ACTIONS", "0")))
+MEMORY_GUARD_STALE_SEC: float = max(60.0, float(os.getenv("MEMORY_GUARD_STALE_SEC", "21600")))
+MEMORY_GUARD_STATE_FILE: str = os.getenv(
+    "MEMORY_GUARD_STATE_FILE",
+    os.path.join(tempfile.gettempdir(), "axis_dataset_memory_guard.json"),
+)
+MEMORY_GUARD_MUTEX_NAME: str = os.getenv("MEMORY_GUARD_MUTEX_NAME", "Local\\AxisDatasetMemoryGuard")
 
 
 if os.name == "nt":
@@ -510,6 +530,16 @@ if os.name == "nt":
     _psapi.GetProcessMemoryInfo.restype = ctypes.c_int
     _kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MEMORYSTATUSEX)]
     _kernel32.GlobalMemoryStatusEx.restype = ctypes.c_int
+    _kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    _kernel32.CreateMutexW.restype = ctypes.c_void_p
+    _kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    _kernel32.WaitForSingleObject.restype = ctypes.c_ulong
+    _kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+    _kernel32.ReleaseMutex.restype = ctypes.c_int
+    _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    _kernel32.CloseHandle.restype = ctypes.c_int
+    _kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    _kernel32.OpenProcess.restype = ctypes.c_void_p
 
 
 def _format_gb(num_bytes: int | float | None) -> str:
@@ -584,6 +614,238 @@ def _log_memory(stage: str, **extra: Any) -> None:
     if extra_text:
         parts.append(extra_text)
     print("[MEM] " + " ".join(parts), flush=True)
+
+
+_MEMORY_GUARD_WAIT_OBJECT_0 = 0x00000000
+_MEMORY_GUARD_WAIT_ABANDONED = 0x00000080
+_MEMORY_GUARD_INFINITE = 0xFFFFFFFF
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def _memory_guard_budget_bytes(stage: str, reserve_gb: float | None) -> int:
+    if reserve_gb is None:
+        if stage == "branch_measure":
+            reserve_gb = MEMORY_GUARD_BRANCH_BUDGET_GB
+        else:
+            reserve_gb = MEMORY_GUARD_CANDIDATE_BUDGET_GB
+    return int(max(0.0, float(reserve_gb)) * (1024.0 ** 3))
+
+
+def _acquire_memory_guard_mutex():
+    if os.name != "nt":
+        return None
+    handle = _kernel32.CreateMutexW(None, False, MEMORY_GUARD_MUTEX_NAME)
+    if not handle:
+        return None
+    wait_code = _kernel32.WaitForSingleObject(handle, _MEMORY_GUARD_INFINITE)
+    if wait_code in (_MEMORY_GUARD_WAIT_OBJECT_0, _MEMORY_GUARD_WAIT_ABANDONED):
+        return handle
+    _kernel32.CloseHandle(handle)
+    return None
+
+
+def _release_memory_guard_mutex(handle) -> None:
+    if handle:
+        try:
+            _kernel32.ReleaseMutex(handle)
+        finally:
+            _kernel32.CloseHandle(handle)
+
+
+def _is_process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name != "nt":
+        return True
+    handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, 0, int(pid))
+    if not handle:
+        return False
+    _kernel32.CloseHandle(handle)
+    return True
+
+
+def _read_memory_guard_records() -> Dict[str, Dict[str, Any]]:
+    try:
+        with open(MEMORY_GUARD_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if isinstance(data, dict) and isinstance(data.get("reservations"), dict):
+        raw_records = data["reservations"]
+    elif isinstance(data, dict):
+        raw_records = data
+    else:
+        return {}
+    records: Dict[str, Dict[str, Any]] = {}
+    for token, record in raw_records.items():
+        if isinstance(token, str) and isinstance(record, dict):
+            records[token] = dict(record)
+    return records
+
+
+def _write_memory_guard_records(records: Dict[str, Dict[str, Any]]) -> None:
+    guard_dir = os.path.dirname(MEMORY_GUARD_STATE_FILE)
+    if guard_dir:
+        os.makedirs(guard_dir, exist_ok=True)
+    tmp_path = f"{MEMORY_GUARD_STATE_FILE}.{os.getpid()}.{time.time_ns()}.tmp"
+    payload = {
+        "updated_at": time.time(),
+        "reservations": records,
+    }
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=True, indent=2)
+    os.replace(tmp_path, MEMORY_GUARD_STATE_FILE)
+
+
+def _prune_memory_guard_records(records: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+    now = time.time()
+    pruned: Dict[str, Dict[str, Any]] = {}
+    changed = False
+    for token, record in records.items():
+        try:
+            pid = int(record.get("pid", 0))
+            started_at = float(record.get("started_at", now))
+        except Exception:
+            changed = True
+            continue
+        if now - started_at > MEMORY_GUARD_STALE_SEC or not _is_process_alive(pid):
+            changed = True
+            continue
+        pruned[token] = record
+    return pruned, changed
+
+
+def _sum_memory_guard_budget(records: Dict[str, Dict[str, Any]]) -> int:
+    total = 0
+    for record in records.values():
+        try:
+            total += max(0, int(record.get("budget_bytes", 0)))
+        except Exception:
+            continue
+    return total
+
+
+def _release_memory_guard_reservation(token: str | None) -> None:
+    if not token or not MEMORY_GUARD_ENABLED or os.name != "nt":
+        return
+    handle = _acquire_memory_guard_mutex()
+    if not handle:
+        return
+    try:
+        records = _read_memory_guard_records()
+        records, _ = _prune_memory_guard_records(records)
+        if token in records:
+            del records[token]
+            _write_memory_guard_records(records)
+    finally:
+        _release_memory_guard_mutex(handle)
+
+
+def _wait_for_memory_headroom(stage: str, reserve_gb: float | None = None, **extra: Any) -> str | None:
+    """Blocks before expensive NX work and reserves estimated memory headroom."""
+    if not MEMORY_GUARD_ENABLED or os.name != "nt":
+        return None
+    min_avail = int(max(0.0, MEMORY_GUARD_MIN_AVAIL_GB) * (1024.0 ** 3))
+    min_commit_avail = int(max(0.0, MEMORY_GUARD_MIN_COMMIT_AVAIL_GB) * (1024.0 ** 3))
+    max_load = int(MEMORY_GUARD_MAX_LOAD_PCT)
+    request_budget = _memory_guard_budget_bytes(stage, reserve_gb)
+    if (
+        min_avail <= 0
+        and min_commit_avail <= 0
+        and max_load >= 100
+        and request_budget <= 0
+        and MEMORY_GUARD_MAX_ACTIVE_ACTIONS <= 0
+    ):
+        return None
+
+    token = f"{os.getpid()}:{stage}:{time.time_ns()}"
+    started = time.monotonic()
+    last_log = 0.0
+    while True:
+        snap = _get_memory_snapshot()
+        if snap is None:
+            return None
+
+        records: Dict[str, Dict[str, Any]] = {}
+        active_count = 0
+        reserved_budget = 0
+        records_changed = False
+        handle = _acquire_memory_guard_mutex()
+        try:
+            if handle:
+                records = _read_memory_guard_records()
+                records, records_changed = _prune_memory_guard_records(records)
+                active_count = len(records)
+                reserved_budget = _sum_memory_guard_budget(records)
+
+            projected_avail = snap["avail_phys"] - reserved_budget - request_budget
+            projected_commit_avail = snap["system_commit_avail"] - reserved_budget - request_budget
+            reasons = []
+            if min_avail > 0 and projected_avail < min_avail:
+                reasons.append(f"projected_avail<{_format_gb(min_avail)}")
+            if min_commit_avail > 0 and projected_commit_avail < min_commit_avail:
+                reasons.append(f"projected_commit_avail<{_format_gb(min_commit_avail)}")
+            if max_load < 100 and snap["memory_load_pct"] > max_load:
+                reasons.append(f"mem_load>{max_load}%")
+            if MEMORY_GUARD_MAX_ACTIVE_ACTIONS > 0 and active_count >= MEMORY_GUARD_MAX_ACTIVE_ACTIONS:
+                reasons.append(f"active>={MEMORY_GUARD_MAX_ACTIVE_ACTIONS}")
+
+            if not reasons:
+                if handle and request_budget > 0:
+                    records[token] = {
+                        "pid": int(os.getpid()),
+                        "stage": str(stage),
+                        "budget_bytes": int(request_budget),
+                        "started_at": time.time(),
+                    }
+                    _write_memory_guard_records(records)
+                elif handle and records_changed:
+                    _write_memory_guard_records(records)
+
+                waited = time.monotonic() - started
+                if waited >= MEMORY_GUARD_POLL_SEC:
+                    print(
+                        "[MEM-GUARD] resume "
+                        f"stage={stage} waited={waited:.0f}s "
+                        f"avail_phys={_format_gb(snap['avail_phys'])} "
+                        f"commit_avail={_format_gb(snap['system_commit_avail'])} "
+                        f"reserved={_format_gb(reserved_budget)} "
+                        f"request={_format_gb(request_budget)} "
+                        f"active={active_count} "
+                        f"mem_load={snap['memory_load_pct']}%",
+                        flush=True,
+                    )
+                return token if handle and request_budget > 0 else None
+
+            if handle and records_changed:
+                _write_memory_guard_records(records)
+        finally:
+            _release_memory_guard_mutex(handle)
+
+        now = time.monotonic()
+        if last_log <= 0.0 or now - last_log >= MEMORY_GUARD_LOG_EVERY_SEC:
+            extra_text = " ".join(
+                f"{key}={value}"
+                for key, value in extra.items()
+                if value is not None
+            )
+            print(
+                "[MEM-GUARD] wait "
+                f"stage={stage} reason={','.join(reasons)} "
+                f"avail_phys={_format_gb(snap['avail_phys'])} "
+                f"commit_avail={_format_gb(snap['system_commit_avail'])} "
+                f"reserved={_format_gb(reserved_budget)} "
+                f"request={_format_gb(request_budget)} "
+                f"active={active_count} "
+                f"mem_load={snap['memory_load_pct']}% "
+                f"poll={MEMORY_GUARD_POLL_SEC:.0f}s "
+                f"{extra_text}".rstrip(),
+                flush=True,
+            )
+            last_log = now
+        time.sleep(MEMORY_GUARD_POLL_SEC)
 
 
 def build_node_mask_512(num_valid_nodes: int, max_nodes: int = 512) -> np.ndarray:
@@ -2187,13 +2449,24 @@ def simulate_rollout_for_axis(
     }
     return summary
 
-def create_run_output_dir(out_root: str, part_name: str, seed: int) -> str:
+def create_run_output_dir(out_root: str, part_name: str, seed: int, pc_name: str = "") -> str:
     """Creates a timestamped output directory for the current run."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"{part_name}_seed{int(seed)}_{ts}"
+    pc_slug = _safe_filename(pc_name).strip("._-")
+    if pc_slug:
+        run_name = f"{run_name}_{pc_slug}"
     run_dir = os.path.join(out_root, run_name)
     _ensure_dir(run_dir)
     return run_dir
+
+
+def _strip_pc_suffix(name: str, pc_name: str = "") -> str:
+    """Returns a run stem without the optional PC suffix."""
+    pc_slug = _safe_filename(pc_name).strip("._-")
+    if pc_slug and name.endswith(f"_{pc_slug}"):
+        return name[: -(len(pc_slug) + 1)]
+    return name
 
 def _to_serializable_list(x):
     """Performs: to list."""
@@ -2337,11 +2610,18 @@ def _close_parquet_stream(state: Dict[str, Any]) -> Tuple[int, int]:
 
 # ----------------------------
 # ----------------------------
-def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, global_parquet_dir: str = None):
+def collect_dataset_episode(
+    prt_file_path: str,
+    out_root: str,
+    seed: int = 0,
+    global_parquet_dir: str = None,
+    pc_name: str = "",
+):
     """Collects one full dataset episode for a single part file."""
     session, work_part = cam_session.create_session(input_file_dir=prt_file_path)
     theUfSession = NXOpen.UF.UFSession.GetUFSession()  # noqa: kept for legacy helpers
-    _log_memory("episode:start", part=os.path.basename(prt_file_path), seed=int(seed))
+    pc_slug = _safe_filename(pc_name or os.getenv("PC_NAME", "")).strip("._-")
+    _log_memory("episode:start", part=os.path.basename(prt_file_path), seed=int(seed), pc=pc_slug or None)
 
     origin_body = max(work_part.Bodies, key=get_body_volume)
     origin_faces = origin_body.GetFaces()
@@ -2391,8 +2671,9 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         cam_utils.create_cam_tool(session, work_part, tool_diameter=d, tool_type=mill_tool_types[1], tool_list=ball_tools)
 
     part_name = os.path.splitext(os.path.basename(prt_file_path))[0]
-    out_dir = create_run_output_dir(out_root, part_name, seed)
+    out_dir = create_run_output_dir(out_root, part_name, seed, pc_name=pc_slug)
     run_name = os.path.basename(out_dir)
+    parquet_run_name = _strip_pc_suffix(run_name, pc_slug)
     parquet_path = ""
     chosen_parquet_path = ""
     num_rows = 0
@@ -3032,13 +3313,23 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                     continue
 
                 K_groups = len(groups_face)
-                branch_before_state = measure_current_state_for_branch(
-                    session, work_part, prt_file_path, origin_body, origin_faces, groups_face,
-                    face_areas, points_array, norm_vecs_array, lines_array, flat_tools,
-                    workpiece_name_chain=workpiece_name_chain,
-                    state_depth=len(branch["history"]),
-                    base_object_blank=base_object_blank,
+                memory_guard_token = _wait_for_memory_headroom(
+                    "branch_measure",
+                    reserve_gb=MEMORY_GUARD_BRANCH_BUDGET_GB,
+                    t=int(t),
+                    branch=str(branch["id"]),
+                    depth=len(branch["history"]),
                 )
+                try:
+                    branch_before_state = measure_current_state_for_branch(
+                        session, work_part, prt_file_path, origin_body, origin_faces, groups_face,
+                        face_areas, points_array, norm_vecs_array, lines_array, flat_tools,
+                        workpiece_name_chain=workpiece_name_chain,
+                        state_depth=len(branch["history"]),
+                        base_object_blank=base_object_blank,
+                    )
+                finally:
+                    _release_memory_guard_reservation(memory_guard_token)
                 state_volume = float(branch_before_state["volume"])
                 if initial_stock_volume is None:
                     initial_stock_volume = float(max(state_volume, 1e-9))
@@ -3129,11 +3420,24 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                     if MEMORY_DEBUG and (ci % MEMORY_DEBUG_CANDIDATE_EVERY == 0 or ci == len(candidates) - 1):
                         memory_log_label = f"candidate:t{t}:b{branch['id']}:c{ci}"
                     cand_chain_snapshot = list(workpiece_name_chain)
-                    cand_mark = session.SetUndoMark(
-                        NXOpen.Session.MarkVisibility.Invisible,
-                        f"beam_t{t:02d}_b{bi:03d}_c{ci:03d}",
+                    memory_guard_token = _wait_for_memory_headroom(
+                        "candidate",
+                        reserve_gb=MEMORY_GUARD_CANDIDATE_BUDGET_GB,
+                        t=int(t),
+                        branch=str(branch["id"]),
+                        candidate=int(ci),
+                        depth=len(branch["history"]),
+                        macro=action.get("macro_class_name"),
                     )
                     cand_mark_name = f"beam_t{t:02d}_b{bi:03d}_c{ci:03d}"
+                    try:
+                        cand_mark = session.SetUndoMark(
+                            NXOpen.Session.MarkVisibility.Invisible,
+                            cand_mark_name,
+                        )
+                    except Exception:
+                        _release_memory_guard_reservation(memory_guard_token)
+                        raise
                     candidate_error = None
                     candidate_error_snapshot_path = ""
                     rollback_error = None
@@ -3188,7 +3492,10 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
                                 f"candidate={ci} mark={cand_mark_name} err={exc!r}",
                                 flush=True,
                             )
-                        restore_workpiece_chain(workpiece_name_chain, cand_chain_snapshot)
+                        try:
+                            restore_workpiece_chain(workpiece_name_chain, cand_chain_snapshot)
+                        finally:
+                            _release_memory_guard_reservation(memory_guard_token)
                     if rollback_error is not None:
                         rollback_runtime_error = RuntimeError(
                             "candidate rollback failed after action simulation "
@@ -3458,12 +3765,12 @@ def collect_dataset_episode(prt_file_path: str, out_root: str, seed: int = 0, gl
         if episode_completed:
             if num_rows > 0 and global_parquet_dir:
                 _ensure_dir(global_parquet_dir)
-                global_filename = f"{run_name}.parquet"
+                global_filename = f"{parquet_run_name}.parquet"
                 global_path = os.path.join(global_parquet_dir, global_filename)
                 shutil.copy2(parquet_path, global_path)
                 print(f"[INFO] Copied parquet to: {global_path}")
                 if bool(SAVE_CHOSEN_ONLY_PARQUET):
-                    global_chosen_filename = f"{run_name}_chosen_only.parquet"
+                    global_chosen_filename = f"{parquet_run_name}_chosen_only.parquet"
                     global_chosen_path = os.path.join(global_parquet_dir, global_chosen_filename)
                     shutil.copy2(chosen_parquet_path, global_chosen_path)
                     print(f"[INFO] Copied chosen-only parquet to: {global_chosen_path}")
@@ -3492,6 +3799,7 @@ if __name__ == "__main__":
     parser.add_argument("--input", type=str, required=False, help="Path to input .prt file")
     parser.add_argument("--output", type=str, required=False, help="Path to output directory")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--pc-name", type=str, default=os.getenv("PC_NAME", ""), help="PC label for output folder naming")
     args = parser.parse_args()
 
     if args.input and args.output:
@@ -3516,7 +3824,13 @@ if __name__ == "__main__":
     _ensure_dir(out_root)
 
     try:
-        ret = collect_dataset_episode(prt_path, out_root, seed=current_seed, global_parquet_dir=GLOBAL_PARQUET_DIR)
+        ret = collect_dataset_episode(
+            prt_path,
+            out_root,
+            seed=current_seed,
+            global_parquet_dir=GLOBAL_PARQUET_DIR,
+            pc_name=args.pc_name,
+        )
         print(json.dumps(ret, ensure_ascii=False, indent=2))
     except Exception as e:
         print(f"[Critical Error] {e}", file=sys.stderr)
