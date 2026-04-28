@@ -13,7 +13,7 @@ import time
 # Use the current interpreter so jobs run in the active environment.
 PYTHON_EXE = sys.executable
 WORKER_SCRIPT = "collect_axis_dataset.py"
-PC_NAME = "3090"
+PC_NAME = "615"
 
 # Shared network paths for distributed collection machines.
 SHARED_BASE_DIR = r"Y:\04_개별폴더\22. 통합과정 오인욱"
