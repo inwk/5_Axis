@@ -469,16 +469,16 @@ OCTREE_BBOX_PADDING: float = float(os.getenv("OCTREE_BBOX_PADDING", "0.05"))
 MEMORY_DEBUG: bool = bool(int(os.getenv("MEMORY_DEBUG", "1")))
 MEMORY_DEBUG_CANDIDATE_EVERY: int = max(1, int(os.getenv("MEMORY_DEBUG_CANDIDATE_EVERY", "1")))
 MEMORY_GUARD_ENABLED: bool = bool(int(os.getenv("MEMORY_GUARD_ENABLED", "1")))
-MEMORY_GUARD_MIN_AVAIL_GB: float = float(os.getenv("MEMORY_GUARD_MIN_AVAIL_GB", "6.0"))
-MEMORY_GUARD_MIN_COMMIT_AVAIL_GB: float = float(os.getenv("MEMORY_GUARD_MIN_COMMIT_AVAIL_GB", "8.0"))
-MEMORY_GUARD_MAX_LOAD_PCT: int = int(os.getenv("MEMORY_GUARD_MAX_LOAD_PCT", "86"))
-MEMORY_GUARD_POLL_SEC: float = max(1.0, float(os.getenv("MEMORY_GUARD_POLL_SEC", "15")))
+MEMORY_GUARD_MIN_AVAIL_GB: float = float(os.getenv("MEMORY_GUARD_MIN_AVAIL_GB", "5.0"))
+MEMORY_GUARD_MIN_COMMIT_AVAIL_GB: float = float(os.getenv("MEMORY_GUARD_MIN_COMMIT_AVAIL_GB", "0.0"))
+MEMORY_GUARD_MAX_LOAD_PCT: int = int(os.getenv("MEMORY_GUARD_MAX_LOAD_PCT", "88"))
+MEMORY_GUARD_POLL_SEC: float = max(1.0, float(os.getenv("MEMORY_GUARD_POLL_SEC", "5")))
 MEMORY_GUARD_LOG_EVERY_SEC: float = max(5.0, float(os.getenv("MEMORY_GUARD_LOG_EVERY_SEC", "60")))
-MEMORY_GUARD_ACTION_BUDGET_GB: float = float(os.getenv("MEMORY_GUARD_ACTION_BUDGET_GB", "1.5"))
+MEMORY_GUARD_ACTION_BUDGET_GB: float = float(os.getenv("MEMORY_GUARD_ACTION_BUDGET_GB", "1.0"))
 MEMORY_GUARD_CANDIDATE_BUDGET_GB: float = float(
     os.getenv("MEMORY_GUARD_CANDIDATE_BUDGET_GB", str(MEMORY_GUARD_ACTION_BUDGET_GB))
 )
-MEMORY_GUARD_BRANCH_BUDGET_GB: float = float(os.getenv("MEMORY_GUARD_BRANCH_BUDGET_GB", "1.0"))
+MEMORY_GUARD_BRANCH_BUDGET_GB: float = float(os.getenv("MEMORY_GUARD_BRANCH_BUDGET_GB", "0.6"))
 MEMORY_GUARD_MAX_ACTIVE_ACTIONS: int = max(0, int(os.getenv("MEMORY_GUARD_MAX_ACTIVE_ACTIONS", "0")))
 MEMORY_GUARD_STALE_SEC: float = max(60.0, float(os.getenv("MEMORY_GUARD_STALE_SEC", "21600")))
 MEMORY_GUARD_STATE_FILE: str = os.getenv(
@@ -486,6 +486,15 @@ MEMORY_GUARD_STATE_FILE: str = os.getenv(
     os.path.join(tempfile.gettempdir(), "axis_dataset_memory_guard.json"),
 )
 MEMORY_GUARD_MUTEX_NAME: str = os.getenv("MEMORY_GUARD_MUTEX_NAME", "Local\\AxisDatasetMemoryGuard")
+MEMORY_GUARD_ALLOW_ONE_UNDER_PRESSURE: bool = bool(
+    int(os.getenv("MEMORY_GUARD_ALLOW_ONE_UNDER_PRESSURE", "1"))
+)
+MEMORY_GUARD_EMERGENCY_MIN_AVAIL_GB: float = float(
+    os.getenv("MEMORY_GUARD_EMERGENCY_MIN_AVAIL_GB", "2.0")
+)
+MEMORY_GUARD_EMERGENCY_MAX_LOAD_PCT: int = int(
+    os.getenv("MEMORY_GUARD_EMERGENCY_MAX_LOAD_PCT", "95")
+)
 
 
 if os.name == "nt":
@@ -750,6 +759,8 @@ def _wait_for_memory_headroom(stage: str, reserve_gb: float | None = None, **ext
     min_avail = int(max(0.0, MEMORY_GUARD_MIN_AVAIL_GB) * (1024.0 ** 3))
     min_commit_avail = int(max(0.0, MEMORY_GUARD_MIN_COMMIT_AVAIL_GB) * (1024.0 ** 3))
     max_load = int(MEMORY_GUARD_MAX_LOAD_PCT)
+    emergency_min_avail = int(max(0.0, MEMORY_GUARD_EMERGENCY_MIN_AVAIL_GB) * (1024.0 ** 3))
+    emergency_max_load = int(MEMORY_GUARD_EMERGENCY_MAX_LOAD_PCT)
     request_budget = _memory_guard_budget_bytes(stage, reserve_gb)
     if (
         min_avail <= 0
@@ -792,7 +803,16 @@ def _wait_for_memory_headroom(stage: str, reserve_gb: float | None = None, **ext
             if MEMORY_GUARD_MAX_ACTIVE_ACTIONS > 0 and active_count >= MEMORY_GUARD_MAX_ACTIVE_ACTIONS:
                 reasons.append(f"active>={MEMORY_GUARD_MAX_ACTIVE_ACTIONS}")
 
-            if not reasons:
+            force_single_progress = (
+                bool(reasons)
+                and bool(MEMORY_GUARD_ALLOW_ONE_UNDER_PRESSURE)
+                and bool(handle)
+                and active_count <= 0
+                and snap["avail_phys"] >= emergency_min_avail
+                and snap["memory_load_pct"] <= emergency_max_load
+            )
+
+            if not reasons or force_single_progress:
                 if handle and request_budget > 0:
                     records[token] = {
                         "pid": int(os.getpid()),
@@ -805,7 +825,22 @@ def _wait_for_memory_headroom(stage: str, reserve_gb: float | None = None, **ext
                     _write_memory_guard_records(records)
 
                 waited = time.monotonic() - started
-                if waited >= MEMORY_GUARD_POLL_SEC:
+                if force_single_progress:
+                    print(
+                        "[MEM-GUARD] force-resume "
+                        f"stage={stage} waited={waited:.0f}s "
+                        f"blocked_reason={','.join(reasons)} "
+                        f"avail_phys={_format_gb(snap['avail_phys'])} "
+                        f"commit_avail={_format_gb(snap['system_commit_avail'])} "
+                        f"reserved={_format_gb(reserved_budget)} "
+                        f"request={_format_gb(request_budget)} "
+                        f"active={active_count} "
+                        f"mem_load={snap['memory_load_pct']}% "
+                        f"emergency_min_avail={_format_gb(emergency_min_avail)} "
+                        f"emergency_max_load={emergency_max_load}%",
+                        flush=True,
+                    )
+                elif waited >= MEMORY_GUARD_POLL_SEC:
                     print(
                         "[MEM-GUARD] resume "
                         f"stage={stage} waited={waited:.0f}s "
