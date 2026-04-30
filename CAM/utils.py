@@ -1,4 +1,4 @@
-import functools
+﻿import functools
 import tempfile
 import trimesh
 import numpy as np
@@ -23,7 +23,7 @@ def visualize_stl(path, title="", block=False):
         p.add_mesh(mesh, show_edges=False)
         p.view_isometric()
         p.show_grid()
-        return p  
+        return p
 
 def identify_exterior_faces(body, direction):
     """Performs: identify exterior faces."""
@@ -82,14 +82,16 @@ def _export_nx_body_to_obj(session, body, output_path: str) -> str:
     output_path = os.path.abspath(output_path)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     obj_creator = session.DexManager.CreateWavefrontObjCreator()
-    obj_creator.ExportSelectionBlock.SelectionScope = NXOpen.ObjectSelector.Scope.SelectedObjects
-    obj_creator.AngularTolerance = 17.999999999999996
-    obj_creator.FlattenAssemblyStructure = True
-    obj_creator.ExportSelectionBlock.SelectionComp.Add(body)
-    obj_creator.OutputFile = output_path
-    obj_creator.FileSaveFlag = False
-    obj_creator.Commit()
-    obj_creator.Destroy()
+    try:
+        obj_creator.ExportSelectionBlock.SelectionScope = NXOpen.ObjectSelector.Scope.SelectedObjects
+        obj_creator.AngularTolerance = 17.999999999999996
+        obj_creator.FlattenAssemblyStructure = True
+        obj_creator.ExportSelectionBlock.SelectionComp.Add(body)
+        obj_creator.OutputFile = output_path
+        obj_creator.FileSaveFlag = False
+        obj_creator.Commit()
+    finally:
+        _safe_destroy(obj_creator)
     return output_path
 
 
@@ -266,6 +268,32 @@ import sys
 import json
 import math
 import numpy as np
+
+
+def _safe_destroy(nx_object):
+    """Best-effort cleanup for NX builders/creators."""
+    if nx_object is None:
+        return
+    try:
+        nx_object.Destroy()
+    except Exception:
+        pass
+
+
+def _undo_to_mark_and_delete(session, mark_id, mark_name: str) -> None:
+    """Undo temporary NX objects and remove the mark from the stack."""
+    undo_error = None
+    try:
+        session.UndoToMark(mark_id, mark_name)
+    except Exception as exc:
+        undo_error = exc
+    try:
+        session.DeleteUndoMark(mark_id, mark_name)
+    except Exception:
+        pass
+    if undo_error is not None:
+        raise undo_error
+
 try:
     from measurements import getFaceVector, getConvergentFaceInfo
     from measurements import getFaceArea
@@ -287,6 +315,7 @@ def create_tool(session, work_part, tool_diameter, tool_type, tool_list):
     if tool_name in tool_list:
         tool_list.append(tool_name)
         return
+    ToolBuilder = None
     if tool_type == "STD_DRILL":
         tool = work_part.CAMSetup.CAMGroupCollection.CreateTool(nCGroup, "hole_making", tool_type, NXOpen.CAM.NCGroupCollection.UseDefaultName.FalseValue, tool_name)
         ToolBuilder = work_part.CAMSetup.CAMGroupCollection.CreateDrillStdToolBuilder(tool)
@@ -294,35 +323,37 @@ def create_tool(session, work_part, tool_diameter, tool_type, tool_list):
         tool = work_part.CAMSetup.CAMGroupCollection.CreateTool(nCGroup, "mill_contour", tool_type, NXOpen.CAM.NCGroupCollection.UseDefaultName.FalseValue, tool_name)
         ToolBuilder = work_part.CAMSetup.CAMGroupCollection.CreateMillToolBuilder(tool)
 
-    ToolBuilder.TlDiameterBuilder.Value = float(tool_diameter)
-    ###
-    if tool_diameter >= 12:
+    try:
+        ToolBuilder.TlDiameterBuilder.Value = float(tool_diameter)
+        ###
+        if tool_diameter >= 12:
 
-        ToolBuilder.TlHeightBuilder.Value = tool_diameter * 4
-        ToolBuilder.TlFluteLnBuilder.Value = tool_diameter * 2
+            ToolBuilder.TlHeightBuilder.Value = tool_diameter * 4
+            ToolBuilder.TlFluteLnBuilder.Value = tool_diameter * 2
 
-        # lower_diameter = 50.0
-        # holder_length = 120.0
-        # taper_angle = 0.0
-        # _ = ToolBuilder.HolderSectionBuilder.Add(0, lower_diameter, holder_length, taper_angle, 0.0)
-    else:
-        ToolBuilder.TlHeightBuilder.Value = tool_diameter * 6
-        ToolBuilder.TlFluteLnBuilder.Value = tool_diameter * 3
+            # lower_diameter = 50.0
+            # holder_length = 120.0
+            # taper_angle = 0.0
+            # _ = ToolBuilder.HolderSectionBuilder.Add(0, lower_diameter, holder_length, taper_angle, 0.0)
+        else:
+            ToolBuilder.TlHeightBuilder.Value = tool_diameter * 6
+            ToolBuilder.TlFluteLnBuilder.Value = tool_diameter * 3
 
-        # lower_diameter = 32.0
-        # holder_length = 150.0
-        # taper_angle = 1.5275
-        # _ = ToolBuilder.HolderSectionBuilder.Add(0, lower_diameter, holder_length, taper_angle, 0.0)
+            # lower_diameter = 32.0
+            # holder_length = 150.0
+            # taper_angle = 1.5275
+            # _ = ToolBuilder.HolderSectionBuilder.Add(0, lower_diameter, holder_length, taper_angle, 0.0)
 
-    ###
-    ToolBuilder.Commit()
-    ToolBuilder.Destroy()
+        ###
+        ToolBuilder.Commit()
+    finally:
+        _safe_destroy(ToolBuilder)
     tool_list.append(tool_name)
 
 def rotate_vector(rot, vector):
     """Performs: rotate vector."""
     dx, dy, dz = vector
-    
+
     if rot == 1:
         rotation_matrix = np.array([[1, 0, 0],
                                     [0, 0, -1],
@@ -342,9 +373,9 @@ def rotate_vector(rot, vector):
     else:
         pass
     vector_np = np.array([dx, dy, dz])
-    
+
     rotated_vector = np.dot(rotation_matrix, vector_np)
-    
+
     return rotated_vector
 
 def face_classify(session=None, work_part=None, target_size=None, operation_type=None, origin_faces=None, deviation_list=None, drill_orientation=None):
@@ -392,7 +423,7 @@ def face_classify(session=None, work_part=None, target_size=None, operation_type
                 # else:
                 face_idx_list.append(idx)
                 face.Color = 20
-           
+
     if (operation_type == "Area Mill"):
         for idx, face in enumerate(origin_faces):
             if (deviation_list[idx] > diff_threshold):  # skip nearly-finished faces
@@ -413,7 +444,7 @@ def face_classify(session=None, work_part=None, target_size=None, operation_type
                 else:
                     face_idx_list.append(idx)
                     face.Color = 40
-                    
+
     if (operation_type == "Drill"):
         for idx, face in enumerate(origin_faces):
             _, center, direction_data, _, major_radius, _, _ = theUfSession.Modeling.AskFaceData(face.Tag)
@@ -480,7 +511,7 @@ def face_classify(session=None, work_part=None, target_size=None, operation_type
 
     # if (operation_type == "Drill"):
     #         for idx, face in enumerate(origin_faces):
-    #             _, _, direction_data, _, major_radius, _, _ = theUfSession.Modeling.AskFaceData(face.Tag) 
+    #             _, _, direction_data, _, major_radius, _, _ = theUfSession.Modeling.AskFaceData(face.Tag)
     #             nx, ny, nz = direction_data
     #             # if (abs(nz) == 1.0):
     #                     face.Color = 150
@@ -534,7 +565,7 @@ def getEncInputData(faces,faces_tag):
     G=nx.Graph()
     for face_tag in faces_tag:
         G.add_node(face_tag)
-    
+
     # For face
     for face_tag in faces_tag:
         adjacent_faces_tag = theUfSession.Modeling.AskAdjacFaces(face_tag)
@@ -563,7 +594,7 @@ def getEncInputData(faces,faces_tag):
         elif face.SolidFaceType.value == 1:
             if len(face.GetEdges()) == 1:
                 area, _, _, _, _, _, _, _ = the_session.Measurement.GetFaceProperties([face], 0.98999999999999999, NXOpen.Measurement.AlternateFace.Radius, True)
-                if area <= math.pi * math.pow(5.1, 2): 
+                if area <= math.pi * math.pow(5.1, 2):
                     face_type = 6
                     visualize_face(face, 6)
                     faces_vec.append(getFaceVector(face.Tag))
@@ -579,13 +610,13 @@ def getEncInputData(faces,faces_tag):
 
         faces_area.append(getFaceArea(face))
         faces_type.append(face_type)
-    return G, faces_vec, faces_area, faces_type 
+    return G, faces_vec, faces_area, faces_type
 def getDecOutputData(opType, pattern_idx, tool_idx, selected_face_idx):
     """Performs: get dec output data."""
     return [opType, pattern_idx, tool_idx]+selected_face_idx
 def graph_to_json(G):
     """Performs: graph to json."""
-    return json.dumps(nx.readwrite.json_graph.node_link_data(G))   
+    return json.dumps(nx.readwrite.json_graph.node_link_data(G))
 
 def json_to_graph(graph_json):
     """Performs: json to graph."""
@@ -614,7 +645,7 @@ def save_data(path, data_list,overwrite=False):#graph, faces_vec, faces_area, fa
         df_existing.to_parquet(path)
     else:
         df_new.to_parquet(path)
-        
+
 def save_data_sdf(path, data_list, overwrite=False):
     """Performs: save data sdf."""
     new_data_list = []
@@ -698,53 +729,54 @@ def get_ipw_property(session=None, work_part=None, object_blank=None, tool_name=
     session.ApplicationSwitchImmediate("UG_APP_MANUFACTURING")
     work_part = session.Parts.Work
     session.CAMSession.PathDisplay.SetIpwResolution(NXOpen.CAM.PathDisplay.IpwResolutionType.Coarse)
-    
+
     markId = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "before")
+    try:
+        # ----------------------------------------------
+        #   Create CAM Operation
+        # ----------------------------------------------
+        nCGroup = work_part.CAMSetup.CAMGroupCollection.FindObject("NC_PROGRAM")
+        method = work_part.CAMSetup.CAMGroupCollection.FindObject("METHOD")
+        tool = work_part.CAMSetup.CAMGroupCollection.FindObject(tool_name)
+        operation = work_part.CAMSetup.CAMOperationCollection.Create(nCGroup,
+                                                                    method,
+                                                                    tool,
+                                                                    object_blank,
+                                                                    "mill_contour",
+                                                                    "AREA_MILL",
+                                                                    NXOpen.CAM.OperationCollection.UseDefaultName.TrueValue,
+                                                                    "AREA_MILL")
 
-    # ----------------------------------------------
-    #   Create CAM Operation
-    # ----------------------------------------------
-    nCGroup = work_part.CAMSetup.CAMGroupCollection.FindObject("NC_PROGRAM")
-    method = work_part.CAMSetup.CAMGroupCollection.FindObject("METHOD")
-    tool = work_part.CAMSetup.CAMGroupCollection.FindObject(tool_name)
-    operation = work_part.CAMSetup.CAMOperationCollection.Create(nCGroup, 
-                                                                method, 
-                                                                tool, 
-                                                                object_blank, 
-                                                                "mill_contour", 
-                                                                "AREA_MILL", 
-                                                                NXOpen.CAM.OperationCollection.UseDefaultName.TrueValue, 
-                                                                "AREA_MILL")
+        ipw = operation.GetInputIpw()
+        # if savepath != None:
+        #     if isinstance(savepath, list):
+        #         name_base = "Raw_stock" if not savepath else f"op_{len(savepath)}"
 
-    ipw = operation.GetInputIpw()
-    # if savepath != None:
-    #     if isinstance(savepath, list):
-    #         name_base = "Raw_stock" if not savepath else f"op_{len(savepath)}"
-            
-    #     else:
-    #         name_base = str(savepath)
-    #     # --- STL Export ---
-    #     out_file = f"{name_base}.stl"
-    #     stl = session.DexManager.CreateStlCreator()
-    #     stl.AutoNormalGen = True
-    #     stl.ChordalTol = 0.05
-    #     stl.AdjacencyTol = 0.05
-    #     stl.Commit()
-    #     stl.Destroy()
-        # viewer = os.path.join(os.path.dirname(__file__), "stl_viewer.py")
-        # subprocess.Popen([
-        #     sys.executable, viewer,
-        #     "--file", out_file,           # ?? "op_3.stl"
-        #     "--title", name_base,         # ?? "op_3"
-        # ])
+        #     else:
+        #         name_base = str(savepath)
+        #     # --- STL Export ---
+        #     out_file = f"{name_base}.stl"
+        #     stl = session.DexManager.CreateStlCreator()
+        #     stl.AutoNormalGen = True
+        #     stl.ChordalTol = 0.05
+        #     stl.AdjacencyTol = 0.05
+        #     stl.Commit()
+        #     stl.Destroy()
+            # viewer = os.path.join(os.path.dirname(__file__), "stl_viewer.py")
+            # subprocess.Popen([
+            #     sys.executable, viewer,
+            #     "--file", out_file,           # ?? "op_3.stl"
+            #     "--title", name_base,         # ?? "op_3"
+            # ])
 
-    volume = ipw.Volume/1000 
-    deviation_list, objects = get_deviation_per_face(ipw, points_array, norm_vecs_array,lines_array)
-    
-    #volume = getVolume(objects)
-    assert volume != 0.0, "volume 0"
-    session.UndoToMark(markId, "before")  
-    return deviation_list, volume
+        volume = ipw.Volume/1000
+        deviation_list, objects = get_deviation_per_face(ipw, points_array, norm_vecs_array,lines_array)
+
+        #volume = getVolume(objects)
+        assert volume != 0.0, "volume 0"
+        return deviation_list, volume
+    finally:
+        _undo_to_mark_and_delete(session, markId, "before")
 
 
 def get_ipw_property_detailed(
@@ -769,28 +801,30 @@ def get_ipw_property_detailed(
 
     markId = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "before_detailed")
 
-    nCGroup = work_part.CAMSetup.CAMGroupCollection.FindObject("NC_PROGRAM")
-    method = work_part.CAMSetup.CAMGroupCollection.FindObject("METHOD")
-    tool = work_part.CAMSetup.CAMGroupCollection.FindObject(tool_name)
-    operation = work_part.CAMSetup.CAMOperationCollection.Create(
-        nCGroup,
-        method,
-        tool,
-        object_blank,
-        "mill_contour",
-        "AREA_MILL",
-        NXOpen.CAM.OperationCollection.UseDefaultName.TrueValue,
-        "AREA_MILL",
-    )
+    try:
+        nCGroup = work_part.CAMSetup.CAMGroupCollection.FindObject("NC_PROGRAM")
+        method = work_part.CAMSetup.CAMGroupCollection.FindObject("METHOD")
+        tool = work_part.CAMSetup.CAMGroupCollection.FindObject(tool_name)
+        operation = work_part.CAMSetup.CAMOperationCollection.Create(
+            nCGroup,
+            method,
+            tool,
+            object_blank,
+            "mill_contour",
+            "AREA_MILL",
+            NXOpen.CAM.OperationCollection.UseDefaultName.TrueValue,
+            "AREA_MILL",
+        )
 
-    ipw = operation.GetInputIpw()
-    volume = ipw.Volume / 1000
-    deviation_list, _ = get_deviation_per_face(ipw, points_array, norm_vecs_array, lines_array)
-    pointwise_list, _ = get_pointwise_deviation_per_face(ipw, points_array, norm_vecs_array, lines_array)
+        ipw = operation.GetInputIpw()
+        volume = ipw.Volume / 1000
+        deviation_list, _ = get_deviation_per_face(ipw, points_array, norm_vecs_array, lines_array)
+        pointwise_list, _ = get_pointwise_deviation_per_face(ipw, points_array, norm_vecs_array, lines_array)
 
-    assert volume != 0.0, "volume 0"
-    session.UndoToMark(markId, "before_detailed")
-    return deviation_list, pointwise_list, volume
+        assert volume != 0.0, "volume 0"
+        return deviation_list, pointwise_list, volume
+    finally:
+        _undo_to_mark_and_delete(session, markId, "before_detailed")
 
 
 def sample_ipw_octree_state(
@@ -898,7 +932,7 @@ def sample_ipw_octree_state(
         )
         return centers, depths, labels, bbox_min_use.astype(np.float32), bbox_max_use.astype(np.float32)
     finally:
-        session.UndoToMark(markId, "before_octree")
+        _undo_to_mark_and_delete(session, markId, "before_octree")
 
 
 def query_ipw_occupancy_at_positions(
@@ -914,7 +948,7 @@ def query_ipw_occupancy_at_positions(
     with *object_blank*, then evaluates point-in-body containment at every
     position in *centers_xyz*.  All NX objects are cleaned up via an undo mark.
 
-    This is the companion to :func:`sample_ipw_octree_state` — use it to obtain
+    This is the companion to :func:`sample_ipw_octree_state` ??use it to obtain
     *before-operation* labels at the same octree cell positions that were sampled
     from the *after-operation* body, enabling the monotonicity training signal.
 
@@ -926,7 +960,7 @@ def query_ipw_occupancy_at_positions(
         centers_xyz:   ``[K, 3]`` float array of world-coordinate positions.
 
     Returns:
-        ``[K]`` float32 occupancy labels — 1.0 inside material, 0.0 outside.
+        ``[K]`` float32 occupancy labels ??1.0 inside material, 0.0 outside.
     """
     if session is None:
         session = NXOpen.Session.GetSession()
@@ -975,7 +1009,7 @@ def query_ipw_occupancy_at_positions(
 
         return np.asarray(labels, dtype=np.float32).reshape(-1)
     finally:
-        session.UndoToMark(markId, "query_ipw_occ")
+        _undo_to_mark_and_delete(session, markId, "query_ipw_occ")
 
 
 def CAMFilter(dec_input_list,dec_output_list, cycle_time_list, volume_diff_list):
@@ -992,13 +1026,13 @@ def CAMFilter(dec_input_list,dec_output_list, cycle_time_list, volume_diff_list)
     if min_val == max_val:
         sys.exit(1)
     norm_cycle_time_list = [(x - min_val) / (max_val - min_val) for x in cycle_time_list]
-    
+
     min_val = min(volume_diff_list)
     max_val = max(volume_diff_list)
     if min_val == max_val:
         sys.exit(1)
     norm_volume_diff_list = [(x - min_val) / (max_val - min_val) for x in volume_diff_list]
-    
+
     distances = [math.sqrt(x**2 + y**2) for x, y in zip(norm_cycle_time_list, norm_volume_diff_list)]
 
     low_indices = np.argsort(distances)[-round(cnt*0.7):]
@@ -1013,12 +1047,12 @@ def CAMFilter(dec_input_list,dec_output_list, cycle_time_list, volume_diff_list)
 def combine_parquet_files(directory, output_path):
     """Performs: combine parquet files."""
     parquet_files = [os.path.join(directory, f) for f in os.listdir(directory) if f.endswith('.parquet')]
-    
+
     combined_df = pd.DataFrame()
     for file in parquet_files:
         df = pd.read_parquet(file)
         combined_df = pd.concat([combined_df, df], ignore_index=True)
-    
+
     combined_df.to_parquet(output_path)
 
     return combined_df
@@ -1062,11 +1096,11 @@ def resample_point_cloud(points, target_count):
                     break
                 _, idx = tree.query(points[i], k=2)  # nearest two neighbors
                 midpoint = (points[idx[0]] + points[idx[1]]) / 2  # insert midpoint sample
-                
+
                 points = np.vstack([points, midpoint])
-                
+
                 tree = KDTree(points)
-                
+
         return points[:target_count]
 
     else:

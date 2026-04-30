@@ -93,14 +93,19 @@ def export_body_to_obj(session, work_part, body, output_path: str) -> str:
     output_path = os.path.abspath(output_path)
     _ensure_dir(os.path.dirname(output_path))
     obj_creator = session.DexManager.CreateWavefrontObjCreator()
-    obj_creator.ExportSelectionBlock.SelectionScope = NXOpen.ObjectSelector.Scope.SelectedObjects
-    obj_creator.AngularTolerance = 17.999999999999996
-    obj_creator.FlattenAssemblyStructure = True
-    obj_creator.ExportSelectionBlock.SelectionComp.Add(body)
-    obj_creator.OutputFile = output_path
-    obj_creator.FileSaveFlag = False
-    obj_creator.Commit()
-    obj_creator.Destroy()
+    try:
+        obj_creator.ExportSelectionBlock.SelectionScope = NXOpen.ObjectSelector.Scope.SelectedObjects
+        obj_creator.AngularTolerance = 17.999999999999996
+        obj_creator.FlattenAssemblyStructure = True
+        obj_creator.ExportSelectionBlock.SelectionComp.Add(body)
+        obj_creator.OutputFile = output_path
+        obj_creator.FileSaveFlag = False
+        obj_creator.Commit()
+    finally:
+        try:
+            obj_creator.Destroy()
+        except Exception:
+            pass
     return output_path
 
 def serialize_graph_to_node_link(G: nxg.Graph) -> dict:
@@ -2153,9 +2158,18 @@ def evaluate_action_with_lookahead(
 def force_close_part_by_path(target_path: str) -> None:
     """Performs: force close part by path."""
     session = NXOpen.Session.GetSession()
+    target_abs = os.path.normcase(os.path.abspath(target_path))
+    uf_session = NXOpen.UF.UFSession.GetUFSession()
     for part in list(session.Parts):
-        if part.FullPath and part.FullPath.lower() == target_path.lower():
-            NXOpen.UF.UFSession.GetUFSession().Part.Close(part.Tag, 0, 1)
+        try:
+            part_abs = os.path.normcase(os.path.abspath(part.FullPath)) if part.FullPath else ""
+        except Exception:
+            part_abs = ""
+        if part_abs == target_abs:
+            try:
+                uf_session.Part.Close(part.Tag, 0, 1)
+            except Exception as exc:
+                print(f"[WARN] Failed to close part {part.FullPath!r}: {exc!r}", flush=True)
     gc.collect()
 
 def measure_current_state(
@@ -2640,6 +2654,16 @@ def _close_parquet_stream(state: Dict[str, Any]) -> Tuple[int, int]:
             state["writer"].close()
         if state["chosen_writer"] is not None:
             state["chosen_writer"].close()
+        state["writer"] = None
+        state["chosen_writer"] = None
+        state["fallback_rows"].clear()
+        state["fallback_chosen_rows"].clear()
+        if state.get("pa") is not None:
+            try:
+                state["pa"].default_memory_pool().release_unused()
+            except Exception:
+                pass
+        gc.collect()
 
     return int(state["num_rows"]), int(state["num_chosen_rows"])
 
@@ -3817,6 +3841,7 @@ def collect_dataset_episode(
         except Exception as exc:
             print(f"[WARN] Could not delete beam_root undo mark: {exc!r}", flush=True)
         force_close_part_by_path(prt_file_path)
+        _log_memory("episode:after_cleanup")
 
     return {
         "out_dir": out_dir, "parquet_path": parquet_path,

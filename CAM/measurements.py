@@ -64,12 +64,18 @@ def calculate_distance_to_face(face, point):
     theSession = NXOpen.Session.GetSession()
     work_part = theSession.Parts.Work
     point3d = point.Coordinates
-    point = work_part.Points.CreatePoint(point3d)
-    measure_manager = work_part.MeasureManager
-    unit = theSession.Parts.Work.UnitCollection.FindObject("MilliMeter")
-    measure_type = NXOpen.MeasureManager.MeasureType.Minimum
-    distance = measure_manager.NewDistance(unit, measure_type, face, point)
-    return float(distance.Value)
+    measure_point = work_part.Points.CreatePoint(point3d)
+    try:
+        measure_manager = work_part.MeasureManager
+        unit = theSession.Parts.Work.UnitCollection.FindObject("MilliMeter")
+        measure_type = NXOpen.MeasureManager.MeasureType.Minimum
+        distance = measure_manager.NewDistance(unit, measure_type, face, measure_point)
+        return float(distance.Value)
+    finally:
+        try:
+            work_part.Points.DeletePoint(measure_point)
+        except Exception:
+            pass
 
 def get_deviation_per_face(ipw, points_array, norm_vecs_array, lines_array):
     """Performs: get deviation per face."""

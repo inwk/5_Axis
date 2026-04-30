@@ -333,6 +333,7 @@ class OctreeDecoder(nn.Module):
                                    dtype=torch.long, device=device)
 
         finest_centers = []
+        finest_depths  = []
         finest_probs   = []
 
         for depth in range(coarse_depth, self.max_depth + 1):
@@ -345,6 +346,7 @@ class OctreeDecoder(nn.Module):
 
             if depth == self.max_depth:
                 finest_centers.append(active_centers.squeeze(0))
+                finest_depths.append(active_depths.squeeze(0))
                 finest_probs.append(probs)
                 break
 
@@ -355,6 +357,7 @@ class OctreeDecoder(nn.Module):
             leaf_idx = (~is_boundary).nonzero(as_tuple=True)[0]
             if len(leaf_idx) > 0:
                 finest_centers.append(active_centers[0, leaf_idx])
+                finest_depths.append(active_depths[0, leaf_idx])
                 finest_probs.append(probs[leaf_idx])
 
             # Subdivide boundary cells
@@ -380,18 +383,24 @@ class OctreeDecoder(nn.Module):
             return None
 
         all_centers = torch.cat(finest_centers, dim=0).cpu().numpy()   # [total, 3]
+        all_depths  = torch.cat(finest_depths, dim=0).cpu().numpy()    # [total]
         all_probs   = torch.cat(finest_probs, dim=0).cpu().numpy()      # [total]
 
-        # Rasterise the finest-level cells onto a regular grid for Marching Cubes
+        # Rasterise every octree leaf onto the fine grid region it represents.
+        # A depth-d leaf covers 2^(max_depth-d) voxels per axis.
         R = 2 ** self.max_depth
         grid = np.zeros((R, R, R), dtype=np.float32)
         bmin = np.array(bbox_min)
         bmax = np.array(bbox_max)
         extent = bmax - bmin
-        # Map centres → voxel indices
-        ijk = np.floor(((all_centers - bmin) / extent) * R).astype(int).clip(0, R - 1)
-        for (i, j, k), p in zip(ijk, all_probs):
-            grid[i, j, k] = p
+        for center, depth, p in zip(all_centers, all_depths, all_probs):
+            depth_i = int(np.clip(depth, 0, self.max_depth))
+            n_depth = 2 ** depth_i
+            span = 2 ** (self.max_depth - depth_i)
+            ijk_depth = np.floor(((center - bmin) / extent) * n_depth).astype(int).clip(0, n_depth - 1)
+            start = ijk_depth * span
+            end = start + span
+            grid[start[0]:end[0], start[1]:end[1], start[2]:end[2]] = p
 
         return _marching_cubes(grid, occupancy_threshold, R, bbox_min, bbox_max)
 
