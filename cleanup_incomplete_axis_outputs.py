@@ -42,6 +42,10 @@ def _extract_part_name_from_log_name(filename: str, seed: int) -> str:
     suffix = f"_seed{int(seed)}.log"
     if filename.endswith(suffix):
         return filename[: -len(suffix)]
+    token = f"_seed{int(seed)}_"
+    idx = filename.rfind(token)
+    if idx >= 0:
+        return filename[:idx]
     return os.path.splitext(filename)[0]
 
 
@@ -51,6 +55,21 @@ def _global_parquet_run_name(filename: str) -> str:
     if filename.endswith(".parquet"):
         return filename[: -len(".parquet")]
     return filename
+
+
+def _global_parquet_run_name_from_folder(run_name: str, seed: int) -> str:
+    """Returns the PC-independent parquet stem for a completed run folder."""
+    token = f"_seed{int(seed)}_"
+    idx = run_name.rfind(token)
+    if idx < 0:
+        return run_name
+    prefix = run_name[: idx + len(token)]
+    suffix = run_name[idx + len(token) :]
+    parts = suffix.split("_")
+    # create_run_output_dir uses YYYYMMDD_HHMMSS[_pc].
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        return prefix + "_".join(parts[:2])
+    return run_name
 
 
 def _remove_path(path: str, dry_run: bool, is_dir: bool = False) -> bool:
@@ -80,6 +99,7 @@ def cleanup_output_root(output_dir: str, seed: int, dry_run: bool = False) -> di
         run_name = os.path.basename(run_dir)
         if _is_completed_run_dir(run_dir):
             completed_run_names.add(run_name)
+            completed_run_names.add(_global_parquet_run_name_from_folder(run_name, seed))
             completed_parts.add(_extract_part_name_from_run_name(run_name, seed))
 
     stats = {

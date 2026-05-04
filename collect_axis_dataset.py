@@ -475,7 +475,7 @@ MEMORY_DEBUG: bool = bool(int(os.getenv("MEMORY_DEBUG", "1")))
 MEMORY_DEBUG_CANDIDATE_EVERY: int = max(1, int(os.getenv("MEMORY_DEBUG_CANDIDATE_EVERY", "1")))
 MEMORY_GUARD_ENABLED: bool = bool(int(os.getenv("MEMORY_GUARD_ENABLED", "1")))
 MEMORY_GUARD_MIN_AVAIL_GB: float = float(os.getenv("MEMORY_GUARD_MIN_AVAIL_GB", "5.0"))
-MEMORY_GUARD_MIN_COMMIT_AVAIL_GB: float = float(os.getenv("MEMORY_GUARD_MIN_COMMIT_AVAIL_GB", "0.0"))
+MEMORY_GUARD_MIN_COMMIT_AVAIL_GB: float = 0.0
 MEMORY_GUARD_MAX_LOAD_PCT: int = int(os.getenv("MEMORY_GUARD_MAX_LOAD_PCT", "88"))
 MEMORY_GUARD_POLL_SEC: float = max(1.0, float(os.getenv("MEMORY_GUARD_POLL_SEC", "5")))
 MEMORY_GUARD_LOG_EVERY_SEC: float = max(5.0, float(os.getenv("MEMORY_GUARD_LOG_EVERY_SEC", "60")))
@@ -485,6 +485,7 @@ MEMORY_GUARD_CANDIDATE_BUDGET_GB: float = float(
 )
 MEMORY_GUARD_BRANCH_BUDGET_GB: float = float(os.getenv("MEMORY_GUARD_BRANCH_BUDGET_GB", "0.6"))
 MEMORY_GUARD_MAX_ACTIVE_ACTIONS: int = max(0, int(os.getenv("MEMORY_GUARD_MAX_ACTIVE_ACTIONS", "0")))
+MEMORY_GUARD_STOP_ON_WAIT: bool = bool(int(os.getenv("MEMORY_GUARD_STOP_ON_WAIT", "1")))
 MEMORY_GUARD_STALE_SEC: float = max(60.0, float(os.getenv("MEMORY_GUARD_STALE_SEC", "21600")))
 MEMORY_GUARD_STATE_FILE: str = os.getenv(
     "MEMORY_GUARD_STATE_FILE",
@@ -500,6 +501,42 @@ MEMORY_GUARD_EMERGENCY_MIN_AVAIL_GB: float = float(
 MEMORY_GUARD_EMERGENCY_MAX_LOAD_PCT: int = int(
     os.getenv("MEMORY_GUARD_EMERGENCY_MAX_LOAD_PCT", "95")
 )
+
+
+class MemoryGuardStop(RuntimeError):
+    """Raised when memory pressure should end the current episode gracefully."""
+
+    def __init__(
+        self,
+        stage: str,
+        reasons: List[str],
+        snap: Dict[str, Any],
+        reserved_budget: int,
+        request_budget: int,
+        active_count: int,
+        extra: Dict[str, Any],
+    ) -> None:
+        self.stage = str(stage)
+        self.reasons = list(reasons)
+        self.snap = dict(snap)
+        self.reserved_budget = int(reserved_budget)
+        self.request_budget = int(request_budget)
+        self.active_count = int(active_count)
+        self.extra = dict(extra)
+        super().__init__(f"memory guard stop at {self.stage}: {','.join(self.reasons)}")
+
+    def to_record(self) -> Dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "reasons": list(self.reasons),
+            "avail_phys_gb": float(self.snap.get("avail_phys", 0)) / (1024.0 ** 3),
+            "commit_avail_gb": float(self.snap.get("system_commit_avail", 0)) / (1024.0 ** 3),
+            "reserved_gb": float(self.reserved_budget) / (1024.0 ** 3),
+            "request_gb": float(self.request_budget) / (1024.0 ** 3),
+            "active": int(self.active_count),
+            "mem_load_pct": int(self.snap.get("memory_load_pct", 0)),
+            "context": dict(self.extra),
+        }
 
 
 if os.name == "nt":
@@ -758,7 +795,7 @@ def _release_memory_guard_reservation(token: str | None) -> None:
 
 
 def _wait_for_memory_headroom(stage: str, reserve_gb: float | None = None, **extra: Any) -> str | None:
-    """Blocks before expensive NX work and reserves estimated memory headroom."""
+    """Reserves estimated memory headroom, or ends the episode on memory pressure."""
     if not MEMORY_GUARD_ENABLED or os.name != "nt":
         return None
     min_avail = int(max(0.0, MEMORY_GUARD_MIN_AVAIL_GB) * (1024.0 ** 3))
@@ -864,13 +901,36 @@ def _wait_for_memory_headroom(stage: str, reserve_gb: float | None = None, **ext
         finally:
             _release_memory_guard_mutex(handle)
 
+        extra_text = " ".join(
+            f"{key}={value}"
+            for key, value in extra.items()
+            if value is not None
+        )
+        if MEMORY_GUARD_STOP_ON_WAIT:
+            print(
+                "[MEM-GUARD] stop "
+                f"stage={stage} reason={','.join(reasons)} "
+                f"avail_phys={_format_gb(snap['avail_phys'])} "
+                f"commit_avail={_format_gb(snap['system_commit_avail'])} "
+                f"reserved={_format_gb(reserved_budget)} "
+                f"request={_format_gb(request_budget)} "
+                f"active={active_count} "
+                f"mem_load={snap['memory_load_pct']}% "
+                f"{extra_text}".rstrip(),
+                flush=True,
+            )
+            raise MemoryGuardStop(
+                stage=stage,
+                reasons=reasons,
+                snap=snap,
+                reserved_budget=reserved_budget,
+                request_budget=request_budget,
+                active_count=active_count,
+                extra=extra,
+            )
+
         now = time.monotonic()
         if last_log <= 0.0 or now - last_log >= MEMORY_GUARD_LOG_EVERY_SEC:
-            extra_text = " ".join(
-                f"{key}={value}"
-                for key, value in extra.items()
-                if value is not None
-            )
             print(
                 "[MEM-GUARD] wait "
                 f"stage={stage} reason={','.join(reasons)} "
@@ -3333,6 +3393,51 @@ def collect_dataset_episode(
         selected_positions = sorted(set(selected_positions), key=lambda idx: float(ordered[idx]["score"]), reverse=True)
         return [ordered[idx] for idx in selected_positions]
 
+    def _append_scored_children_to_depth(
+        scored_rows: List[Dict[str, Any]],
+        depth_children: List[Dict[str, Any]],
+    ) -> None:
+        for scored_child in scored_rows:
+            depth_children.append({
+                "score": float(scored_child["score"]),
+                "row_ref": scored_child["row_ref"],
+                "branch": scored_child["branch"],
+                "candidate_index": int(scored_child["candidate_index"]),
+                "macro": str(scored_child["macro"]),
+                "tool": str(scored_child["tool"]),
+                "action_face": int(scored_child["action_face"]),
+                "removed_volume": float(scored_child["removed_volume"]),
+                "state_volume_after": float(scored_child["state_volume_after"]),
+                "state_removed_ratio_after": float(scored_child["state_removed_ratio_after"]),
+                "state_done_ratio_after": float(scored_child["state_done_ratio_after"]),
+            })
+
+    def _select_and_mark_depth_children(
+        depth_children: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        selected_children = _select_next_children(depth_children)
+        next_branches: List[Dict[str, Any]] = []
+        selected_records: List[Dict[str, Any]] = []
+        for child in selected_children:
+            child_row = child.get("row_ref")
+            if child_row is not None:
+                child_row["is_chosen"] = 1
+            next_branch = child["branch"]
+            next_branches.append(next_branch)
+            selected_records.append({
+                "scenario_id": str(next_branch["id"]),
+                "parent_scenario_id": str(next_branch["parent_id"]),
+                "candidate_index": int(child["candidate_index"]),
+                "macro": str(child["macro"]),
+                "tool": str(child["tool"]),
+                "action_face": int(child["action_face"]),
+                "score": float(child["score"]),
+                "state_volume_after": float(child["state_volume_after"]),
+                "state_removed_ratio_after": float(child["state_removed_ratio_after"]),
+                "state_done_ratio_after": float(child["state_done_ratio_after"]),
+            })
+        return selected_children, next_branches, selected_records
+
     try:
         branches: List[Dict[str, Any]] = [{
             "id": "s0",
@@ -3357,8 +3462,15 @@ def collect_dataset_episode(
                 "branch_records": [],
             }
             done_branch_count = 0
+            memory_guard_stop_exc = None
+            current_scored_for_stop: List[Dict[str, Any]] = []
+            current_scored_added_to_depth = False
+            current_branch_id_for_stop = ""
 
             for bi, branch in enumerate(branches):
+                current_branch_id_for_stop = str(branch["id"])
+                current_scored_for_stop = []
+                current_scored_added_to_depth = False
                 _restore_to_root()
                 replay_ok, replay_error = _replay_history(branch["history"])
                 if not replay_ok:
@@ -3471,6 +3583,7 @@ def collect_dataset_episode(
                 _oct_raw_max = _oct_raw_max + _oct_pad
 
                 scored: List[Dict[str, Any]] = []
+                current_scored_for_stop = scored
                 reject_stats = {"cam_error": 0, "no_effect": 0, "below_min_effect": 0}
                 reject_examples: List[str] = []
 
@@ -3702,20 +3815,8 @@ def collect_dataset_episode(
                         "best_action_face": int(best_for_branch["action_face"]),
                         "best_score": float(best_for_branch["score"]),
                     })
-                    for scored_child in scored:
-                        depth_children.append({
-                            "score": float(scored_child["score"]),
-                            "row_ref": scored_child["row_ref"],
-                            "branch": scored_child["branch"],
-                            "candidate_index": int(scored_child["candidate_index"]),
-                            "macro": str(scored_child["macro"]),
-                            "tool": str(scored_child["tool"]),
-                            "action_face": int(scored_child["action_face"]),
-                            "removed_volume": float(scored_child["removed_volume"]),
-                            "state_volume_after": float(scored_child["state_volume_after"]),
-                            "state_removed_ratio_after": float(scored_child["state_removed_ratio_after"]),
-                            "state_done_ratio_after": float(scored_child["state_done_ratio_after"]),
-                        })
+                    _append_scored_children_to_depth(scored, depth_children)
+                    current_scored_added_to_depth = True
 
                 _log_memory(
                     "branch:after_candidates",
@@ -3739,27 +3840,7 @@ def collect_dataset_episode(
                 termination_reason = reason
                 break
 
-            selected_children = _select_next_children(depth_children)
-            next_branches: List[Dict[str, Any]] = []
-            selected_records: List[Dict[str, Any]] = []
-            for child in selected_children:
-                child_row = child.get("row_ref")
-                if child_row is not None:
-                    child_row["is_chosen"] = 1
-                next_branch = child["branch"]
-                next_branches.append(next_branch)
-                selected_records.append({
-                    "scenario_id": str(next_branch["id"]),
-                    "parent_scenario_id": str(next_branch["parent_id"]),
-                    "candidate_index": int(child["candidate_index"]),
-                    "macro": str(child["macro"]),
-                    "tool": str(child["tool"]),
-                    "action_face": int(child["action_face"]),
-                    "score": float(child["score"]),
-                    "state_volume_after": float(child["state_volume_after"]),
-                    "state_removed_ratio_after": float(child["state_removed_ratio_after"]),
-                    "state_done_ratio_after": float(child["state_done_ratio_after"]),
-                })
+            selected_children, next_branches, selected_records = _select_and_mark_depth_children(depth_children)
 
             print(
                 f"[INFO] t={t}: selected {len(next_branches)} next branches "
@@ -3814,6 +3895,63 @@ def collect_dataset_episode(
             "planned_max_steps": int(planned_decision_steps),
         }
         episode_completed = True
+
+    except MemoryGuardStop as exc:
+        if current_scored_for_stop and not current_scored_added_to_depth:
+            _append_scored_children_to_depth(current_scored_for_stop, depth_children)
+            current_scored_added_to_depth = True
+
+        if depth_children:
+            selected_children, next_branches, selected_records = _select_and_mark_depth_children(depth_children)
+            selected_removed_mean = float(np.mean([float(x["removed_volume"]) for x in selected_children])) if selected_children else 0.0
+            selected_removed_ratio_mean = float(np.mean([float(x["state_removed_ratio_after"]) for x in selected_children])) if selected_children else 0.0
+            selected_done_ratio_mean = float(np.mean([float(x["state_done_ratio_after"]) for x in selected_children])) if selected_children else 0.0
+            if last_selected_removed_ratio is None:
+                selected_removed_ratio_gain = 0.0
+            else:
+                selected_removed_ratio_gain = float(selected_removed_ratio_mean - last_selected_removed_ratio)
+        else:
+            selected_children, next_branches, selected_records = [], [], []
+            selected_removed_mean = 0.0
+            selected_removed_ratio_mean = 0.0
+            selected_done_ratio_mean = 0.0
+            selected_removed_ratio_gain = 0.0
+
+        depth_record["branch_records"].append({
+            "scenario_id": str(current_branch_id_for_stop),
+            "stopped": True,
+            "reason": "memory_guard_stop",
+            "num_effective_partial": int(len(current_scored_for_stop)),
+            "memory_guard": exc.to_record(),
+        })
+        depth_record.update({
+            "stopped": True,
+            "reason": "memory_guard_stop",
+            "memory_guard": exc.to_record(),
+            "num_effective_transitions": int(len(depth_children)),
+            "num_next_branches": int(len(next_branches)),
+            "beam_width": int(BEAM_WIDTH),
+            "sampled_branches": int(SAMPLED_BRANCHES),
+            "selected_branches": selected_records,
+            "selected_removed_mean": float(selected_removed_mean),
+            "selected_removed_ratio_mean": float(selected_removed_ratio_mean),
+            "selected_removed_ratio_gain": float(selected_removed_ratio_gain),
+            "selected_done_ratio_mean": float(selected_done_ratio_mean),
+            "no_effect_streak": int(no_effect_streak),
+        })
+        episode_record["steps"].append(depth_record)
+        episode_record["termination"] = {
+            "reason": "memory_guard_stop",
+            "executed_steps": int(len(episode_record["steps"])),
+            "planned_max_steps": int(planned_decision_steps),
+        }
+        episode_completed = True
+        print(
+            f"[INFO] stop: memory_guard_stop t={t} "
+            f"stage={exc.stage} reason={','.join(exc.reasons)} "
+            f"effective_partial={len(depth_children)}",
+            flush=True,
+        )
 
     except Exception as exc:
         _save_fatal_error_part("episode", exc)

@@ -59,9 +59,9 @@ def _global_parquet_run_name_from_folder(part_name: str, run_name: str) -> str:
         return run_name
     suffix = run_name[len(prefix):]
     parts = suffix.split("_")
-    # create_run_output_dir uses YYYYMMDD_HHMMSS_microseconds[_pc].
-    if len(parts) >= 4 and parts[0].isdigit() and parts[1].isdigit() and parts[2].isdigit():
-        return prefix + "_".join(parts[:3])
+    # create_run_output_dir uses YYYYMMDD_HHMMSS[_pc].
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        return prefix + "_".join(parts[:2])
     return run_name
 
 
