@@ -1,6 +1,8 @@
 """Parallel runner for large-scale axis dataset collection on shared storage."""
 
 import argparse
+import ctypes
+import ctypes.wintypes as wintypes
 import glob
 import json
 import multiprocessing
@@ -14,12 +16,67 @@ import time
 PYTHON_EXE = sys.executable
 WORKER_SCRIPT = "collect_axis_dataset.py"
 PC_NAME = "615"
+WORKER_JOB_CLEANUP = os.getenv("WORKER_JOB_CLEANUP", "1") != "0"
 
 # Shared network paths for distributed collection machines.
 SHARED_BASE_DIR = r"Y:\04_개별폴더\22. 통합과정 오인욱"
 SHARED_INPUT_DIR = os.path.join(SHARED_BASE_DIR, "prt_dataset")
 SHARED_OUTPUT_DIR = os.path.join(SHARED_BASE_DIR, "sdf_dataset_out")
 CURRENT_SEED = 0
+
+
+if os.name == "nt":
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_uint64),
+            ("WriteOperationCount", ctypes.c_uint64),
+            ("OtherOperationCount", ctypes.c_uint64),
+            ("ReadTransferCount", ctypes.c_uint64),
+            ("WriteTransferCount", ctypes.c_uint64),
+            ("OtherTransferCount", ctypes.c_uint64),
+        ]
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    _kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    _kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        wintypes.INT,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    _kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 
 
 def _is_completed_run_dir(run_dir: str) -> bool:
@@ -115,6 +172,81 @@ def _safe_name_component(text: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(text)).strip("._-")
 
 
+def _format_last_error() -> str:
+    err = ctypes.get_last_error()
+    if not err:
+        return "unknown error"
+    return f"WinError {err}"
+
+
+def _create_worker_cleanup_job():
+    """Creates a Windows job that kills leftover child processes on close."""
+    if os.name != "nt" or not WORKER_JOB_CLEANUP:
+        return None
+    job = _kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise OSError(_format_last_error())
+    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    ok = _kernel32.SetInformationJobObject(
+        job,
+        _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    )
+    if not ok:
+        _kernel32.CloseHandle(job)
+        raise OSError(_format_last_error())
+    return job
+
+
+def _assign_process_to_cleanup_job(job, proc: subprocess.Popen) -> bool:
+    if os.name != "nt" or not job:
+        return False
+    process_handle = wintypes.HANDLE(int(proc._handle))  # noqa: SLF001 - Windows Popen handle
+    ok = _kernel32.AssignProcessToJobObject(job, process_handle)
+    if not ok:
+        raise OSError(_format_last_error())
+    return True
+
+
+def _close_worker_cleanup_job(job) -> None:
+    if os.name == "nt" and job:
+        _kernel32.CloseHandle(job)
+
+
+def _run_worker_subprocess(cmd: list[str], log_f, env: dict[str, str]) -> subprocess.CompletedProcess:
+    """Runs one dataset worker and cleans up any child process tree leftovers."""
+    if os.name != "nt" or not WORKER_JOB_CLEANUP:
+        return subprocess.run(cmd, check=False, stdout=log_f, stderr=log_f, env=env)
+
+    job = None
+    proc = None
+    assigned_to_job = False
+    try:
+        try:
+            job = _create_worker_cleanup_job()
+        except Exception as exc:
+            print(f"[Warn] Worker cleanup job disabled: {exc}", file=log_f, flush=True)
+
+        proc = subprocess.Popen(cmd, stdout=log_f, stderr=log_f, env=env)
+        if job:
+            try:
+                assigned_to_job = _assign_process_to_cleanup_job(job, proc)
+            except Exception as exc:
+                print(f"[Warn] Failed to assign worker to cleanup job: {exc}", file=log_f, flush=True)
+        returncode = proc.wait()
+        return subprocess.CompletedProcess(cmd, returncode)
+    finally:
+        # Closing a kill-on-job-close job releases any NX helper processes that
+        # survived after collect_axis_dataset.py itself exited.
+        if assigned_to_job:
+            print("[Info] Closing worker cleanup job", file=log_f, flush=True)
+        _close_worker_cleanup_job(job)
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+
+
 def process_file_safe(file_info: tuple[str, str, str]) -> None:
     """Processes one part with lock-file protection to avoid duplicate work."""
     prt_path, output_dir, pc_name = file_info
@@ -162,7 +294,7 @@ def process_file_safe(file_info: tuple[str, str, str]) -> None:
         if pc_slug:
             env["PC_NAME"] = pc_slug
         with open(log_path, "w", encoding="utf-8") as log_f:
-            result = subprocess.run(cmd, check=False, stdout=log_f, stderr=log_f, env=env)
+            result = _run_worker_subprocess(cmd, log_f=log_f, env=env)
         if result.returncode != 0:
             print(f"[Error] {part_name} failed (rc={result.returncode}), see {log_path}")
         else:
