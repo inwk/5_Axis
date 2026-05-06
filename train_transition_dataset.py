@@ -35,11 +35,14 @@ VAL_SPLIT_NAME = os.getenv("PILOT_VAL_SPLIT", "val")
 VAL_RATIO = 0.2
 SEED = 0
 
-BATCH_SIZE = 4
+BATCH_SIZE = 1
 NUM_WORKERS = 0
-NUM_EPOCHS = 50
+NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
 PRINT_EVERY = 1
+TRAIN_LOG_EVERY_BATCHES = 50
+MAX_TRAIN_BATCHES_PER_EPOCH = 0  # 0 = use all train batches
+MAX_VAL_BATCHES = 64             # cap pilot validation cost/memory churn
 
 # Optional StateEncoder initialization from SSL pretraining.
 # Set this to ssl_pretraining/train_state_encoder_ssl.py's best.pt.
@@ -49,7 +52,7 @@ FREEZE_STATE_ENCODER = False
 STATE_ENCODER_LR_MULTIPLIER = 1.0
 
 # For batched training this should stay fixed and positive.
-OCTREE_QUERY_NODES = 2048
+OCTREE_QUERY_NODES = 512
 OCTREE_POS_WEIGHT_FACTOR = 2.0
 OCTREE_DEPTH_WEIGHT_BASE = 2.0
 MONOTONICITY_WEIGHT = 0.1
@@ -57,6 +60,20 @@ MONOTONICITY_WEIGHT = 0.1
 SAVE_CHECKPOINTS = True
 CHECKPOINT_ROOT = r"C:\Users\inwoo\Desktop\5_Axis\checkpoints_transition"
 RUN_NAME = os.getenv("RUN_NAME", "")
+
+
+def _cuda_memory_text() -> str:
+    """Returns a compact CUDA memory summary for progress logs."""
+    if not torch.cuda.is_available():
+        return "cuda=n/a"
+    allocated = torch.cuda.memory_allocated() / (1024.0 ** 3)
+    reserved = torch.cuda.memory_reserved() / (1024.0 ** 3)
+    peak = torch.cuda.max_memory_allocated() / (1024.0 ** 3)
+    return f"cuda_alloc={allocated:.2f}GB cuda_reserved={reserved:.2f}GB cuda_peak={peak:.2f}GB"
+
+
+def _is_cuda_oom(exc: RuntimeError) -> bool:
+    return "out of memory" in str(exc).lower() and "cuda" in str(exc).lower()
 
 
 def set_seed(seed: int) -> None:
@@ -262,7 +279,7 @@ def _build_optimizer(
 
 
 @torch.no_grad()
-def _evaluate_octree_accuracy(model: GraphSdfPlanningModel, batch: dict, device: torch.device) -> float:
+def _evaluate_octree_metrics(model: GraphSdfPlanningModel, batch: dict, device: torch.device) -> dict[str, float]:
     model.eval()
     state_embedding = model.encode_state(
         state_points=batch["state_points"].to(device),
@@ -292,9 +309,19 @@ def _evaluate_octree_accuracy(model: GraphSdfPlanningModel, batch: dict, device:
         point_mask=batch.get("point_mask").to(device) if batch.get("point_mask") is not None else None,
         state_embedding=state_embedding,
     )
-    pred = (torch.sigmoid(out["occ_logits"]) >= 0.5).float()
+    prob = torch.sigmoid(out["occ_logits"])
+    pred = (prob >= 0.5).float()
     gt = batch["octree_occ_labels"].to(device)
-    return float((pred == gt).float().mean().item())
+    metrics = {
+        "acc": float((pred == gt).float().mean().item()),
+        "pred_pos": float(pred.mean().item()),
+        "gt_pos": float(gt.mean().item()),
+        "prob_mean": float(prob.mean().item()),
+    }
+    if batch.get("octree_occ_labels_before") is not None:
+        before = batch["octree_occ_labels_before"].to(device)
+        metrics["mono_viol"] = float((pred > before).float().mean().item())
+    return metrics
 
 
 def _make_run_dir() -> Path | None:
@@ -330,6 +357,13 @@ def _save_checkpoint(
         },
         path,
     )
+
+
+def _limited_batches(loader, max_batches: int):
+    for batch_idx, batch in enumerate(loader, start=1):
+        if max_batches > 0 and batch_idx > max_batches:
+            break
+        yield batch_idx, batch
 
 
 def main() -> None:
@@ -418,6 +452,8 @@ def main() -> None:
                 "batch_size": BATCH_SIZE,
                 "num_workers": NUM_WORKERS,
                 "num_epochs": NUM_EPOCHS,
+                "max_train_batches_per_epoch": MAX_TRAIN_BATCHES_PER_EPOCH,
+                "max_val_batches": MAX_VAL_BATCHES,
                 "learning_rate": LEARNING_RATE,
                 "octree_query_nodes": int(OCTREE_QUERY_NODES),
                 "octree_pos_weight_factor": OCTREE_POS_WEIGHT_FACTOR,
@@ -439,6 +475,10 @@ def main() -> None:
     print(f"[Rows] train={len(train_indices)} val={len(val_indices)}")
     print(f"[Train] epochs={NUM_EPOCHS} lr={LEARNING_RATE} batch={BATCH_SIZE} octree_query_nodes={OCTREE_QUERY_NODES}")
     print(
+        f"[Pilot Limits] max_train_batches={MAX_TRAIN_BATCHES_PER_EPOCH or 'all'} "
+        f"max_val_batches={MAX_VAL_BATCHES or 'all'}"
+    )
+    print(
         f"[Encoder] pretrained={bool(PRETRAINED_ENCODER_CHECKPOINT.strip())} "
         f"freeze={FREEZE_STATE_ENCODER} lr_multiplier={STATE_ENCODER_LR_MULTIPLIER}"
     )
@@ -451,35 +491,71 @@ def main() -> None:
     print(f"[Val Macro Dist] { _macro_distribution(macro_val_dataset, val_indices) }")
     if run_dir is not None:
         print(f"[Checkpoint Dir] {run_dir}")
+    print(f"[Memory] {_cuda_memory_text()}")
 
     best_val_loss = float("inf")
     first_val_batch = next(iter(val_loader)) if len(val_dataset) > 0 else None
 
     for epoch in range(1, NUM_EPOCHS + 1):
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         train_losses = []
-        for batch in train_loader:
-            loss = transition_train_step(
-                model,
-                batch,
-                optimizer,
-                device,
-                octree_pos_weight_factor=OCTREE_POS_WEIGHT_FACTOR,
-                octree_depth_weight_base=OCTREE_DEPTH_WEIGHT_BASE,
-                monotonicity_weight=MONOTONICITY_WEIGHT,
-            )
+        for batch_idx, batch in _limited_batches(train_loader, MAX_TRAIN_BATCHES_PER_EPOCH):
+            try:
+                loss = transition_train_step(
+                    model,
+                    batch,
+                    optimizer,
+                    device,
+                    octree_pos_weight_factor=OCTREE_POS_WEIGHT_FACTOR,
+                    octree_depth_weight_base=OCTREE_DEPTH_WEIGHT_BASE,
+                    monotonicity_weight=MONOTONICITY_WEIGHT,
+                )
+            except RuntimeError as exc:
+                if _is_cuda_oom(exc):
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    print(
+                        "[OOM] CUDA ran out of memory during training. "
+                        "Reduce BATCH_SIZE first, then OCTREE_QUERY_NODES. "
+                        f"Current batch={BATCH_SIZE} octree_query_nodes={OCTREE_QUERY_NODES} "
+                        f"{_cuda_memory_text()}",
+                        flush=True,
+                    )
+                raise
             train_losses.append(loss)
+            if TRAIN_LOG_EVERY_BATCHES > 0 and batch_idx % TRAIN_LOG_EVERY_BATCHES == 0:
+                print(
+                    f"[Epoch {epoch:04d} Batch {batch_idx:05d}] "
+                    f"loss={float(loss):.6f} {_cuda_memory_text()}",
+                    flush=True,
+                )
 
-        val_losses = [
-            transition_validation_step(
-                model,
-                batch,
-                device,
-                octree_pos_weight_factor=OCTREE_POS_WEIGHT_FACTOR,
-                octree_depth_weight_base=OCTREE_DEPTH_WEIGHT_BASE,
-                monotonicity_weight=MONOTONICITY_WEIGHT,
-            )
-            for batch in val_loader
-        ]
+        val_losses = []
+        for _, batch in _limited_batches(val_loader, MAX_VAL_BATCHES):
+            try:
+                val_losses.append(
+                    transition_validation_step(
+                        model,
+                        batch,
+                        device,
+                        octree_pos_weight_factor=OCTREE_POS_WEIGHT_FACTOR,
+                        octree_depth_weight_base=OCTREE_DEPTH_WEIGHT_BASE,
+                        monotonicity_weight=MONOTONICITY_WEIGHT,
+                    )
+                )
+            except RuntimeError as exc:
+                if _is_cuda_oom(exc):
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    print(
+                        "[OOM] CUDA ran out of memory during validation. "
+                        "Reduce MAX_VAL_BATCHES, BATCH_SIZE, or OCTREE_QUERY_NODES. "
+                        f"Current max_val_batches={MAX_VAL_BATCHES} batch={BATCH_SIZE} "
+                        f"octree_query_nodes={OCTREE_QUERY_NODES} {_cuda_memory_text()}",
+                        flush=True,
+                    )
+                raise
 
         train_loss = float(sum(train_losses) / max(len(train_losses), 1))
         val_loss = float(sum(val_losses) / max(len(val_losses), 1))
@@ -509,9 +585,19 @@ def main() -> None:
         if epoch == 1 or epoch % PRINT_EVERY == 0 or epoch == NUM_EPOCHS:
             log = f"[Epoch {epoch:04d}] train={train_loss:.6f} val={val_loss:.6f}"
             if first_val_batch is not None:
-                oct_acc = _evaluate_octree_accuracy(model, first_val_batch, device)
-                log += f" val_octree_acc(sample_batch)={oct_acc:.4f}"
+                metrics = _evaluate_octree_metrics(model, first_val_batch, device)
+                log += (
+                    f" val_octree_acc(sample_batch)={metrics['acc']:.4f}"
+                    f" pred_pos={metrics['pred_pos']:.4f}"
+                    f" gt_pos={metrics['gt_pos']:.4f}"
+                    f" prob_mean={metrics['prob_mean']:.4f}"
+                )
+                if "mono_viol" in metrics:
+                    log += f" mono_viol={metrics['mono_viol']:.4f}"
+            log += f" {_cuda_memory_text()}"
             print(log)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     print("[Done] transition-only dataset training finished.")
 
