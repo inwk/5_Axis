@@ -19,6 +19,8 @@ No CLI arguments are required.
 
 from __future__ import annotations
 
+import json
+import os
 import random
 from dataclasses import replace
 from pathlib import Path
@@ -41,8 +43,9 @@ from graph_sdf.training import (
 # ── Mode selection ───────────────────────────────────────────────────────────
 # Set exactly one of PARQUET_PATH (overfit) or PARQUET_DIR (full training).
 # ---------------------------------------------------------------------------
-PARQUET_PATH = r"Y:\04_개별폴더\22. 통합과정 오인욱\sdf_dataset_out\3dDataset0055_seed0_20260415_204610\3dDataset0055_seed0_process_skeleton_dataset.parquet"
+PARQUET_PATH = r""
 PARQUET_DIR  = r""          # e.g. r"Y:\...\sdf_dataset_out"  ← set this for full training
+SPLIT_MANIFEST_PATH = os.getenv("PILOT_SPLIT_MANIFEST", r"")
 
 # ---------------------------------------------------------------------------
 # ── Overfit-mode config ──────────────────────────────────────────────────────
@@ -121,6 +124,25 @@ def _resolve_row_index(parquet_path: str, use_first_chosen_row: bool, row_index:
     if row_index < 0 or row_index >= len(df):
         raise IndexError(f"ROW_INDEX={row_index} is out of range for parquet with {len(df)} rows.")
     return int(row_index)
+
+
+def _resolve_overfit_source() -> tuple[str, int]:
+    """Resolves the overfit parquet row from an explicit path or pilot manifest."""
+    if SPLIT_MANIFEST_PATH.strip():
+        manifest_path = Path(SPLIT_MANIFEST_PATH).expanduser().resolve()
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        sample = payload.get("overfit_sample")
+        if not isinstance(sample, dict):
+            raise KeyError(f"Manifest has no overfit_sample: {manifest_path}")
+        parquet_path = str(Path(str(sample["parquet_path"])).expanduser().resolve())
+        row_index = int(sample.get("row_index", 0))
+        return parquet_path, row_index
+
+    if not PARQUET_PATH:
+        raise ValueError("Set PARQUET_PATH or SPLIT_MANIFEST_PATH for overfit mode.")
+    parquet_path = str(Path(PARQUET_PATH).expanduser().resolve())
+    row_index = _resolve_row_index(parquet_path, USE_FIRST_CHOSEN_ROW, ROW_INDEX)
+    return parquet_path, row_index
 
 
 def _scan_parquet_files(parquet_dir: str) -> list[Path]:
@@ -287,10 +309,7 @@ def main() -> None:
 
     else:
         # ── OVERFIT: single file, single row, repeated ────────────────────
-        if not PARQUET_PATH:
-            raise ValueError("Set PARQUET_PATH (overfit) or PARQUET_DIR (full training) at the top.")
-        parquet_path = str(Path(PARQUET_PATH).expanduser().resolve())
-        source_row_index = _resolve_row_index(parquet_path, USE_FIRST_CHOSEN_ROW, ROW_INDEX)
+        parquet_path, source_row_index = _resolve_overfit_source()
         base_dataset = ProcessSkeletonParquetDataset(
             [parquet_path], octree_query_nodes=OCTREE_QUERY_NODES
         )

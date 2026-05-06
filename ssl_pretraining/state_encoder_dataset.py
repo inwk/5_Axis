@@ -13,20 +13,37 @@ from torch.utils.data import Dataset
 class StateEncoderSslParquetDataset(Dataset):
     """Loads only the columns required for StateEncoder SSL pretraining."""
 
-    REQUIRED_COLUMNS = ["state_points", "node_mask", "point_mask"]
+    REQUIRED_COLUMNS: list[str] = []
     OPTIONAL_COLUMNS = [
+        "state_points",
+        "static_feature_dir",
+        "normalization_scale",
+        "state_point_sdf_raw_512x100",
+        "node_mask",
+        "point_mask",
         "node_process_state",
         "centrality_512",
         "spatial_pos_512x512",
         "face_area_512x1",
         "face_type_512",
     ]
+    _STATIC_FEATURE_FILES = {
+        "face_pc": "embed_face_pc.npy",
+        "face_normal": "embed_face_normal.npy",
+        "node_mask": "embed_node_mask.npy",
+        "point_mask": "embed_point_mask.npy",
+        "centrality_512": "embed_centrality.npy",
+        "spatial_pos_512x512": "embed_spatial_pos.npy",
+        "face_area_512x1": "embed_face_area.npy",
+        "face_type_512": "embed_face_type.npy",
+    }
 
     def __init__(self, parquet_files: list[str]) -> None:
         frames = [self._read_needed_columns(path) for path in parquet_files]
         self.df = pd.concat(frames, ignore_index=True)
         if self.df.empty:
             raise ValueError("StateEncoder SSL dataset has no rows.")
+        self._static_feature_cache: dict[str, dict[str, np.ndarray]] = {}
 
     @staticmethod
     def _read_needed_columns(path: str) -> pd.DataFrame:
@@ -86,6 +103,34 @@ class StateEncoderSslParquetDataset(Dataset):
             return True
         return False
 
+    def _resolve_static_feature_dir(self, row) -> str | None:
+        if "static_feature_dir" not in row.index:
+            return None
+        raw_value = row["static_feature_dir"]
+        if self._is_missing(raw_value):
+            return None
+        return str(Path(str(raw_value)).expanduser().resolve())
+
+    def _load_static_feature(self, row, key: str, dtype) -> np.ndarray:
+        static_dir = self._resolve_static_feature_dir(row)
+        if static_dir is None:
+            raise KeyError(f"Row is missing static_feature_dir for static feature '{key}'")
+        if key not in self._STATIC_FEATURE_FILES:
+            raise KeyError(f"Unsupported static feature key: {key}")
+
+        cache = self._static_feature_cache.setdefault(static_dir, {})
+        if key not in cache:
+            path = Path(static_dir) / self._STATIC_FEATURE_FILES[key]
+            if not path.exists():
+                raise FileNotFoundError(f"Static feature file not found: {path}")
+            cache[key] = np.load(path, allow_pickle=False)
+        return np.asarray(cache[key], dtype=dtype)
+
+    def _row_array_or_static(self, row, row_key: str, static_key: str, dtype) -> np.ndarray:
+        if row_key in row.index and not self._is_missing(row[row_key]):
+            return self._array(row[row_key], dtype)
+        return self._load_static_feature(row, static_key, dtype=dtype)
+
     @staticmethod
     def _optional_array(value, dtype, default_shape: tuple[int, ...]) -> np.ndarray:
         if StateEncoderSslParquetDataset._is_missing(value):
@@ -97,11 +142,26 @@ class StateEncoderSslParquetDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         row = self.df.iloc[int(index)]
-        state_points = self._array(row["state_points"], np.float32).reshape(512, 100, 7)
+        if "state_points" in row.index and not self._is_missing(row["state_points"]):
+            state_points = self._array(row["state_points"], np.float32).reshape(512, 100, 7)
+        else:
+            face_pc = self._load_static_feature(row, "face_pc", dtype=np.float32).reshape(512, 100, 3)
+            face_normal = self._load_static_feature(row, "face_normal", dtype=np.float32).reshape(512, 3)
+            point_sdf_raw = self._optional_array(
+                row["state_point_sdf_raw_512x100"] if "state_point_sdf_raw_512x100" in row.index else None,
+                np.float32,
+                (512, 100),
+            ).reshape(512, 100)
+            scale = float(row["normalization_scale"]) if "normalization_scale" in row.index and not self._is_missing(row["normalization_scale"]) else 1.0
+            scale = max(scale, 1e-6)
+            state_points = np.zeros((512, 100, 7), dtype=np.float32)
+            state_points[:, :, 0:3] = face_pc
+            state_points[:, :, 3:6] = np.broadcast_to(face_normal[:, None, :], (512, 100, 3))
+            state_points[:, :, 6] = point_sdf_raw / scale
         num_nodes = int(state_points.shape[0])
         points_per_node = int(state_points.shape[1])
-        node_mask = self._array(row["node_mask"], np.int16).reshape(num_nodes).astype(np.bool_)
-        point_mask = self._array(row["point_mask"], np.int16).reshape(num_nodes, points_per_node).astype(np.bool_)
+        node_mask = self._row_array_or_static(row, "node_mask", "node_mask", np.int16).reshape(num_nodes).astype(np.bool_)
+        point_mask = self._row_array_or_static(row, "point_mask", "point_mask", np.int16).reshape(num_nodes, points_per_node).astype(np.bool_)
         batch = {
             "state_points": torch.from_numpy(state_points),
             "node_mask": torch.from_numpy(node_mask),
@@ -112,20 +172,20 @@ class StateEncoderSslParquetDataset(Dataset):
             batch["node_process_state"] = torch.from_numpy(
                 self._optional_array(row["node_process_state"], np.float32, (num_nodes, 2)).reshape(num_nodes, 2)
             )
-        if "centrality_512" in row.index:
-            centrality = self._array(row["centrality_512"], np.int16).reshape(num_nodes)
+        if "centrality_512" in row.index or self._resolve_static_feature_dir(row) is not None:
+            centrality = self._row_array_or_static(row, "centrality_512", "centrality_512", np.int16).reshape(num_nodes)
             batch["centrality_512"] = torch.from_numpy(centrality)
             batch["node_centrality"] = batch["centrality_512"]
-        if "spatial_pos_512x512" in row.index:
-            spatial_pos = self._array(row["spatial_pos_512x512"], np.int16).reshape(num_nodes, num_nodes)
+        if "spatial_pos_512x512" in row.index or self._resolve_static_feature_dir(row) is not None:
+            spatial_pos = self._row_array_or_static(row, "spatial_pos_512x512", "spatial_pos_512x512", np.int16).reshape(num_nodes, num_nodes)
             batch["spatial_pos_512x512"] = torch.from_numpy(spatial_pos)
             batch["spatial_pos"] = batch["spatial_pos_512x512"]
-        if "face_area_512x1" in row.index:
-            face_area = self._array(row["face_area_512x1"], np.float32).reshape(num_nodes, 1)
+        if "face_area_512x1" in row.index or self._resolve_static_feature_dir(row) is not None:
+            face_area = self._row_array_or_static(row, "face_area_512x1", "face_area_512x1", np.float32).reshape(num_nodes, 1)
             batch["face_area_512x1"] = torch.from_numpy(face_area)
             batch["face_area"] = batch["face_area_512x1"]
-        if "face_type_512" in row.index:
-            face_type = self._array(row["face_type_512"], np.int16).reshape(num_nodes)
+        if "face_type_512" in row.index or self._resolve_static_feature_dir(row) is not None:
+            face_type = self._row_array_or_static(row, "face_type_512", "face_type_512", np.int16).reshape(num_nodes)
         else:
             face_type = np.zeros((num_nodes,), dtype=np.int16)
         batch["face_type_512"] = torch.from_numpy(face_type)

@@ -7,6 +7,7 @@ No CLI arguments are required.
 from __future__ import annotations
 
 import json
+import os
 import random
 import sys
 from dataclasses import asdict
@@ -43,6 +44,8 @@ PARQUET_DIR = r""
 # Use "**/*.parquet" to include run subdirectories under PARQUET_DIR.
 PARQUET_GLOB = "**/*.parquet"
 EXPLICIT_PARQUET_PATHS: list[str] = []
+SPLIT_MANIFEST_PATH = os.getenv("PILOT_SPLIT_MANIFEST", r"")
+SPLIT_NAME = os.getenv("PILOT_SSL_SPLIT", "train")
 
 VAL_RATIO = 0.2
 SEED = 0
@@ -65,7 +68,7 @@ MASK_FACE_AREA = True
 # SDF_LOSS_WEIGHT=0.0 unless you are training on CAM/parquet state data.
 TYPE_LOSS_WEIGHT = 1.0
 NORMAL_LOSS_WEIGHT = 1.0
-SDF_LOSS_WEIGHT = 0.0
+SDF_LOSS_WEIGHT = 0.3
 AREA_LOSS_WEIGHT = 0.3
 EDGE_LOSS_WEIGHT = 0.5
 
@@ -84,7 +87,7 @@ FACE_TYPE_LOW_ACC_THRESHOLD = 0.60
 
 SAVE_CHECKPOINTS = True
 CHECKPOINT_ROOT = r"C:\Users\inwoo\Desktop\5_Axis\checkpoints_state_encoder_ssl"
-RUN_NAME = ""
+RUN_NAME = os.getenv("RUN_NAME", "")
 
 
 def set_seed(seed: int) -> None:
@@ -211,15 +214,32 @@ def _save_checkpoint(
     )
 
 
+def _load_manifest_files(manifest_path: str, split_name: str) -> list[str]:
+    path = Path(manifest_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"SPLIT_MANIFEST_PATH not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    splits = payload.get("splits", {})
+    if split_name not in splits:
+        raise KeyError(f"Split {split_name!r} not found in manifest: {path}")
+    files = [str(Path(p).expanduser().resolve()) for p in splits[split_name]]
+    if not files:
+        raise ValueError(f"Manifest split {split_name!r} has no parquet files: {path}")
+    return files
+
+
 def main() -> None:
     set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    parquet_files = resolve_parquet_files(
-        parquet_dir=PARQUET_DIR,
-        parquet_glob=PARQUET_GLOB,
-        explicit_parquet_paths=EXPLICIT_PARQUET_PATHS,
-        caller_name="ssl_pretraining/train_state_encoder_ssl.py",
-    )
+    if SPLIT_MANIFEST_PATH.strip():
+        parquet_files = _load_manifest_files(SPLIT_MANIFEST_PATH, SPLIT_NAME)
+    else:
+        parquet_files = resolve_parquet_files(
+            parquet_dir=PARQUET_DIR,
+            parquet_glob=PARQUET_GLOB,
+            explicit_parquet_paths=EXPLICIT_PARQUET_PATHS,
+            caller_name="ssl_pretraining/train_state_encoder_ssl.py",
+        )
 
     dataset = StateEncoderSslParquetDataset(parquet_files)
     train_indices, val_indices = split_indices(len(dataset), VAL_RATIO, SEED)
@@ -272,6 +292,8 @@ def main() -> None:
             run_dir / "run_config.json",
             {
                 "parquet_files": parquet_files,
+                "split_manifest_path": SPLIT_MANIFEST_PATH,
+                "split_name": SPLIT_NAME,
                 "seed": SEED,
                 "val_ratio": VAL_RATIO,
                 "batch_size": BATCH_SIZE,

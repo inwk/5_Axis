@@ -7,6 +7,7 @@ No CLI args are required.
 from __future__ import annotations
 
 import json
+import os
 import random
 from dataclasses import asdict, replace
 from datetime import datetime
@@ -27,6 +28,9 @@ PARQUET_DIR = r""
 # Use "**/*.parquet" to include run subdirectories under PARQUET_DIR.
 PARQUET_GLOB = "**/*.parquet"
 EXPLICIT_PARQUET_PATHS: list[str] = []
+SPLIT_MANIFEST_PATH = os.getenv("PILOT_SPLIT_MANIFEST", r"")
+TRAIN_SPLIT_NAME = os.getenv("PILOT_TRAIN_SPLIT", "train")
+VAL_SPLIT_NAME = os.getenv("PILOT_VAL_SPLIT", "val")
 
 VAL_RATIO = 0.2
 SEED = 0
@@ -39,7 +43,7 @@ PRINT_EVERY = 1
 
 # Optional StateEncoder initialization from SSL pretraining.
 # Set this to ssl_pretraining/train_state_encoder_ssl.py's best.pt.
-PRETRAINED_ENCODER_CHECKPOINT = r""
+PRETRAINED_ENCODER_CHECKPOINT = os.getenv("PRETRAINED_ENCODER_CHECKPOINT", r"")
 PRETRAINED_ENCODER_STRICT = True
 FREEZE_STATE_ENCODER = False
 STATE_ENCODER_LR_MULTIPLIER = 1.0
@@ -52,7 +56,7 @@ MONOTONICITY_WEIGHT = 0.1
 
 SAVE_CHECKPOINTS = True
 CHECKPOINT_ROOT = r"C:\Users\inwoo\Desktop\5_Axis\checkpoints_transition"
-RUN_NAME = ""
+RUN_NAME = os.getenv("RUN_NAME", "")
 
 
 def set_seed(seed: int) -> None:
@@ -86,6 +90,23 @@ def _resolve_parquet_files() -> list[str]:
     if not unique_files:
         raise ValueError("No parquet files matched the configured paths.")
     return unique_files
+
+
+def _load_manifest_files(manifest_path: str, split_name: str) -> list[str]:
+    path = Path(manifest_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"SPLIT_MANIFEST_PATH not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    splits = payload.get("splits", {})
+    if split_name not in splits:
+        raise KeyError(f"Split {split_name!r} not found in manifest: {path}")
+    files = [str(Path(p).expanduser().resolve()) for p in splits[split_name]]
+    if not files:
+        raise ValueError(f"Manifest split {split_name!r} has no parquet files: {path}")
+    for file_path in files:
+        if not Path(file_path).exists():
+            raise FileNotFoundError(f"Parquet file from manifest not found: {file_path}")
+    return files
 
 
 def _build_valid_transition_indices(dataset: ProcessSkeletonParquetDataset) -> list[int]:
@@ -318,13 +339,27 @@ def main() -> None:
         raise ValueError("BATCH_SIZE must be positive.")
 
     set_seed(SEED)
-    parquet_files = _resolve_parquet_files()
-    base_dataset = ProcessSkeletonParquetDataset(parquet_files, octree_query_nodes=int(OCTREE_QUERY_NODES))
-    valid_indices = _build_valid_transition_indices(base_dataset)
-    train_indices, val_indices = _split_indices(valid_indices, VAL_RATIO, SEED)
-
-    train_dataset: Dataset = Subset(base_dataset, train_indices)
-    val_dataset: Dataset = Subset(base_dataset, val_indices)
+    if SPLIT_MANIFEST_PATH.strip():
+        train_files = _load_manifest_files(SPLIT_MANIFEST_PATH, TRAIN_SPLIT_NAME)
+        val_files = _load_manifest_files(SPLIT_MANIFEST_PATH, VAL_SPLIT_NAME)
+        parquet_files = train_files + val_files
+        train_base_dataset = ProcessSkeletonParquetDataset(train_files, octree_query_nodes=int(OCTREE_QUERY_NODES))
+        val_base_dataset = ProcessSkeletonParquetDataset(val_files, octree_query_nodes=int(OCTREE_QUERY_NODES))
+        train_indices = _build_valid_transition_indices(train_base_dataset)
+        val_indices = _build_valid_transition_indices(val_base_dataset)
+        train_dataset: Dataset = Subset(train_base_dataset, train_indices)
+        val_dataset: Dataset = Subset(val_base_dataset, val_indices)
+        macro_train_dataset = train_base_dataset
+        macro_val_dataset = val_base_dataset
+    else:
+        parquet_files = _resolve_parquet_files()
+        base_dataset = ProcessSkeletonParquetDataset(parquet_files, octree_query_nodes=int(OCTREE_QUERY_NODES))
+        valid_indices = _build_valid_transition_indices(base_dataset)
+        train_indices, val_indices = _split_indices(valid_indices, VAL_RATIO, SEED)
+        train_dataset = Subset(base_dataset, train_indices)
+        val_dataset = Subset(base_dataset, val_indices)
+        macro_train_dataset = base_dataset
+        macro_val_dataset = base_dataset
 
     train_loader = DataLoader(
         train_dataset,
@@ -375,6 +410,9 @@ def main() -> None:
             run_dir / "run_config.json",
             {
                 "parquet_files": parquet_files,
+                "split_manifest_path": SPLIT_MANIFEST_PATH,
+                "train_split_name": TRAIN_SPLIT_NAME,
+                "val_split_name": VAL_SPLIT_NAME,
                 "seed": SEED,
                 "val_ratio": VAL_RATIO,
                 "batch_size": BATCH_SIZE,
@@ -398,7 +436,7 @@ def main() -> None:
 
     print(f"[Device] {device}")
     print(f"[Files] {len(parquet_files)} parquet files")
-    print(f"[Rows] total_valid={len(valid_indices)} train={len(train_indices)} val={len(val_indices)}")
+    print(f"[Rows] train={len(train_indices)} val={len(val_indices)}")
     print(f"[Train] epochs={NUM_EPOCHS} lr={LEARNING_RATE} batch={BATCH_SIZE} octree_query_nodes={OCTREE_QUERY_NODES}")
     print(
         f"[Encoder] pretrained={bool(PRETRAINED_ENCODER_CHECKPOINT.strip())} "
@@ -409,8 +447,8 @@ def main() -> None:
         f"depth_weight_base={OCTREE_DEPTH_WEIGHT_BASE} "
         f"monotonicity_weight={MONOTONICITY_WEIGHT}"
     )
-    print(f"[Train Macro Dist] { _macro_distribution(base_dataset, train_indices) }")
-    print(f"[Val Macro Dist] { _macro_distribution(base_dataset, val_indices) }")
+    print(f"[Train Macro Dist] { _macro_distribution(macro_train_dataset, train_indices) }")
+    print(f"[Val Macro Dist] { _macro_distribution(macro_val_dataset, val_indices) }")
     if run_dir is not None:
         print(f"[Checkpoint Dir] {run_dir}")
 
