@@ -4,13 +4,11 @@ This script scans collected process-skeleton parquet files, filters unusable
 files, computes lightweight dataset statistics, and writes a part-level
 train/val/test split manifest.
 
-Typical usage:
-    python prepare_pilot_training_dataset.py --parquet-dir Y:\...\sdf_dataset_out\_ALL_PARQUET_FILES
+Edit the "User config" constants below and run this file directly from VS Code.
 """
 
 from __future__ import annotations
 
-import argparse
 import csv
 import json
 import random
@@ -23,8 +21,11 @@ import numpy as np
 import pandas as pd
 
 
-DEFAULT_PARQUET_DIR = r""
-DEFAULT_OUTPUT_DIR = r"pilot_training_splits"
+# ---------------------------------------------------------------------------
+# User config: edit these directly in VS Code.
+# ---------------------------------------------------------------------------
+PARQUET_DIR = r""
+OUTPUT_DIR = r"pilot_training_splits"
 PARQUET_GLOB = "*.parquet"
 SEED = 0
 VAL_RATIO = 0.10
@@ -309,27 +310,37 @@ def _sum_macro_counts(records: list[dict[str, Any]]) -> dict[str, int]:
     return dict(sorted(counter.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
-def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
-    parquet_dir = Path(args.parquet_dir or DEFAULT_PARQUET_DIR).expanduser().resolve()
-    if not parquet_dir.is_dir():
-        raise NotADirectoryError(f"Parquet directory not found: {parquet_dir}")
+def build_manifest(
+    parquet_dir: str,
+    parquet_glob: str,
+    seed: int,
+    val_ratio: float,
+    test_ratio: float,
+    max_files: int,
+    stats_sample_rows_per_file: int,
+) -> dict[str, Any]:
+    parquet_dir_path = Path(parquet_dir).expanduser().resolve()
+    if not parquet_dir:
+        raise ValueError("Set PARQUET_DIR at the top of prepare_pilot_training_dataset.py")
+    if not parquet_dir_path.is_dir():
+        raise NotADirectoryError(f"Parquet directory not found: {parquet_dir_path}")
 
-    files = sorted(parquet_dir.glob(args.parquet_glob))
-    if args.max_files > 0:
-        files = files[: int(args.max_files)]
+    files = sorted(parquet_dir_path.glob(parquet_glob))
+    if max_files > 0:
+        files = files[: int(max_files)]
     if not files:
-        raise FileNotFoundError(f"No parquet files matched {args.parquet_glob!r} under {parquet_dir}")
+        raise FileNotFoundError(f"No parquet files matched {parquet_glob!r} under {parquet_dir_path}")
 
     records = []
     for i, path in enumerate(files, start=1):
-        record = _scan_one(path, sample_rows=int(args.stats_sample_rows_per_file))
+        record = _scan_one(path, sample_rows=int(stats_sample_rows_per_file))
         records.append(record)
         if i == 1 or i % 50 == 0 or i == len(files):
             print(f"[Scan] {i}/{len(files)} files")
 
     valid_records = [record for record in records if bool(record["valid"])]
     parts = sorted({str(record["part_name"]) for record in valid_records})
-    split_parts = _split_parts(parts, args.val_ratio, args.test_ratio, args.seed)
+    split_parts = _split_parts(parts, val_ratio, test_ratio, seed)
 
     split_files: dict[str, list[str]] = {"train": [], "val": [], "test": []}
     split_records: dict[str, list[dict[str, Any]]] = {"train": [], "val": [], "test": []}
@@ -379,11 +390,11 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
 
     return {
         "created_at": datetime.now().isoformat(timespec="seconds"),
-        "source_parquet_dir": str(parquet_dir),
-        "parquet_glob": args.parquet_glob,
-        "seed": int(args.seed),
-        "val_ratio": float(args.val_ratio),
-        "test_ratio": float(args.test_ratio),
+        "source_parquet_dir": str(parquet_dir_path),
+        "parquet_glob": parquet_glob,
+        "seed": int(seed),
+        "val_ratio": float(val_ratio),
+        "test_ratio": float(test_ratio),
         "splits": split_files,
         "split_parts": {key: sorted(value) for key, value in split_parts.items()},
         "summary": {
@@ -401,19 +412,16 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare pilot train/val/test parquet splits.")
-    parser.add_argument("--parquet-dir", default=DEFAULT_PARQUET_DIR)
-    parser.add_argument("--parquet-glob", default=PARQUET_GLOB)
-    parser.add_argument("--out-dir", default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--val-ratio", type=float, default=VAL_RATIO)
-    parser.add_argument("--test-ratio", type=float, default=TEST_RATIO)
-    parser.add_argument("--max-files", type=int, default=MAX_FILES)
-    parser.add_argument("--stats-sample-rows-per-file", type=int, default=STATS_SAMPLE_ROWS_PER_FILE)
-    args = parser.parse_args()
-
-    manifest = build_manifest(args)
-    out_root = Path(args.out_dir).expanduser().resolve()
+    manifest = build_manifest(
+        parquet_dir=PARQUET_DIR,
+        parquet_glob=PARQUET_GLOB,
+        seed=SEED,
+        val_ratio=VAL_RATIO,
+        test_ratio=TEST_RATIO,
+        max_files=MAX_FILES,
+        stats_sample_rows_per_file=STATS_SAMPLE_ROWS_PER_FILE,
+    )
+    out_root = Path(OUTPUT_DIR).expanduser().resolve()
     run_dir = out_root / f"pilot_split_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
