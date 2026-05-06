@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import bisect
+import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import Iterable
 
@@ -27,20 +30,104 @@ class ProcessSkeletonParquetDataset(Dataset):
         "face_type_512": "embed_face_type.npy",
     }
 
-    def __init__(self, parquet_files: Iterable[str | Path], octree_query_nodes: int | None = 2048) -> None:
+    def __init__(
+        self,
+        parquet_files: Iterable[str | Path],
+        octree_query_nodes: int | None = 2048,
+        lazy_load: bool = False,
+        parquet_cache_size: int | None = None,
+    ) -> None:
         """Reads parquet files into a single dataframe index."""
         files = [str(Path(path)) for path in parquet_files]
         if not files:
             raise ValueError("At least one parquet file is required")
 
-        frames = [pd.read_parquet(path) for path in files]
-        self.df = pd.concat(frames, ignore_index=True)
+        self.parquet_files = files
+        self.lazy_load = bool(lazy_load)
         self.octree_query_nodes = octree_query_nodes
-        self._static_feature_cache: dict[str, dict[str, np.ndarray]] = {}
+        self._parquet_cache_size = max(
+            1,
+            int(parquet_cache_size if parquet_cache_size is not None else os.getenv("PARQUET_ROW_GROUP_CACHE_SIZE", "2")),
+        )
+        self._parquet_row_group_cache: OrderedDict[tuple[str, int], pd.DataFrame] = OrderedDict()
+        self._static_feature_cache_size = max(0, int(os.getenv("STATIC_FEATURE_CACHE_SIZE", "16")))
+        self._static_feature_cache: OrderedDict[str, dict[str, np.ndarray]] = OrderedDict()
+        self._row_group_refs: list[tuple[str, int, int]] = []
+        self._row_group_ends: list[int] = []
+
+        if self.lazy_load:
+            self.df = None
+            self._init_lazy_index(files)
+        else:
+            frames = [pd.read_parquet(path) for path in files]
+            self.df = pd.concat(frames, ignore_index=True)
+
+    def _init_lazy_index(self, files: list[str]) -> None:
+        """Builds row-group offsets without materializing parquet payload columns."""
+        try:
+            import pyarrow.parquet as pq
+        except Exception as exc:
+            raise RuntimeError("lazy_load=True requires pyarrow to read parquet row-group metadata") from exc
+
+        total = 0
+        for path in files:
+            parquet_file = pq.ParquetFile(path)
+            for row_group_index in range(parquet_file.metadata.num_row_groups):
+                row_count = int(parquet_file.metadata.row_group(row_group_index).num_rows)
+                if row_count <= 0:
+                    continue
+                self._row_group_refs.append((path, int(row_group_index), row_count))
+                total += row_count
+                self._row_group_ends.append(total)
 
     def __len__(self) -> int:
         """Returns the number of operation rows."""
+        if self.lazy_load:
+            return int(self._row_group_ends[-1]) if self._row_group_ends else 0
         return int(len(self.df))
+
+    def _row_from_lazy_index(self, index: int):
+        """Loads one row from the bounded row-group cache."""
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        group_pos = bisect.bisect_right(self._row_group_ends, int(index))
+        group_start = 0 if group_pos == 0 else self._row_group_ends[group_pos - 1]
+        path, row_group_index, _ = self._row_group_refs[group_pos]
+        local_index = int(index) - int(group_start)
+        key = (path, int(row_group_index))
+        frame = self._parquet_row_group_cache.get(key)
+        if frame is None:
+            import pyarrow.parquet as pq
+            frame = pq.ParquetFile(path).read_row_group(int(row_group_index)).to_pandas()
+            self._parquet_row_group_cache[key] = frame
+            while len(self._parquet_row_group_cache) > self._parquet_cache_size:
+                self._parquet_row_group_cache.popitem(last=False)
+        else:
+            self._parquet_row_group_cache.move_to_end(key)
+        return frame.iloc[local_index]
+
+    def row_indices(self) -> list[int]:
+        """Returns all row indices without scanning payload columns."""
+        return list(range(len(self)))
+
+    def macro_distribution(self, indices: Iterable[int] | None = None) -> dict[str, int]:
+        """Counts macro classes while respecting lazy loading."""
+        out: dict[str, int] = {}
+        if self.lazy_load:
+            row_indices = self.row_indices() if indices is None else [int(i) for i in indices]
+            for idx in row_indices:
+                row = self._row_from_lazy_index(idx)
+                name = str(row.get("macro_class_name", "unknown"))
+                out[name] = out.get(name, 0) + 1
+            return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
+
+        if self.df is None or "macro_class_name" not in self.df.columns:
+            return out
+        row_indices = range(len(self.df)) if indices is None else [int(i) for i in indices]
+        for idx in row_indices:
+            name = str(self.df.iloc[int(idx)].get("macro_class_name", "unknown"))
+            out[name] = out.get(name, 0) + 1
+        return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
 
     def _resolve_static_feature_dir(self, row) -> str | None:
         """Returns the static feature directory for a row when available."""
@@ -59,7 +146,17 @@ class ProcessSkeletonParquetDataset(Dataset):
         if key not in self._STATIC_FEATURE_FILES:
             raise KeyError(f"Unsupported static feature key: {key}")
 
-        cache = self._static_feature_cache.setdefault(static_dir, {})
+        if self._static_feature_cache_size > 0:
+            cache = self._static_feature_cache.get(static_dir)
+            if cache is None:
+                cache = {}
+                self._static_feature_cache[static_dir] = cache
+                while len(self._static_feature_cache) > self._static_feature_cache_size:
+                    self._static_feature_cache.popitem(last=False)
+            else:
+                self._static_feature_cache.move_to_end(static_dir)
+        else:
+            cache = {}
         if key not in cache:
             path = Path(static_dir) / self._STATIC_FEATURE_FILES[key]
             if not path.exists():
@@ -183,7 +280,7 @@ class ProcessSkeletonParquetDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         """Converts one dataframe row into the training batch schema."""
-        row = self.df.iloc[int(index)]
+        row = self._row_from_lazy_index(int(index)) if self.lazy_load else self.df.iloc[int(index)]
         if "state_points" in row.index and not self._is_missing(row["state_points"]):
             state_points = self._array(row["state_points"], np.float32).reshape(512, 100, 7)
         else:

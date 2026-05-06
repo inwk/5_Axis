@@ -43,6 +43,10 @@ PRINT_EVERY = 1
 TRAIN_LOG_EVERY_BATCHES = 50
 MAX_TRAIN_BATCHES_PER_EPOCH = 0  # 0 = use all train batches
 MAX_VAL_BATCHES = 64             # cap pilot validation cost/memory churn
+MAX_TRAIN_FILES = 32             # 0 = use all train files from the split
+MAX_VAL_FILES = 8                # 0 = use all val files from the split
+LAZY_PARQUET_LOADING = True      # keep RAM bounded by loading parquet row groups on demand
+PARQUET_ROW_GROUP_CACHE_SIZE = 2
 
 # Optional StateEncoder initialization from SSL pretraining.
 # Set this to ssl_pretraining/train_state_encoder_ssl.py's best.pt.
@@ -126,7 +130,18 @@ def _load_manifest_files(manifest_path: str, split_name: str) -> list[str]:
     return files
 
 
+def _cap_files(files: list[str], max_files: int) -> list[str]:
+    """Returns a deterministic pilot subset to avoid eager-loading every parquet."""
+    limit = int(max_files)
+    if limit <= 0 or len(files) <= limit:
+        return files
+    return files[:limit]
+
+
 def _build_valid_transition_indices(dataset: ProcessSkeletonParquetDataset) -> list[int]:
+    if getattr(dataset, "lazy_load", False):
+        return dataset.row_indices()
+
     indices: list[int] = []
     df = dataset.df
     required = {"octree_centers", "octree_depths", "octree_occ_labels"}
@@ -162,6 +177,9 @@ def _split_indices(indices: list[int], val_ratio: float, seed: int) -> tuple[lis
 
 
 def _macro_distribution(dataset: ProcessSkeletonParquetDataset, indices: list[int]) -> dict[str, int]:
+    if hasattr(dataset, "macro_distribution"):
+        return dataset.macro_distribution(indices)
+
     out: dict[str, int] = {}
     if "macro_class_name" not in dataset.df.columns:
         return out
@@ -374,11 +392,23 @@ def main() -> None:
 
     set_seed(SEED)
     if SPLIT_MANIFEST_PATH.strip():
-        train_files = _load_manifest_files(SPLIT_MANIFEST_PATH, TRAIN_SPLIT_NAME)
-        val_files = _load_manifest_files(SPLIT_MANIFEST_PATH, VAL_SPLIT_NAME)
+        train_files_all = _load_manifest_files(SPLIT_MANIFEST_PATH, TRAIN_SPLIT_NAME)
+        val_files_all = _load_manifest_files(SPLIT_MANIFEST_PATH, VAL_SPLIT_NAME)
+        train_files = _cap_files(train_files_all, MAX_TRAIN_FILES)
+        val_files = _cap_files(val_files_all, MAX_VAL_FILES)
         parquet_files = train_files + val_files
-        train_base_dataset = ProcessSkeletonParquetDataset(train_files, octree_query_nodes=int(OCTREE_QUERY_NODES))
-        val_base_dataset = ProcessSkeletonParquetDataset(val_files, octree_query_nodes=int(OCTREE_QUERY_NODES))
+        train_base_dataset = ProcessSkeletonParquetDataset(
+            train_files,
+            octree_query_nodes=int(OCTREE_QUERY_NODES),
+            lazy_load=LAZY_PARQUET_LOADING,
+            parquet_cache_size=PARQUET_ROW_GROUP_CACHE_SIZE,
+        )
+        val_base_dataset = ProcessSkeletonParquetDataset(
+            val_files,
+            octree_query_nodes=int(OCTREE_QUERY_NODES),
+            lazy_load=LAZY_PARQUET_LOADING,
+            parquet_cache_size=PARQUET_ROW_GROUP_CACHE_SIZE,
+        )
         train_indices = _build_valid_transition_indices(train_base_dataset)
         val_indices = _build_valid_transition_indices(val_base_dataset)
         train_dataset: Dataset = Subset(train_base_dataset, train_indices)
@@ -386,8 +416,17 @@ def main() -> None:
         macro_train_dataset = train_base_dataset
         macro_val_dataset = val_base_dataset
     else:
-        parquet_files = _resolve_parquet_files()
-        base_dataset = ProcessSkeletonParquetDataset(parquet_files, octree_query_nodes=int(OCTREE_QUERY_NODES))
+        parquet_files_all = _resolve_parquet_files()
+        total_file_cap = (MAX_TRAIN_FILES if MAX_TRAIN_FILES > 0 else len(parquet_files_all)) + (
+            MAX_VAL_FILES if MAX_VAL_FILES > 0 else 0
+        )
+        parquet_files = _cap_files(parquet_files_all, total_file_cap)
+        base_dataset = ProcessSkeletonParquetDataset(
+            parquet_files,
+            octree_query_nodes=int(OCTREE_QUERY_NODES),
+            lazy_load=LAZY_PARQUET_LOADING,
+            parquet_cache_size=PARQUET_ROW_GROUP_CACHE_SIZE,
+        )
         valid_indices = _build_valid_transition_indices(base_dataset)
         train_indices, val_indices = _split_indices(valid_indices, VAL_RATIO, SEED)
         train_dataset = Subset(base_dataset, train_indices)
@@ -398,7 +437,7 @@ def main() -> None:
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        shuffle=not bool(LAZY_PARQUET_LOADING),
         num_workers=NUM_WORKERS,
         pin_memory=torch.cuda.is_available(),
     )
@@ -454,6 +493,10 @@ def main() -> None:
                 "num_epochs": NUM_EPOCHS,
                 "max_train_batches_per_epoch": MAX_TRAIN_BATCHES_PER_EPOCH,
                 "max_val_batches": MAX_VAL_BATCHES,
+                "max_train_files": MAX_TRAIN_FILES,
+                "max_val_files": MAX_VAL_FILES,
+                "lazy_parquet_loading": LAZY_PARQUET_LOADING,
+                "parquet_row_group_cache_size": PARQUET_ROW_GROUP_CACHE_SIZE,
                 "learning_rate": LEARNING_RATE,
                 "octree_query_nodes": int(OCTREE_QUERY_NODES),
                 "octree_pos_weight_factor": OCTREE_POS_WEIGHT_FACTOR,
@@ -472,6 +515,8 @@ def main() -> None:
 
     print(f"[Device] {device}")
     print(f"[Files] {len(parquet_files)} parquet files")
+    print(f"[File Caps] max_train_files={MAX_TRAIN_FILES or 'all'} max_val_files={MAX_VAL_FILES or 'all'}")
+    print(f"[Parquet Loading] lazy={LAZY_PARQUET_LOADING} row_group_cache={PARQUET_ROW_GROUP_CACHE_SIZE}")
     print(f"[Rows] train={len(train_indices)} val={len(val_indices)}")
     print(f"[Train] epochs={NUM_EPOCHS} lr={LEARNING_RATE} batch={BATCH_SIZE} octree_query_nodes={OCTREE_QUERY_NODES}")
     print(
