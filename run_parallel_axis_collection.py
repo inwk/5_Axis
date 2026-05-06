@@ -17,6 +17,12 @@ PYTHON_EXE = sys.executable
 WORKER_SCRIPT = "collect_axis_dataset.py"
 PC_NAME = "615"
 WORKER_JOB_CLEANUP = os.getenv("WORKER_JOB_CLEANUP", "1") != "0"
+MEMORY_GUARD_EMPTY_EXIT_CODE = int(os.getenv("MEMORY_GUARD_EMPTY_EXIT_CODE", "75"))
+RUNNER_MEMORY_LAUNCH_GUARD = os.getenv("RUNNER_MEMORY_LAUNCH_GUARD", "1") != "0"
+RUNNER_MEMORY_POLL_SEC = max(5.0, float(os.getenv("RUNNER_MEMORY_POLL_SEC", "120")))
+RUNNER_MIN_AVAIL_GB = float(os.getenv("RUNNER_MIN_AVAIL_GB", os.getenv("MEMORY_GUARD_MIN_AVAIL_GB", "5.0")))
+RUNNER_WORKER_START_BUDGET_GB = float(os.getenv("RUNNER_WORKER_START_BUDGET_GB", "3.0"))
+RUNNER_MAX_LOAD_PCT = int(os.getenv("RUNNER_MAX_LOAD_PCT", os.getenv("MEMORY_GUARD_MAX_LOAD_PCT", "100")))
 
 # Shared network paths for distributed collection machines.
 SHARED_BASE_DIR = r"Y:\04_개별폴더\22. 통합과정 오인욱"
@@ -27,6 +33,19 @@ CURRENT_SEED = 0
 
 if os.name == "nt":
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class _MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", wintypes.DWORD),
+            ("dwMemoryLoad", wintypes.DWORD),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
 
     class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
         _fields_ = [
@@ -74,9 +93,76 @@ if os.name == "nt":
     _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MEMORYSTATUSEX)]
+    _kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
 
     _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+
+def _format_gb(num_bytes: int | float) -> str:
+    return f"{float(num_bytes) / (1024.0 ** 3):.2f}GB"
+
+
+def _get_system_memory_snapshot() -> dict[str, int] | None:
+    """Returns system memory state used to avoid launching doomed workers."""
+    if os.name != "nt":
+        return None
+    mem_status = _MEMORYSTATUSEX()
+    mem_status.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+    if not _kernel32.GlobalMemoryStatusEx(ctypes.byref(mem_status)):
+        return None
+    return {
+        "avail_phys": int(mem_status.ullAvailPhys),
+        "total_phys": int(mem_status.ullTotalPhys),
+        "commit_avail": int(mem_status.ullAvailPageFile),
+        "commit_total": int(mem_status.ullTotalPageFile),
+        "memory_load_pct": int(mem_status.dwMemoryLoad),
+    }
+
+
+def _wait_for_worker_launch_headroom(part_name: str) -> None:
+    """Blocks before starting a new NX worker when memory is already tight."""
+    if not RUNNER_MEMORY_LAUNCH_GUARD or os.name != "nt":
+        return
+
+    min_launch_avail = int(
+        max(0.0, RUNNER_MIN_AVAIL_GB + RUNNER_WORKER_START_BUDGET_GB) * (1024.0 ** 3)
+    )
+    max_load = int(RUNNER_MAX_LOAD_PCT)
+    last_log = 0.0
+    started = time.monotonic()
+    while True:
+        snap = _get_system_memory_snapshot()
+        if snap is None:
+            return
+
+        reasons = []
+        if min_launch_avail > 0 and snap["avail_phys"] < min_launch_avail:
+            reasons.append(f"avail_phys<{_format_gb(min_launch_avail)}")
+        if max_load < 100 and snap["memory_load_pct"] > max_load:
+            reasons.append(f"mem_load>{max_load}%")
+        if not reasons:
+            waited = time.monotonic() - started
+            if waited >= RUNNER_MEMORY_POLL_SEC:
+                print(
+                    f"[Runner-MEM] resume {part_name}: waited={waited:.0f}s "
+                    f"avail_phys={_format_gb(snap['avail_phys'])} "
+                    f"mem_load={snap['memory_load_pct']}%"
+                )
+            return
+
+        now = time.monotonic()
+        if last_log <= 0.0 or now - last_log >= RUNNER_MEMORY_POLL_SEC:
+            print(
+                f"[Runner-MEM] wait {part_name}: reason={','.join(reasons)} "
+                f"avail_phys={_format_gb(snap['avail_phys'])} "
+                f"commit_avail={_format_gb(snap['commit_avail'])} "
+                f"mem_load={snap['memory_load_pct']}% "
+                f"poll={RUNNER_MEMORY_POLL_SEC:.0f}s"
+            )
+            last_log = now
+        time.sleep(RUNNER_MEMORY_POLL_SEC)
 
 
 def _is_completed_run_dir(run_dir: str) -> bool:
@@ -97,6 +183,14 @@ def _is_completed_run_dir(run_dir: str) -> bool:
     termination = episode_record.get("termination")
     if not isinstance(termination, dict):
         return False
+    if termination.get("reason") == "memory_guard_stop":
+        steps = episode_record.get("steps", [])
+        has_effective_rows = any(
+            isinstance(step, dict) and int(step.get("num_effective_transitions", 0) or 0) > 0
+            for step in steps
+        )
+        if not has_effective_rows:
+            return False
     return bool(termination.get("reason"))
 
 
@@ -269,8 +363,6 @@ def process_file_safe(file_info: tuple[str, str, str]) -> None:
     except (FileExistsError, OSError):
         return
 
-    pc_text = f" pc={pc_slug}" if pc_slug else ""
-    print(f"[Start] {part_name} (PID: {os.getpid()}{pc_text})")
     start_time = time.time()
 
     try:
@@ -293,12 +385,30 @@ def process_file_safe(file_info: tuple[str, str, str]) -> None:
         env = os.environ.copy()
         if pc_slug:
             env["PC_NAME"] = pc_slug
-        with open(log_path, "w", encoding="utf-8") as log_f:
-            result = _run_worker_subprocess(cmd, log_f=log_f, env=env)
-        if result.returncode != 0:
-            print(f"[Error] {part_name} failed (rc={result.returncode}), see {log_path}")
-        else:
-            print(f"[Done] {part_name} finished in {time.time() - start_time:.1f}s")
+        attempt = 0
+        while True:
+            attempt += 1
+            _wait_for_worker_launch_headroom(part_name)
+            pc_text = f" pc={pc_slug}" if pc_slug else ""
+            retry_text = f" attempt={attempt}" if attempt > 1 else ""
+            print(f"[Start] {part_name} (PID: {os.getpid()}{pc_text}{retry_text})")
+            log_mode = "a" if attempt > 1 else "w"
+            with open(log_path, log_mode, encoding="utf-8") as log_f:
+                if attempt > 1:
+                    print(f"\n[Retry] attempt={attempt}", file=log_f, flush=True)
+                result = _run_worker_subprocess(cmd, log_f=log_f, env=env)
+            if result.returncode == MEMORY_GUARD_EMPTY_EXIT_CODE:
+                print(
+                    f"[Retry] {part_name}: memory guard stopped before rows; "
+                    f"sleeping {RUNNER_MEMORY_POLL_SEC:.0f}s before retry"
+                )
+                time.sleep(RUNNER_MEMORY_POLL_SEC)
+                continue
+            if result.returncode != 0:
+                print(f"[Error] {part_name} failed (rc={result.returncode}), see {log_path}")
+            else:
+                print(f"[Done] {part_name} finished in {time.time() - start_time:.1f}s")
+            break
     except subprocess.CalledProcessError:
         print(f"[Error] Script failed for {part_name}")
     except Exception as exc:

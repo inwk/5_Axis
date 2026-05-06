@@ -501,6 +501,7 @@ MEMORY_GUARD_EMERGENCY_MIN_AVAIL_GB: float = float(
 MEMORY_GUARD_EMERGENCY_MAX_LOAD_PCT: int = int(
     os.getenv("MEMORY_GUARD_EMERGENCY_MAX_LOAD_PCT", "95")
 )
+MEMORY_GUARD_EMPTY_EXIT_CODE: int = int(os.getenv("MEMORY_GUARD_EMPTY_EXIT_CODE", "75"))
 
 
 class MemoryGuardStop(RuntimeError):
@@ -3897,6 +3898,7 @@ def collect_dataset_episode(
         episode_completed = True
 
     except MemoryGuardStop as exc:
+        termination_reason = "memory_guard_stop"
         if current_scored_for_stop and not current_scored_added_to_depth:
             _append_scored_children_to_depth(current_scored_for_stop, depth_children)
             current_scored_added_to_depth = True
@@ -3990,6 +3992,7 @@ def collect_dataset_episode(
         "num_decision_steps": int(len(episode_record["steps"])),
         "planned_max_steps": int(planned_decision_steps),
         "rollout_mode": str(ROLLOUT_MODE),
+        "termination_reason": str(termination_reason),
     }
 
 if __name__ == "__main__":
@@ -4030,6 +4033,11 @@ if __name__ == "__main__":
             pc_name=args.pc_name,
         )
         print(json.dumps(ret, ensure_ascii=False, indent=2))
+        if (
+            str(ret.get("termination_reason", "")) == "memory_guard_stop"
+            and int(ret.get("num_rows", 0)) <= 0
+        ):
+            sys.exit(MEMORY_GUARD_EMPTY_EXIT_CODE)
     except Exception as e:
         print(f"[Critical Error] {e}", file=sys.stderr)
         import traceback
