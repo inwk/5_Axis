@@ -363,8 +363,29 @@ def _evaluate_octree_metrics(model: GraphSdfPlanningModel, batch: dict, device: 
         )
         valid_count = float(valid.sum().item())
         if valid_count > 0.0:
-            metrics["mono_viol"] = float((((pred > before).float() * valid).sum() / valid.sum().clamp_min(1.0)).item())
+            before_bin = (before >= 0.5).float()
+            gt_bin = (gt >= 0.5).float()
+            valid_float = valid.float()
+            changed_mask = ((before_bin != gt_bin).float() * valid_float)
+            removed_mask = ((before_bin > 0.5) & (gt_bin < 0.5)).float() * valid_float
+            added_mask = ((before_bin < 0.5) & (gt_bin > 0.5)).float() * valid_float
+            changed_count = float(changed_mask.sum().item())
+            removed_count = float(removed_mask.sum().item())
+            added_count = float(added_mask.sum().item())
+
+            metrics["mono_viol"] = float((((pred > before).float() * valid_float).sum() / valid_float.sum().clamp_min(1.0)).item())
             metrics["mono_valid_cells"] = valid_count
+            metrics["before_valid_cells"] = valid_count
+            metrics["changed_cell_ratio"] = changed_count / max(valid_count, 1.0)
+            metrics["changed_cells"] = changed_count
+            metrics["removed_cell_ratio"] = removed_count / max(valid_count, 1.0)
+            metrics["removed_cells"] = removed_count
+            metrics["gt_added_cell_ratio"] = added_count / max(valid_count, 1.0)
+            metrics["added_cells"] = added_count
+            if changed_count > 0.0:
+                metrics["changed_cell_acc"] = float((((pred == gt_bin).float() * changed_mask).sum() / changed_mask.sum().clamp_min(1.0)).item())
+            if removed_count > 0.0:
+                metrics["removed_cell_recall"] = float((((pred < 0.5).float() * removed_mask).sum() / removed_mask.sum().clamp_min(1.0)).item())
     return metrics
 
 
@@ -618,10 +639,16 @@ def main() -> None:
                 )
                 metrics = _evaluate_octree_metrics(model, batch, device)
                 for key, value in metrics.items():
-                    if key in {"num_cells", "mono_valid_cells"}:
+                    if key in {"num_cells", "mono_valid_cells", "before_valid_cells", "changed_cells", "removed_cells", "added_cells"}:
                         continue
                     if key == "mono_viol":
                         metric_weight = max(float(metrics.get("mono_valid_cells", 0.0)), 1.0)
+                    elif key in {"changed_cell_acc"}:
+                        metric_weight = max(float(metrics.get("changed_cells", 0.0)), 1.0)
+                    elif key in {"removed_cell_recall"}:
+                        metric_weight = max(float(metrics.get("removed_cells", 0.0)), 1.0)
+                    elif key in {"changed_cell_ratio", "removed_cell_ratio", "gt_added_cell_ratio"}:
+                        metric_weight = max(float(metrics.get("before_valid_cells", 0.0)), 1.0)
                     else:
                         metric_weight = max(float(metrics.get("num_cells", 1.0)), 1.0)
                     val_metric_sums[key] = val_metric_sums.get(key, 0.0) + float(value) * metric_weight
@@ -679,6 +706,12 @@ def main() -> None:
                 )
                 if "mono_viol" in val_metrics:
                     log += f" mono_viol={val_metrics['mono_viol']:.4f}"
+                if "changed_cell_ratio" in val_metrics:
+                    log += f" changed_ratio={val_metrics['changed_cell_ratio']:.4f}"
+                if "changed_cell_acc" in val_metrics:
+                    log += f" changed_acc={val_metrics['changed_cell_acc']:.4f}"
+                if "removed_cell_recall" in val_metrics:
+                    log += f" removed_recall={val_metrics['removed_cell_recall']:.4f}"
             log += f" {_cuda_memory_text()}"
             print(log)
         if torch.cuda.is_available():
