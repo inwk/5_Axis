@@ -35,7 +35,7 @@ VAL_SPLIT_NAME = os.getenv("PILOT_VAL_SPLIT", "val")
 VAL_RATIO = 0.2
 SEED = 0
 
-BATCH_SIZE = 1
+BATCH_SIZE = 8
 NUM_WORKERS = 0
 NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
@@ -55,8 +55,9 @@ PRETRAINED_ENCODER_STRICT = True
 FREEZE_STATE_ENCODER = False
 STATE_ENCODER_LR_MULTIPLIER = 1.0
 
-# For batched training this should stay fixed and positive.
-OCTREE_QUERY_NODES = 512
+# For a 24GB GPU, start here. If GPU memory is still low, try BATCH_SIZE=16
+# and then OCTREE_QUERY_NODES=4096.
+OCTREE_QUERY_NODES = 2048
 OCTREE_POS_WEIGHT_FACTOR = 2.0
 OCTREE_DEPTH_WEIGHT_BASE = 2.0
 MONOTONICITY_WEIGHT = 0.1
@@ -335,6 +336,7 @@ def _evaluate_octree_metrics(model: GraphSdfPlanningModel, batch: dict, device: 
         "pred_pos": float(pred.mean().item()),
         "gt_pos": float(gt.mean().item()),
         "prob_mean": float(prob.mean().item()),
+        "num_cells": float(gt.numel()),
     }
     if batch.get("octree_occ_labels_before") is not None:
         before = batch["octree_occ_labels_before"].to(device)
@@ -539,7 +541,6 @@ def main() -> None:
     print(f"[Memory] {_cuda_memory_text()}")
 
     best_val_loss = float("inf")
-    first_val_batch = next(iter(val_loader)) if len(val_dataset) > 0 else None
 
     for epoch in range(1, NUM_EPOCHS + 1):
         if torch.cuda.is_available():
@@ -577,6 +578,8 @@ def main() -> None:
                 )
 
         val_losses = []
+        val_metric_sums: dict[str, float] = {}
+        val_metric_weights: dict[str, float] = {}
         for _, batch in _limited_batches(val_loader, MAX_VAL_BATCHES):
             try:
                 val_losses.append(
@@ -589,6 +592,13 @@ def main() -> None:
                         monotonicity_weight=MONOTONICITY_WEIGHT,
                     )
                 )
+                metrics = _evaluate_octree_metrics(model, batch, device)
+                metric_weight = max(float(metrics.get("num_cells", 1.0)), 1.0)
+                for key, value in metrics.items():
+                    if key == "num_cells":
+                        continue
+                    val_metric_sums[key] = val_metric_sums.get(key, 0.0) + float(value) * metric_weight
+                    val_metric_weights[key] = val_metric_weights.get(key, 0.0) + metric_weight
             except RuntimeError as exc:
                 if _is_cuda_oom(exc):
                     if torch.cuda.is_available():
@@ -604,6 +614,10 @@ def main() -> None:
 
         train_loss = float(sum(train_losses) / max(len(train_losses), 1))
         val_loss = float(sum(val_losses) / max(len(val_losses), 1))
+        val_metrics = {
+            key: val_metric_sums[key] / max(val_metric_weights.get(key, 0.0), 1.0)
+            for key in val_metric_sums
+        }
 
         if run_dir is not None and (epoch == 1 or epoch % PRINT_EVERY == 0 or epoch == NUM_EPOCHS):
             _save_checkpoint(
@@ -629,16 +643,15 @@ def main() -> None:
 
         if epoch == 1 or epoch % PRINT_EVERY == 0 or epoch == NUM_EPOCHS:
             log = f"[Epoch {epoch:04d}] train={train_loss:.6f} val={val_loss:.6f}"
-            if first_val_batch is not None:
-                metrics = _evaluate_octree_metrics(model, first_val_batch, device)
+            if val_metrics:
                 log += (
-                    f" val_octree_acc(sample_batch)={metrics['acc']:.4f}"
-                    f" pred_pos={metrics['pred_pos']:.4f}"
-                    f" gt_pos={metrics['gt_pos']:.4f}"
-                    f" prob_mean={metrics['prob_mean']:.4f}"
+                    f" val_octree_acc={val_metrics['acc']:.4f}"
+                    f" pred_pos={val_metrics['pred_pos']:.4f}"
+                    f" gt_pos={val_metrics['gt_pos']:.4f}"
+                    f" prob_mean={val_metrics['prob_mean']:.4f}"
                 )
-                if "mono_viol" in metrics:
-                    log += f" mono_viol={metrics['mono_viol']:.4f}"
+                if "mono_viol" in val_metrics:
+                    log += f" mono_viol={val_metrics['mono_viol']:.4f}"
             log += f" {_cuda_memory_text()}"
             print(log)
         if torch.cuda.is_available():
