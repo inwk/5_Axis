@@ -217,11 +217,16 @@ def _compute_octree_loss(
     octree_centers = batch["octree_centers"].to(device)
     octree_depths = batch["octree_depths"].to(device)
     octree_labels = batch["octree_occ_labels"].to(device)
-    octree_occ_before = (
-        batch["octree_occ_labels_before"].to(device)
-        if "octree_occ_labels_before" in batch
-        else None
-    )
+    octree_occ_before = None
+    if "octree_occ_labels_before" in batch:
+        labels_before_for_decoder = batch["octree_occ_labels_before"].to(device)
+        before_valid_for_decoder = (
+            batch["octree_occ_labels_before_valid"].to(device)
+            if "octree_occ_labels_before_valid" in batch
+            else None
+        )
+        if before_valid_for_decoder is None or bool(before_valid_for_decoder.sum().item() >= before_valid_for_decoder.numel()):
+            octree_occ_before = labels_before_for_decoder
 
     octree_outputs = model.forward_octree(
         state_points=inputs["state_points"],
@@ -256,9 +261,15 @@ def _compute_octree_loss(
     mono = torch.zeros((), device=device, dtype=occ_logits.dtype)
     if monotonicity_weight > 0.0 and "octree_occ_labels_before" in batch:
         labels_before = batch["octree_occ_labels_before"].to(device)
+        before_valid = (
+            batch["octree_occ_labels_before_valid"].to(device)
+            if "octree_occ_labels_before_valid" in batch
+            else None
+        )
         mono = monotonicity_occupancy_loss(
             occ_logits=occ_logits,
             occ_labels_before=labels_before,
+            valid_mask=before_valid,
         )
 
     return bce + monotonicity_weight * mono
@@ -287,11 +298,16 @@ def _compute_transition_only_octree_loss(
         )
 
     octree_depths = batch["octree_depths"].to(device)
-    octree_occ_before = (
-        batch["octree_occ_labels_before"].to(device)
-        if "octree_occ_labels_before" in batch
-        else None
-    )
+    octree_occ_before = None
+    if "octree_occ_labels_before" in batch:
+        labels_before_for_decoder = batch["octree_occ_labels_before"].to(device)
+        before_valid_for_decoder = (
+            batch["octree_occ_labels_before_valid"].to(device)
+            if "octree_occ_labels_before_valid" in batch
+            else None
+        )
+        if before_valid_for_decoder is None or bool(before_valid_for_decoder.sum().item() >= before_valid_for_decoder.numel()):
+            octree_occ_before = labels_before_for_decoder
     state_embedding = _encode_state_only(model, inputs)
     octree_outputs = model.forward_octree(
         state_points=inputs["state_points"],
@@ -325,9 +341,15 @@ def _compute_transition_only_octree_loss(
     # ── 2. Monotonicity penalty ───────────────────────────────────────────
     mono = torch.zeros((), device=device, dtype=occ_logits.dtype)
     if monotonicity_weight > 0.0 and "octree_occ_labels_before" in batch:
+        before_valid = (
+            batch["octree_occ_labels_before_valid"].to(device)
+            if "octree_occ_labels_before_valid" in batch
+            else None
+        )
         mono = monotonicity_occupancy_loss(
             occ_logits=occ_logits,
             occ_labels_before=batch["octree_occ_labels_before"].to(device),
+            valid_mask=before_valid,
         )
 
     return bce + monotonicity_weight * mono

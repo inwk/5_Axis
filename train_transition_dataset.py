@@ -141,7 +141,15 @@ def _cap_files(files: list[str], max_files: int) -> list[str]:
 
 def _build_valid_transition_indices(dataset: ProcessSkeletonParquetDataset) -> list[int]:
     if getattr(dataset, "lazy_load", False):
-        return dataset.row_indices()
+        required = {"octree_centers", "octree_depths", "octree_occ_labels"}
+        indices: list[int] = []
+        for idx in dataset.row_indices():
+            row = dataset._row_from_lazy_index(int(idx))
+            if all(col in row.index and not dataset._is_missing(row[col]) for col in required):
+                indices.append(int(idx))
+        if not indices:
+            raise ValueError("No rows with complete octree supervision were found.")
+        return indices
 
     indices: list[int] = []
     df = dataset.df
@@ -317,7 +325,15 @@ def _evaluate_octree_metrics(model: GraphSdfPlanningModel, batch: dict, device: 
         action_face_id=batch["action_face_id"].clamp_min(0).to(device),
         octree_centers=batch["octree_centers"].to(device),
         octree_depths=batch["octree_depths"].to(device),
-        octree_occ_before=batch.get("octree_occ_labels_before").to(device) if batch.get("octree_occ_labels_before") is not None else None,
+        octree_occ_before=(
+            batch.get("octree_occ_labels_before").to(device)
+            if batch.get("octree_occ_labels_before") is not None
+            and (
+                batch.get("octree_occ_labels_before_valid") is None
+                or bool(batch.get("octree_occ_labels_before_valid").sum().item() >= batch.get("octree_occ_labels_before_valid").numel())
+            )
+            else None
+        ),
         axis_visible=batch.get("axis_visible").to(device) if batch.get("axis_visible") is not None else None,
         node_process_state=batch.get("node_process_state").to(device) if batch.get("node_process_state") is not None else None,
         node_centrality=batch.get("node_centrality").to(device) if batch.get("node_centrality") is not None else None,
@@ -340,7 +356,15 @@ def _evaluate_octree_metrics(model: GraphSdfPlanningModel, batch: dict, device: 
     }
     if batch.get("octree_occ_labels_before") is not None:
         before = batch["octree_occ_labels_before"].to(device)
-        metrics["mono_viol"] = float((pred > before).float().mean().item())
+        valid = (
+            batch["octree_occ_labels_before_valid"].to(device)
+            if batch.get("octree_occ_labels_before_valid") is not None
+            else torch.ones_like(before)
+        )
+        valid_count = float(valid.sum().item())
+        if valid_count > 0.0:
+            metrics["mono_viol"] = float((((pred > before).float() * valid).sum() / valid.sum().clamp_min(1.0)).item())
+            metrics["mono_valid_cells"] = valid_count
     return metrics
 
 
@@ -593,10 +617,13 @@ def main() -> None:
                     )
                 )
                 metrics = _evaluate_octree_metrics(model, batch, device)
-                metric_weight = max(float(metrics.get("num_cells", 1.0)), 1.0)
                 for key, value in metrics.items():
-                    if key == "num_cells":
+                    if key in {"num_cells", "mono_valid_cells"}:
                         continue
+                    if key == "mono_viol":
+                        metric_weight = max(float(metrics.get("mono_valid_cells", 0.0)), 1.0)
+                    else:
+                        metric_weight = max(float(metrics.get("num_cells", 1.0)), 1.0)
                     val_metric_sums[key] = val_metric_sums.get(key, 0.0) + float(value) * metric_weight
                     val_metric_weights[key] = val_metric_weights.get(key, 0.0) + metric_weight
             except RuntimeError as exc:

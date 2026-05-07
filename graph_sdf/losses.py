@@ -205,6 +205,7 @@ def octree_bce_loss(
 def monotonicity_occupancy_loss(
     occ_logits: torch.Tensor,
     occ_labels_before: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Penalises predicting occupied material in cells that were already empty.
 
@@ -228,4 +229,7 @@ def monotonicity_occupancy_loss(
     """
     occ_pred = torch.sigmoid(occ_logits)                       # [B, K]
     violation = F.relu(occ_pred - occ_labels_before)           # [B, K]
-    return violation.mean()
+    if valid_mask is None:
+        return violation.mean()
+    valid = valid_mask.to(device=violation.device, dtype=violation.dtype)
+    return (violation * valid).sum() / valid.sum().clamp_min(1.0)

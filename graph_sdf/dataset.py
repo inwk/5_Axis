@@ -493,6 +493,8 @@ class ProcessSkeletonParquetDataset(Dataset):
                 labels_before_raw = (
                     row["octree_occ_labels_before"] if "octree_occ_labels_before" in row.index else None
                 )
+                labels_before_sampled = np.zeros_like(labels, dtype=np.float32)
+                labels_before_valid = np.zeros_like(labels, dtype=np.float32)
                 if not self._is_missing(labels_before_raw):
                     labels_before_full = self._array(labels_before_raw, np.float32).reshape(-1)
                     bcount = min(labels_before_full.shape[0], count)
@@ -507,8 +509,10 @@ class ProcessSkeletonParquetDataset(Dataset):
                             labels_before_full[:count],
                             rng=sample_rng_b,
                         )
-                        batch["octree_occ_labels_before"] = torch.from_numpy(labels_before_sampled)
-                        batch["octree_occ_before"] = batch["octree_occ_labels_before"]
+                        labels_before_valid = np.ones_like(labels_before_sampled, dtype=np.float32)
+                batch["octree_occ_labels_before"] = torch.from_numpy(labels_before_sampled.astype(np.float32, copy=False))
+                batch["octree_occ_labels_before_valid"] = torch.from_numpy(labels_before_valid.astype(np.float32, copy=False))
+                batch["octree_occ_before"] = batch["octree_occ_labels_before"]
 
         bbox_min_raw = row["octree_bbox_min"] if "octree_bbox_min" in row.index else None
         bbox_max_raw = row["octree_bbox_max"] if "octree_bbox_max" in row.index else None
