@@ -3054,7 +3054,7 @@ def collect_dataset_episode(
     ROLLOUT_MODE = os.getenv("ROLLOUT_MODE", "fixed_steps").strip().lower()
     if ROLLOUT_MODE not in {"until_done", "fixed_steps"}:
         raise ValueError(f"Unsupported ROLLOUT_MODE: {ROLLOUT_MODE!r}")
-    FIXED_DECISION_STEPS = int(os.getenv("FIXED_DECISION_STEPS", "1"))
+    FIXED_DECISION_STEPS = int(os.getenv("FIXED_DECISION_STEPS", "4"))
     MAX_TOTAL_DECISION_STEPS = int(os.getenv("MAX_TOTAL_DECISION_STEPS", "64"))
     if FIXED_DECISION_STEPS <= 0 or MAX_TOTAL_DECISION_STEPS <= 0:
         raise ValueError("FIXED_DECISION_STEPS and MAX_TOTAL_DECISION_STEPS must be positive")
@@ -3075,9 +3075,12 @@ def collect_dataset_episode(
     # up finish-ready states before the rollout terminates. Search width is
     # still controlled separately by target/tool/beam limits.
     MAX_ROUGH_TARGETS = int(os.getenv("MAX_ROUGH_TARGETS", "3"))
-    MAX_FINISH_TARGETS = int(os.getenv("MAX_FINISH_TARGETS", "2"))
+    MAX_FINISH_TARGETS = int(os.getenv("MAX_FINISH_TARGETS", "6"))
     MAX_TOOLS_PER_CLASS = int(os.getenv("MAX_TOOLS_PER_CLASS", "2"))
-    MAX_CANDIDATES_PER_BRANCH = max(0, int(os.getenv("MAX_CANDIDATES_PER_BRANCH", "5")))
+    MAX_GLOBAL_CANDIDATES_PER_BRANCH = max(0, int(os.getenv("MAX_GLOBAL_CANDIDATES_PER_BRANCH", "0")))
+    MAX_ROUGH_CANDIDATES_PER_BRANCH = max(0, int(os.getenv("MAX_ROUGH_CANDIDATES_PER_BRANCH", "5")))
+    MAX_FINISH_CANDIDATES_PER_BRANCH = max(0, int(os.getenv("MAX_FINISH_CANDIDATES_PER_BRANCH", "25")))
+    FINISH_STAGE_PREFER_FINISH = bool(int(os.getenv("FINISH_STAGE_PREFER_FINISH", "1")))
     BEAM_WIDTH = max(1, int(os.getenv("BEAM_WIDTH", "2")))
     SAMPLED_BRANCHES = max(0, int(os.getenv("SAMPLED_BRANCHES", "1")))
     finish_ready_tol_default = float(globals().get("FINISH_READY_TOL", 1.0))
@@ -3240,7 +3243,10 @@ def collect_dataset_episode(
                 "fixed_decision_steps": int(FIXED_DECISION_STEPS),
                 "max_total_decision_steps": int(MAX_TOTAL_DECISION_STEPS),
                 "early_rough_only_steps": int(EARLY_ROUGH_ONLY_STEPS),
-                "max_candidates_per_branch": int(MAX_CANDIDATES_PER_BRANCH),
+                "max_global_candidates_per_branch": int(MAX_GLOBAL_CANDIDATES_PER_BRANCH),
+                "max_rough_candidates_per_branch": int(MAX_ROUGH_CANDIDATES_PER_BRANCH),
+                "max_finish_candidates_per_branch": int(MAX_FINISH_CANDIDATES_PER_BRANCH),
+                "finish_stage_prefer_finish": bool(FINISH_STAGE_PREFER_FINISH),
                 "beam_width": int(BEAM_WIDTH),
                 "sampled_branches": int(SAMPLED_BRANCHES),
                 "max_no_effect_streak": int(MAX_NO_EFFECT_STREAK),
@@ -3398,7 +3404,10 @@ def collect_dataset_episode(
         "rollout_mode": str(ROLLOUT_MODE),
         "fixed_decision_steps": int(FIXED_DECISION_STEPS),
         "max_total_decision_steps": int(MAX_TOTAL_DECISION_STEPS),
-        "max_candidates_per_branch": int(MAX_CANDIDATES_PER_BRANCH),
+        "max_global_candidates_per_branch": int(MAX_GLOBAL_CANDIDATES_PER_BRANCH),
+        "max_rough_candidates_per_branch": int(MAX_ROUGH_CANDIDATES_PER_BRANCH),
+        "max_finish_candidates_per_branch": int(MAX_FINISH_CANDIDATES_PER_BRANCH),
+        "finish_stage_prefer_finish": bool(FINISH_STAGE_PREFER_FINISH),
         "max_no_effect_streak": int(MAX_NO_EFFECT_STREAK),
         "no_effect_removed_volume_eps": float(NO_EFFECT_REMOVED_VOLUME_EPS),
         "no_effect_removed_ratio_gain_eps": float(NO_EFFECT_REMOVED_RATIO_GAIN_EPS),
@@ -3935,6 +3944,7 @@ def collect_dataset_episode(
                     ready_tol=FINISH_READY_TOL,
                 )
 
+                finish_stage = bool(t >= EARLY_ROUGH_ONLY_STEPS)
                 candidates = generate_action_candidates(
                     state_node_sdf_512=state_dev_red_512,
                     rough_done_mask_512=np.asarray(branch["rough_done"], dtype=np.int16),
@@ -3944,13 +3954,31 @@ def collect_dataset_episode(
                     max_rough_targets=MAX_ROUGH_TARGETS,
                     max_finish_targets=MAX_FINISH_TARGETS,
                     max_tools_per_class=MAX_TOOLS_PER_CLASS,
-                    allow_finish=bool(t >= EARLY_ROUGH_ONLY_STEPS),
+                    allow_finish=finish_stage,
                     rng=rng,
                 )
-                if MAX_CANDIDATES_PER_BRANCH > 0 and len(candidates) > MAX_CANDIDATES_PER_BRANCH:
+                if finish_stage and FINISH_STAGE_PREFER_FINISH:
+                    finish_candidates = [
+                        c for c in candidates
+                        if str(c.get("macro_class_name", "")) != "indexed_rough"
+                    ]
+                    if finish_candidates:
+                        candidates = finish_candidates
+                candidate_cap = (
+                    MAX_FINISH_CANDIDATES_PER_BRANCH
+                    if finish_stage
+                    else MAX_ROUGH_CANDIDATES_PER_BRANCH
+                )
+                if MAX_GLOBAL_CANDIDATES_PER_BRANCH > 0:
+                    candidate_cap = (
+                        min(candidate_cap, MAX_GLOBAL_CANDIDATES_PER_BRANCH)
+                        if candidate_cap > 0
+                        else MAX_GLOBAL_CANDIDATES_PER_BRANCH
+                    )
+                if candidate_cap > 0 and len(candidates) > candidate_cap:
                     keep_idx = rng.choice(
                         np.arange(len(candidates), dtype=np.int32),
-                        size=int(MAX_CANDIDATES_PER_BRANCH),
+                        size=int(candidate_cap),
                         replace=False,
                     )
                     candidates = [candidates[int(i)] for i in sorted(keep_idx.tolist())]
