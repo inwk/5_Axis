@@ -38,6 +38,15 @@ class TrainConfig:
     # Monotonicity penalty: penalises predicting occupied for already-empty cells.
     # Requires octree_occ_labels_before in the dataset.  Set 0.0 to disable.
     monotonicity_weight: float = 0.1
+    occupancy_loss_weight: float = 0.1
+    fill_fraction_weight: float = 0.5
+    removed_fraction_weight: float = 2.0
+    tsdf_loss_weight: float = 1.0
+    delta_tsdf_loss_weight: float = 0.5
+    tsdf_monotonicity_weight: float = 0.1
+    tsdf_monotonicity_empty_margin: float = 0.2
+    affected_face_loss_weight: float = 1.0
+    affected_delta_loss_weight: float = 0.0
     # EMA-based gradient balancing between planner and octree losses.
     use_loss_balancer: bool = True
     balancer_momentum: float = 0.99
@@ -71,6 +80,15 @@ def run_training(
                 octree_pos_weight_factor=config.octree_pos_weight_factor,
                 octree_depth_weight_base=config.octree_depth_weight_base,
                 monotonicity_weight=config.monotonicity_weight,
+                fill_fraction_weight=config.fill_fraction_weight,
+                removed_fraction_weight=config.removed_fraction_weight,
+                tsdf_loss_weight=config.tsdf_loss_weight,
+                delta_tsdf_loss_weight=config.delta_tsdf_loss_weight,
+                tsdf_monotonicity_weight=config.tsdf_monotonicity_weight,
+                tsdf_monotonicity_empty_margin=config.tsdf_monotonicity_empty_margin,
+                occupancy_loss_weight=config.occupancy_loss_weight,
+                affected_face_loss_weight=config.affected_face_loss_weight,
+                affected_delta_loss_weight=config.affected_delta_loss_weight,
                 balancer=balancer,
             )
             for batch in train_loader
@@ -90,6 +108,15 @@ def run_training(
                 octree_pos_weight_factor=config.octree_pos_weight_factor,
                 octree_depth_weight_base=config.octree_depth_weight_base,
                 monotonicity_weight=config.monotonicity_weight,
+                fill_fraction_weight=config.fill_fraction_weight,
+                removed_fraction_weight=config.removed_fraction_weight,
+                tsdf_loss_weight=config.tsdf_loss_weight,
+                delta_tsdf_loss_weight=config.delta_tsdf_loss_weight,
+                tsdf_monotonicity_weight=config.tsdf_monotonicity_weight,
+                tsdf_monotonicity_empty_margin=config.tsdf_monotonicity_empty_margin,
+                occupancy_loss_weight=config.occupancy_loss_weight,
+                affected_face_loss_weight=config.affected_face_loss_weight,
+                affected_delta_loss_weight=config.affected_delta_loss_weight,
             )
             for batch in val_loader
         ]
@@ -123,6 +150,15 @@ def run_transition_training(
                 octree_pos_weight_factor=config.octree_pos_weight_factor,
                 octree_depth_weight_base=config.octree_depth_weight_base,
                 monotonicity_weight=config.monotonicity_weight,
+                fill_fraction_weight=config.fill_fraction_weight,
+                removed_fraction_weight=config.removed_fraction_weight,
+                tsdf_loss_weight=config.tsdf_loss_weight,
+                delta_tsdf_loss_weight=config.delta_tsdf_loss_weight,
+                tsdf_monotonicity_weight=config.tsdf_monotonicity_weight,
+                tsdf_monotonicity_empty_margin=config.tsdf_monotonicity_empty_margin,
+                occupancy_loss_weight=config.occupancy_loss_weight,
+                affected_face_loss_weight=config.affected_face_loss_weight,
+                affected_delta_loss_weight=config.affected_delta_loss_weight,
             )
             for batch in train_loader
         ]
@@ -134,6 +170,15 @@ def run_transition_training(
                 octree_pos_weight_factor=config.octree_pos_weight_factor,
                 octree_depth_weight_base=config.octree_depth_weight_base,
                 monotonicity_weight=config.monotonicity_weight,
+                fill_fraction_weight=config.fill_fraction_weight,
+                removed_fraction_weight=config.removed_fraction_weight,
+                tsdf_loss_weight=config.tsdf_loss_weight,
+                delta_tsdf_loss_weight=config.delta_tsdf_loss_weight,
+                tsdf_monotonicity_weight=config.tsdf_monotonicity_weight,
+                tsdf_monotonicity_empty_margin=config.tsdf_monotonicity_empty_margin,
+                occupancy_loss_weight=config.occupancy_loss_weight,
+                affected_face_loss_weight=config.affected_face_loss_weight,
+                affected_delta_loss_weight=config.affected_delta_loss_weight,
             )
             for batch in val_loader
         ]

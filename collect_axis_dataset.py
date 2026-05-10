@@ -466,11 +466,19 @@ FINISH_READY_TOL = float(os.getenv("FINISH_READY_TOL", "1.0"))
 # The octree target is the only geometric transition supervision used by the
 # new model.  Current face SDF remains an encoder input, but next-state SDF is
 # no longer required as a training target.
-OCTREE_ENABLED: bool = os.getenv("OCTREE_ENABLED", "1") != "0"
+OCTREE_ENABLED: bool = os.getenv("OCTREE_ENABLED", "0") != "0"
 OCTREE_COARSE_DEPTH: int = int(os.getenv("OCTREE_COARSE_DEPTH", "3"))
 OCTREE_FINE_DEPTH: int = int(os.getenv("OCTREE_FINE_DEPTH", "5"))
-OCTREE_MAX_NODES: int = int(os.getenv("OCTREE_MAX_NODES", "4096"))
+OCTREE_MAX_NODES: int = int(os.getenv("OCTREE_MAX_NODES", "16384"))
 OCTREE_BBOX_PADDING: float = float(os.getenv("OCTREE_BBOX_PADDING", "0.05"))
+OCTREE_FILL_SAMPLES_PER_AXIS: int = max(0, int(os.getenv("OCTREE_FILL_SAMPLES_PER_AXIS", "2")))
+OCTREE_TSDF_ENABLED: bool = os.getenv("OCTREE_TSDF_ENABLED", "1") != "0"
+OCTREE_TSDF_TRUNCATION: float = float(os.getenv("OCTREE_TSDF_TRUNCATION", "5.0"))
+SDF_QUERY_ENABLED: bool = os.getenv("SDF_QUERY_ENABLED", "1") != "0"
+SDF_QUERY_COUNT: int = max(1, int(os.getenv("SDF_QUERY_COUNT", "32768")))
+SDF_QUERY_TRUNCATION: float = float(os.getenv("SDF_QUERY_TRUNCATION", "5.0"))
+SDF_QUERY_SURFACE_JITTER: float = float(os.getenv("SDF_QUERY_SURFACE_JITTER", "1.0"))
+AFFECTED_FACE_DELTA_TOL: float = float(os.getenv("AFFECTED_FACE_DELTA_TOL", "0.01"))
 MEMORY_DEBUG: bool = bool(int(os.getenv("MEMORY_DEBUG", "1")))
 MEMORY_DEBUG_CANDIDATE_EVERY: int = max(1, int(os.getenv("MEMORY_DEBUG_CANDIDATE_EVERY", "1")))
 MEMORY_GUARD_ENABLED: bool = bool(int(os.getenv("MEMORY_GUARD_ENABLED", "1")))
@@ -1635,7 +1643,21 @@ def simulate_single_action(
     octree_max_nodes: int = 4096,
     octree_bbox_padding: float = 0.05,
     octree_enabled: bool = False,
+    octree_fill_samples_per_axis: int = 0,
+    octree_tsdf_enabled: bool = False,
+    octree_tsdf_truncation: float = 5.0,
+    sdf_query_enabled: bool = False,
+    sdf_query_count: int = 16384,
+    sdf_query_truncation: float = 5.0,
+    sdf_query_surface_jitter: float = 1.0,
+    sdf_face_points_raw_512x100x3: "np.ndarray | None" = None,
+    affected_face_delta_tol: float = 0.01,
     memory_log_label: str | None = None,
+    state_obj_before_path: str | None = None,
+    state_obj_after_path: str | None = None,
+    octree_focus_center_raw: "np.ndarray | None" = None,
+    octree_focus_radius_raw: float | None = None,
+    target_sdf_query=None,
 ) -> Dict[str, Any]:
     """Simulates one action and returns transition data.
 
@@ -1760,6 +1782,48 @@ def simulate_single_action(
             result["dev_after_red_512"] = dev_bef_red_512.copy()
             return result
 
+    before_occ_chain_snapshot = list(state_chain)
+    before_occ_query = None
+    if octree_enabled or sdf_query_enabled:
+        m_occ_snapshot = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "sim_snapshot_bef_occ")
+        before_occ_snapshot_chain = list(before_occ_chain_snapshot)
+        try:
+            obj_b_occ_snapshot = create_measure_geometry_for_depth(
+                session, work_part, prt_file_path, before_occ_snapshot_chain, origin_body,
+                int(operation_depth), base_object_blank,
+            )
+            before_occ_query = cam_utils.snapshot_ipw_occupancy_query(
+                session=session,
+                work_part=work_part,
+                object_blank=obj_b_occ_snapshot,
+                tool_name=flat_tools[0],
+            )
+        except Exception as exc:
+            print(f"[WARN] simulate_single_action: before-occupancy snapshot failed: {exc}", flush=True)
+            before_occ_query = None
+        finally:
+            session.UndoToMark(m_occ_snapshot, "sim_snapshot_bef_occ")
+            session.DeleteUndoMark(m_occ_snapshot, "sim_snapshot_bef_occ")
+
+    if state_obj_before_path:
+        m_obj_bef = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "sim_export_bef_obj")
+        export_before_chain = list(before_occ_chain_snapshot)
+        try:
+            obj_b_export = create_measure_geometry_for_depth(
+                session, work_part, prt_file_path, export_before_chain, origin_body,
+                int(operation_depth), base_object_blank,
+            )
+            result["state_obj_path"] = cam_utils.export_ipw_object_blank_to_obj(
+                session=session,
+                work_part=work_part,
+                object_blank=obj_b_export,
+                tool_name=flat_tools[0],
+                output_path=state_obj_before_path,
+            )
+        finally:
+            session.UndoToMark(m_obj_bef, "sim_export_bef_obj")
+            session.DeleteUndoMark(m_obj_bef, "sim_export_bef_obj")
+
     obj_op = create_operation_geometry_for_depth(
         session, work_part, prt_file_path, state_chain, origin_body,
         int(operation_depth), base_object_blank,
@@ -1795,6 +1859,14 @@ def simulate_single_action(
             session, work_part, prt_file_path, state_chain, origin_body,
             int(operation_depth) + 1, base_object_blank,
         )
+        if state_obj_after_path:
+            result["next_state_obj_path"] = cam_utils.export_ipw_object_blank_to_obj(
+                session=session,
+                work_part=work_part,
+                object_blank=obj_a,
+                tool_name=flat_tools[0],
+                output_path=state_obj_after_path,
+            )
         if capture_pw:
             dev_after, pw_raw_aft, vol_after = cam_utils.measure_ipw_state_detailed(
                 session, work_part, obj_a, flat_tools[0],
@@ -1817,21 +1889,48 @@ def simulate_single_action(
 
         # ── Adaptive octree occupancy target (inside try while obj_a is live) ──
         if octree_enabled and octree_bbox_min_raw is not None and octree_bbox_max_raw is not None:
-            centers_raw, depths, labels, bbox_min_for_octree, bbox_max_for_octree = cam_utils.sample_ipw_octree_state(
-                session=session,
-                work_part=work_part,
-                object_blank=obj_a,
-                tool_name=flat_tools[0],
-                bbox_min=np.asarray(octree_bbox_min_raw, dtype=np.float32).reshape(3),
-                bbox_max=np.asarray(octree_bbox_max_raw, dtype=np.float32).reshape(3),
-                coarse_depth=octree_coarse_depth,
-                fine_depth=octree_fine_depth,
-                max_nodes=octree_max_nodes,
-                bbox_padding=octree_bbox_padding,
-            )
+            before_labels_from_sampler = None
+            if before_occ_query is not None:
+                (
+                    centers_raw,
+                    depths,
+                    labels,
+                    before_labels_from_sampler,
+                    bbox_min_for_octree,
+                    bbox_max_for_octree,
+                ) = cam_utils.sample_transition_ipw_octree_state(
+                    session=session,
+                    work_part=work_part,
+                    object_blank_after=obj_a,
+                    tool_name=flat_tools[0],
+                    before_snapshot=before_occ_query,
+                    bbox_min=np.asarray(octree_bbox_min_raw, dtype=np.float32).reshape(3),
+                    bbox_max=np.asarray(octree_bbox_max_raw, dtype=np.float32).reshape(3),
+                    coarse_depth=octree_coarse_depth,
+                    fine_depth=octree_fine_depth,
+                    max_nodes=octree_max_nodes,
+                    bbox_padding=octree_bbox_padding,
+                    focus_center=octree_focus_center_raw,
+                    focus_radius=octree_focus_radius_raw,
+                )
+            else:
+                centers_raw, depths, labels, bbox_min_for_octree, bbox_max_for_octree = cam_utils.sample_ipw_octree_state(
+                    session=session,
+                    work_part=work_part,
+                    object_blank=obj_a,
+                    tool_name=flat_tools[0],
+                    bbox_min=np.asarray(octree_bbox_min_raw, dtype=np.float32).reshape(3),
+                    bbox_max=np.asarray(octree_bbox_max_raw, dtype=np.float32).reshape(3),
+                    coarse_depth=octree_coarse_depth,
+                    fine_depth=octree_fine_depth,
+                    max_nodes=octree_max_nodes,
+                    bbox_padding=octree_bbox_padding,
+                )
             result["octree_centers_raw"] = centers_raw      # [K, 3] world mm
             result["octree_depths"] = depths                # [K] int16
             result["octree_occ_labels"] = labels            # [K] float32  (AFTER labels)
+            if before_labels_from_sampler is not None:
+                result["octree_occ_labels_before"] = np.asarray(before_labels_from_sampler, dtype=np.float32).reshape(-1)
             result["octree_bbox_min_raw"] = bbox_min_for_octree.astype(np.float32)
             result["octree_bbox_max_raw"] = bbox_max_for_octree.astype(np.float32)
             if memory_log_label is not None:
@@ -1850,26 +1949,34 @@ def simulate_single_action(
                     )
 
             # ── Query BEFORE-state occupancy at the same cell positions ──────
-            # Creates the before-operation IPW in a nested undo mark so it does
-            # not interfere with obj_a (the after-state body still live here).
-            # The before-labels enable the monotonicity training constraint.
-            if centers_raw is not None and len(centers_raw) > 0:
-                m_bef2 = session.SetUndoMark(
-                    NXOpen.Session.MarkVisibility.Invisible, "sim_bef_occ"
-                )
-                bef2_chain_snap = list(state_chain)
+            # Prefer the pre-operation mesh snapshot. Querying NX after the
+            # candidate operation can make root-state dummy ops see after IPW.
+            if centers_raw is not None and len(centers_raw) > 0 and "octree_occ_labels_before" not in result:
                 try:
-                    obj_b_inner = create_measure_geometry_for_depth(
-                        session, work_part, prt_file_path, state_chain, origin_body,
-                        int(operation_depth), base_object_blank,
-                    )
-                    before_labels = cam_utils.query_ipw_occupancy_at_positions(
-                        session=session,
-                        work_part=work_part,
-                        object_blank=obj_b_inner,
-                        tool_name=flat_tools[0],
-                        centers_xyz=centers_raw,
-                    )
+                    if before_occ_query is not None:
+                        before_labels = before_occ_query(centers_raw)
+                    else:
+                        m_bef2 = session.SetUndoMark(
+                            NXOpen.Session.MarkVisibility.Invisible, "sim_bef_occ"
+                        )
+                        bef2_chain_snap = list(state_chain)
+                        before_occ_chain = list(before_occ_chain_snapshot)
+                        try:
+                            obj_b_inner = create_measure_geometry_for_depth(
+                                session, work_part, prt_file_path, before_occ_chain, origin_body,
+                                int(operation_depth), base_object_blank,
+                            )
+                            before_labels = cam_utils.query_ipw_occupancy_at_positions(
+                                session=session,
+                                work_part=work_part,
+                                object_blank=obj_b_inner,
+                                tool_name=flat_tools[0],
+                                centers_xyz=centers_raw,
+                            )
+                        finally:
+                            session.UndoToMark(m_bef2, "sim_bef_occ")
+                            session.DeleteUndoMark(m_bef2, "sim_bef_occ")
+                            restore_workpiece_chain(state_chain, bef2_chain_snap)
                     result["octree_occ_labels_before"] = before_labels  # [K] float32
                     if memory_log_label is not None:
                         _log_memory(
@@ -1890,10 +1997,136 @@ def simulate_single_action(
                         f"[WARN] simulate_single_action: before-occupancy query failed: {exc}",
                         flush=True,
                     )
-                finally:
-                    session.UndoToMark(m_bef2, "sim_bef_occ")
-                    session.DeleteUndoMark(m_bef2, "sim_bef_occ")
-                    restore_workpiece_chain(state_chain, bef2_chain_snap)
+
+            fill_samples = int(max(0, octree_fill_samples_per_axis))
+            if centers_raw is not None and len(centers_raw) > 0 and fill_samples > 0:
+                try:
+                    fill_before = (
+                        before_occ_query.fill_fractions(
+                            centers_xyz=centers_raw,
+                            depths=depths,
+                            bbox_min=bbox_min_for_octree,
+                            bbox_max=bbox_max_for_octree,
+                            samples_per_axis=fill_samples,
+                        )
+                        if before_occ_query is not None
+                        else None
+                    )
+                    fill_after = cam_utils.query_ipw_fill_fractions_at_cells(
+                        session=session,
+                        work_part=work_part,
+                        object_blank=obj_a,
+                        tool_name=flat_tools[0],
+                        centers_xyz=centers_raw,
+                        depths=depths,
+                        bbox_min=bbox_min_for_octree,
+                        bbox_max=bbox_max_for_octree,
+                        samples_per_axis=fill_samples,
+                    )
+                    result["octree_fill_after"] = np.asarray(fill_after, dtype=np.float32).reshape(-1)
+                    if fill_before is not None:
+                        fill_before = np.asarray(fill_before, dtype=np.float32).reshape(-1)
+                        result["octree_fill_before"] = fill_before
+                        result["octree_removed_fraction"] = np.maximum(
+                            fill_before - result["octree_fill_after"], 0.0
+                        ).astype(np.float32)
+                except Exception as exc:
+                    print(
+                        f"[WARN] simulate_single_action: octree fill-fraction query failed: {exc}",
+                        flush=True,
+                    )
+
+            if centers_raw is not None and len(centers_raw) > 0 and bool(octree_tsdf_enabled):
+                try:
+                    tau = float(max(float(octree_tsdf_truncation), 1e-6))
+                    tsdf_after = cam_utils.query_ipw_tsdf_at_positions(
+                        session=session,
+                        work_part=work_part,
+                        object_blank=obj_a,
+                        tool_name=flat_tools[0],
+                        centers_xyz=centers_raw,
+                        truncation=tau,
+                    )
+                    result["octree_tsdf_after"] = np.asarray(tsdf_after, dtype=np.float32).reshape(-1)
+                    if before_occ_query is not None:
+                        tsdf_before = np.asarray(
+                            before_occ_query.tsdf(centers_raw, truncation=tau),
+                            dtype=np.float32,
+                        ).reshape(-1)
+                        result["octree_tsdf_before"] = tsdf_before
+                        result["octree_delta_tsdf"] = (
+                            result["octree_tsdf_after"] - tsdf_before
+                        ).astype(np.float32)
+                    if target_sdf_query is not None:
+                        result["octree_target_tsdf"] = np.asarray(
+                            target_sdf_query.tsdf(centers_raw, truncation=tau),
+                            dtype=np.float32,
+                        ).reshape(-1)
+                except Exception as exc:
+                    print(
+                        f"[WARN] simulate_single_action: octree TSDF query failed: {exc}",
+                        flush=True,
+                    )
+
+        if bool(sdf_query_enabled) and before_occ_query is not None:
+            try:
+                after_sdf_query = cam_utils.snapshot_ipw_occupancy_query(
+                    session=session,
+                    work_part=work_part,
+                    object_blank=obj_a,
+                    tool_name=flat_tools[0],
+                )
+                affected_region_points = None
+                if sdf_face_points_raw_512x100x3 is not None:
+                    before_raw = np.asarray(dev_before, dtype=np.float32).reshape(-1)
+                    after_raw = np.asarray(dev_after, dtype=np.float32).reshape(-1)
+                    raw_count = min(before_raw.shape[0], after_raw.shape[0])
+                    affected_idx = np.where(
+                        np.maximum(before_raw[:raw_count] - after_raw[:raw_count], 0.0)
+                        > float(affected_face_delta_tol)
+                    )[0]
+                    if affected_idx.size > 0:
+                        face_points = np.asarray(sdf_face_points_raw_512x100x3, dtype=np.float32).reshape(512, 100, 3)
+                        safe_idx = affected_idx[affected_idx < face_points.shape[0]]
+                        if safe_idx.size > 0:
+                            affected_region_points = face_points[safe_idx].reshape(-1, 3)
+                            affected_region_points = affected_region_points[
+                                np.any(np.abs(affected_region_points) > 1e-12, axis=1)
+                            ]
+                tau = float(max(float(sdf_query_truncation), 1e-6))
+                sdf_points_raw = cam_utils.sample_sdf_transition_query_points(
+                    before_snapshot=before_occ_query,
+                    after_snapshot=after_sdf_query,
+                    target_snapshot=target_sdf_query,
+                    bbox_min=np.asarray(octree_bbox_min_raw, dtype=np.float32).reshape(3) if octree_bbox_min_raw is not None else None,
+                    bbox_max=np.asarray(octree_bbox_max_raw, dtype=np.float32).reshape(3) if octree_bbox_max_raw is not None else None,
+                    count=int(sdf_query_count),
+                    region_points=affected_region_points,
+                    focus_center=octree_focus_center_raw,
+                    focus_radius=octree_focus_radius_raw,
+                    surface_jitter=float(sdf_query_surface_jitter),
+                    seed=int(abs(hash((memory_log_label, action_face_id))) % (2 ** 31)),
+                )
+                sdf_before = before_occ_query.tsdf(sdf_points_raw, truncation=tau)
+                sdf_after = after_sdf_query.tsdf(sdf_points_raw, truncation=tau)
+                result["sdf_query_points_raw"] = np.asarray(sdf_points_raw, dtype=np.float32).reshape(-1, 3)
+                result["sdf_tsdf_before"] = np.asarray(sdf_before, dtype=np.float32).reshape(-1)
+                result["sdf_tsdf_after"] = np.asarray(sdf_after, dtype=np.float32).reshape(-1)
+                result["sdf_delta_tsdf"] = (
+                    result["sdf_tsdf_after"] - result["sdf_tsdf_before"]
+                ).astype(np.float32)
+                if target_sdf_query is not None:
+                    result["sdf_target_tsdf"] = np.asarray(
+                        target_sdf_query.tsdf(sdf_points_raw, truncation=tau),
+                        dtype=np.float32,
+                    ).reshape(-1)
+                if memory_log_label is not None:
+                    _log_memory(f"{memory_log_label}:after_sdf_query", sdf_query_points=int(sdf_points_raw.shape[0]))
+            except Exception as exc:
+                print(
+                    f"[WARN] simulate_single_action: SDF query generation failed: {exc}",
+                    flush=True,
+                )
 
     finally:
         session.UndoToMark(m_aft, "sim_meas_aft")
@@ -2805,6 +3038,13 @@ def collect_dataset_episode(
         origin_body,
         os.path.join(out_dir, "target_body.obj"),
     )
+    target_sdf_query = None
+    if bool(SDF_QUERY_ENABLED) or bool(OCTREE_TSDF_ENABLED):
+        try:
+            target_sdf_query = cam_utils.load_obj_sdf_query(target_body_mesh_path)
+        except Exception as exc:
+            print(f"[WARN] Failed to load target CAD mesh for TSDF queries: {exc}", flush=True)
+            target_sdf_query = None
 
     # Rollout settings:
     # - fixed_steps: bounded horizon for quick data collection.
@@ -2814,7 +3054,7 @@ def collect_dataset_episode(
     ROLLOUT_MODE = os.getenv("ROLLOUT_MODE", "fixed_steps").strip().lower()
     if ROLLOUT_MODE not in {"until_done", "fixed_steps"}:
         raise ValueError(f"Unsupported ROLLOUT_MODE: {ROLLOUT_MODE!r}")
-    FIXED_DECISION_STEPS = int(os.getenv("FIXED_DECISION_STEPS", "6"))
+    FIXED_DECISION_STEPS = int(os.getenv("FIXED_DECISION_STEPS", "1"))
     MAX_TOTAL_DECISION_STEPS = int(os.getenv("MAX_TOTAL_DECISION_STEPS", "64"))
     if FIXED_DECISION_STEPS <= 0 or MAX_TOTAL_DECISION_STEPS <= 0:
         raise ValueError("FIXED_DECISION_STEPS and MAX_TOTAL_DECISION_STEPS must be positive")
@@ -2837,6 +3077,7 @@ def collect_dataset_episode(
     MAX_ROUGH_TARGETS = int(os.getenv("MAX_ROUGH_TARGETS", "3"))
     MAX_FINISH_TARGETS = int(os.getenv("MAX_FINISH_TARGETS", "2"))
     MAX_TOOLS_PER_CLASS = int(os.getenv("MAX_TOOLS_PER_CLASS", "2"))
+    MAX_CANDIDATES_PER_BRANCH = max(0, int(os.getenv("MAX_CANDIDATES_PER_BRANCH", "5")))
     BEAM_WIDTH = max(1, int(os.getenv("BEAM_WIDTH", "2")))
     SAMPLED_BRANCHES = max(0, int(os.getenv("SAMPLED_BRANCHES", "1")))
     finish_ready_tol_default = float(globals().get("FINISH_READY_TOL", 1.0))
@@ -2861,6 +3102,35 @@ def collect_dataset_episode(
     # needs the full episode table in memory. Keep the default conservative.
     PARQUET_WRITE_BATCH_ROWS = max(1, int(os.getenv("PARQUET_WRITE_BATCH_ROWS", "20")))
     ERROR_PART_SNAPSHOT_DIR = os.getenv("ERROR_PART_SNAPSHOT_DIR", "")
+    EXPORT_ROW_STATE_OBJS = bool(int(os.getenv("EXPORT_ROW_STATE_OBJS", "0")))
+    EXPORT_ROW_STATE_OBJS_DIR = os.getenv("EXPORT_ROW_STATE_OBJS_DIR", "").strip()
+    row_state_obj_dir = (
+        os.path.abspath(EXPORT_ROW_STATE_OBJS_DIR)
+        if EXPORT_ROW_STATE_OBJS_DIR
+        else os.path.abspath(os.path.join(out_dir, "row_state_objs"))
+    )
+
+    def _build_row_state_obj_paths(t: int, branch_id: str, candidate_index: int, action: Dict[str, Any]) -> Tuple[str, str]:
+        if not EXPORT_ROW_STATE_OBJS:
+            return "", ""
+        tool_name = f"{action.get('tool_kind', 'tool')}_{float(action.get('tool_diameter', 0.0)):.1f}"
+        stem = _safe_filename(
+            f"t{int(t):02d}_b{branch_id}_c{int(candidate_index):03d}_"
+            f"{action.get('macro_class_name', 'macro')}_{tool_name}_face{action.get('action_face_id', 'face')}"
+        )
+        return (
+            os.path.join(row_state_obj_dir, f"{stem}_s_t.obj"),
+            os.path.join(row_state_obj_dir, f"{stem}_s_t1.obj"),
+        )
+
+    def _delete_row_state_obj_paths(*paths: str) -> None:
+        for path in paths:
+            if not path or not os.path.isfile(path):
+                continue
+            try:
+                os.remove(path)
+            except Exception as exc:
+                print(f"[WARN] Failed to delete rejected row-state OBJ {path}: {exc!r}", flush=True)
 
     def _save_candidate_error_part(t: int, branch_id: str, candidate_index: int, action: Dict[str, Any], exc: Exception) -> str:
         if not bool(SAVE_PART_ON_CANDIDATE_ERROR):
@@ -2970,6 +3240,7 @@ def collect_dataset_episode(
                 "fixed_decision_steps": int(FIXED_DECISION_STEPS),
                 "max_total_decision_steps": int(MAX_TOTAL_DECISION_STEPS),
                 "early_rough_only_steps": int(EARLY_ROUGH_ONLY_STEPS),
+                "max_candidates_per_branch": int(MAX_CANDIDATES_PER_BRANCH),
                 "beam_width": int(BEAM_WIDTH),
                 "sampled_branches": int(SAMPLED_BRANCHES),
                 "max_no_effect_streak": int(MAX_NO_EFFECT_STREAK),
@@ -3009,6 +3280,51 @@ def collect_dataset_episode(
             "fail_on_candidate_error": bool(FAIL_ON_CANDIDATE_ERROR),
             "save_part_on_candidate_error": bool(SAVE_PART_ON_CANDIDATE_ERROR),
             "error_part_snapshot_dir": os.path.abspath(ERROR_PART_SNAPSHOT_DIR or os.path.join(out_dir, "error_prt_snapshots")),
+            "row_state_obj_export": {
+                "enabled": bool(EXPORT_ROW_STATE_OBJS),
+                "dir": row_state_obj_dir if bool(EXPORT_ROW_STATE_OBJS) else "",
+                "state_file_suffix": "_s_t.obj",
+                "next_state_file_suffix": "_s_t1.obj",
+            },
+            "octree_fill_fraction": {
+                "samples_per_axis": int(OCTREE_FILL_SAMPLES_PER_AXIS),
+                "samples_per_cell": int(OCTREE_FILL_SAMPLES_PER_AXIS ** 3) if int(OCTREE_FILL_SAMPLES_PER_AXIS) > 0 else 0,
+            },
+            "octree_tsdf": {
+                "enabled": bool(OCTREE_TSDF_ENABLED),
+                "truncation": float(OCTREE_TSDF_TRUNCATION),
+                "sign": "negative_inside_material_positive_outside",
+                "columns": [
+                    "octree_tsdf_before",
+                    "octree_tsdf_after",
+                    "octree_delta_tsdf",
+                    "octree_target_tsdf",
+                ],
+            },
+            "sdf_query": {
+                "enabled": bool(SDF_QUERY_ENABLED),
+                "count": int(SDF_QUERY_COUNT),
+                "truncation": float(SDF_QUERY_TRUNCATION),
+                "surface_jitter": float(SDF_QUERY_SURFACE_JITTER),
+                "affected_face_delta_tol": float(AFFECTED_FACE_DELTA_TOL),
+                "sign": "negative_inside_material_positive_outside",
+                "columns": [
+                    "sdf_query_points",
+                    "sdf_tsdf_before",
+                    "sdf_tsdf_after",
+                    "sdf_delta_tsdf",
+                    "sdf_target_tsdf",
+                ],
+            },
+            "affected_face_supervision": {
+                "delta_tol": float(AFFECTED_FACE_DELTA_TOL),
+                "columns": [
+                    "affected_face_mask_512",
+                    "affected_face_delta_512",
+                    "affected_face_count",
+                    "affected_face_ratio",
+                ],
+            },
         },
     })
     _np_save(os.path.join(out_dir, "embed_centrality.npy"), centrality)
@@ -3042,11 +3358,21 @@ def collect_dataset_episode(
         "fail_on_candidate_error": bool(FAIL_ON_CANDIDATE_ERROR),
         "save_part_on_candidate_error": bool(SAVE_PART_ON_CANDIDATE_ERROR),
         "error_part_snapshot_dir": os.path.abspath(ERROR_PART_SNAPSHOT_DIR or os.path.join(out_dir, "error_prt_snapshots")),
+        "export_row_state_objs": bool(EXPORT_ROW_STATE_OBJS),
+        "row_state_obj_dir": row_state_obj_dir if bool(EXPORT_ROW_STATE_OBJS) else "",
         "octree_enabled": bool(OCTREE_ENABLED),
         "octree_coarse_depth": int(OCTREE_COARSE_DEPTH),
         "octree_fine_depth": int(OCTREE_FINE_DEPTH),
         "octree_max_nodes": int(OCTREE_MAX_NODES),
         "octree_bbox_padding": float(OCTREE_BBOX_PADDING),
+        "octree_fill_samples_per_axis": int(OCTREE_FILL_SAMPLES_PER_AXIS),
+        "octree_tsdf_enabled": bool(OCTREE_TSDF_ENABLED),
+        "octree_tsdf_truncation": float(OCTREE_TSDF_TRUNCATION),
+        "sdf_query_enabled": bool(SDF_QUERY_ENABLED),
+        "sdf_query_count": int(SDF_QUERY_COUNT),
+        "sdf_query_truncation": float(SDF_QUERY_TRUNCATION),
+        "sdf_query_surface_jitter": float(SDF_QUERY_SURFACE_JITTER),
+        "affected_face_delta_tol": float(AFFECTED_FACE_DELTA_TOL),
         "row_unit": "one_executed_nx_operation",
     }, ensure_ascii=False)
     shared_row_payload: Dict[str, Any] = {
@@ -3072,6 +3398,7 @@ def collect_dataset_episode(
         "rollout_mode": str(ROLLOUT_MODE),
         "fixed_decision_steps": int(FIXED_DECISION_STEPS),
         "max_total_decision_steps": int(MAX_TOTAL_DECISION_STEPS),
+        "max_candidates_per_branch": int(MAX_CANDIDATES_PER_BRANCH),
         "max_no_effect_streak": int(MAX_NO_EFFECT_STREAK),
         "no_effect_removed_volume_eps": float(NO_EFFECT_REMOVED_VOLUME_EPS),
         "no_effect_removed_ratio_gain_eps": float(NO_EFFECT_REMOVED_RATIO_GAIN_EPS),
@@ -3128,6 +3455,16 @@ def collect_dataset_episode(
         axis_visible_512 = _as_i16(result["visible_512"])
 
         next_node_sdf_raw = _as_f32(result["dev_after_red_512"])
+        affected_face_delta_512 = np.maximum(
+            np.asarray(state_node_sdf_raw, dtype=np.float32).reshape(512) - next_node_sdf_raw.reshape(512),
+            0.0,
+        ).astype(np.float32)
+        affected_face_mask_512 = (
+            (affected_face_delta_512 > float(AFFECTED_FACE_DELTA_TOL))
+            & (np.asarray(node_mask_512, dtype=np.int16).reshape(512) == 0)
+        ).astype(np.int16)
+        affected_face_count = int(affected_face_mask_512.sum())
+        valid_face_count = int((np.asarray(node_mask_512, dtype=np.int16).reshape(512) == 0).sum())
 
         state_done_mask_512, state_done_ratio = compute_done_mask_from_dev_red(
             state_node_sdf_raw, SURFACE_FINISH_TOL, node_mask_512=node_mask_512,
@@ -3213,6 +3550,13 @@ def collect_dataset_episode(
         octree_depths: np.ndarray | None = None
         octree_occ_labels: np.ndarray | None = None
         octree_occ_labels_before: np.ndarray | None = None
+        octree_fill_before: np.ndarray | None = None
+        octree_fill_after: np.ndarray | None = None
+        octree_removed_fraction: np.ndarray | None = None
+        octree_tsdf_before: np.ndarray | None = None
+        octree_tsdf_after: np.ndarray | None = None
+        octree_delta_tsdf: np.ndarray | None = None
+        octree_target_tsdf: np.ndarray | None = None
         octree_bbox_min_norm: np.ndarray | None = None
         octree_bbox_max_norm: np.ndarray | None = None
         if OCTREE_ENABLED:
@@ -3220,6 +3564,13 @@ def collect_dataset_episode(
             raw_depths = result.get("octree_depths")             # [K]    | None
             raw_labels = result.get("octree_occ_labels")         # [K]    | None  (after)
             raw_labels_before = result.get("octree_occ_labels_before")  # [K] | None (before)
+            raw_fill_before = result.get("octree_fill_before")
+            raw_fill_after = result.get("octree_fill_after")
+            raw_removed_fraction = result.get("octree_removed_fraction")
+            raw_tsdf_before = result.get("octree_tsdf_before")
+            raw_tsdf_after = result.get("octree_tsdf_after")
+            raw_delta_tsdf = result.get("octree_delta_tsdf")
+            raw_target_tsdf = result.get("octree_target_tsdf")
             if raw_centers is not None and raw_depths is not None and raw_labels is not None:
                 octree_scale = float(max(normalization_scale, 1e-6))
                 raw_c = np.asarray(raw_centers, dtype=np.float32).reshape(-1, 3)
@@ -3228,10 +3579,43 @@ def collect_dataset_episode(
                 octree_occ_labels = np.asarray(raw_labels, dtype=np.float32).reshape(-1)
                 if raw_labels_before is not None:
                     octree_occ_labels_before = np.asarray(raw_labels_before, dtype=np.float32).reshape(-1)
+                if raw_fill_before is not None:
+                    octree_fill_before = np.asarray(raw_fill_before, dtype=np.float32).reshape(-1)
+                if raw_fill_after is not None:
+                    octree_fill_after = np.asarray(raw_fill_after, dtype=np.float32).reshape(-1)
+                if raw_removed_fraction is not None:
+                    octree_removed_fraction = np.asarray(raw_removed_fraction, dtype=np.float32).reshape(-1)
+                if raw_tsdf_before is not None:
+                    octree_tsdf_before = np.asarray(raw_tsdf_before, dtype=np.float32).reshape(-1)
+                if raw_tsdf_after is not None:
+                    octree_tsdf_after = np.asarray(raw_tsdf_after, dtype=np.float32).reshape(-1)
+                if raw_delta_tsdf is not None:
+                    octree_delta_tsdf = np.asarray(raw_delta_tsdf, dtype=np.float32).reshape(-1)
+                if raw_target_tsdf is not None:
+                    octree_target_tsdf = np.asarray(raw_target_tsdf, dtype=np.float32).reshape(-1)
                 raw_bbox_min = np.asarray(result.get("octree_bbox_min_raw", raw_c.min(axis=0)), dtype=np.float32).reshape(3)
                 raw_bbox_max = np.asarray(result.get("octree_bbox_max_raw", raw_c.max(axis=0)), dtype=np.float32).reshape(3)
                 octree_bbox_min_norm = (raw_bbox_min - normalization_center_xyz) / octree_scale
                 octree_bbox_max_norm = (raw_bbox_max - normalization_center_xyz) / octree_scale
+
+        sdf_query_points_norm: np.ndarray | None = None
+        sdf_tsdf_before: np.ndarray | None = None
+        sdf_tsdf_after: np.ndarray | None = None
+        sdf_delta_tsdf: np.ndarray | None = None
+        sdf_target_tsdf: np.ndarray | None = None
+        raw_sdf_points = result.get("sdf_query_points_raw")
+        raw_sdf_after = result.get("sdf_tsdf_after")
+        if raw_sdf_points is not None and raw_sdf_after is not None:
+            sdf_scale = float(max(normalization_scale, 1e-6))
+            raw_q = np.asarray(raw_sdf_points, dtype=np.float32).reshape(-1, 3)
+            sdf_query_points_norm = (raw_q - normalization_center_xyz.reshape(1, 3)) / sdf_scale
+            sdf_tsdf_after = np.asarray(raw_sdf_after, dtype=np.float32).reshape(-1)
+            if result.get("sdf_tsdf_before") is not None:
+                sdf_tsdf_before = np.asarray(result.get("sdf_tsdf_before"), dtype=np.float32).reshape(-1)
+            if result.get("sdf_delta_tsdf") is not None:
+                sdf_delta_tsdf = np.asarray(result.get("sdf_delta_tsdf"), dtype=np.float32).reshape(-1)
+            if result.get("sdf_target_tsdf") is not None:
+                sdf_target_tsdf = np.asarray(result.get("sdf_target_tsdf"), dtype=np.float32).reshape(-1)
 
         return {
             "decision_step": int(decision_step),
@@ -3265,6 +3649,10 @@ def collect_dataset_episode(
             "next_done_mask_512": _as_i16(next_done_mask_512),
             "rough_done_mask_512": _as_i16(rough_done_mask),
             "finish_ready_mask_512": _as_i16(finish_ready_mask),
+            "affected_face_mask_512": _as_i16(affected_face_mask_512),
+            "affected_face_delta_512": _as_f32(affected_face_delta_512),
+            "affected_face_count": int(affected_face_count),
+            "affected_face_ratio": _to_safe_float(affected_face_count / max(valid_face_count, 1)),
             "state_done_ratio": _to_safe_float(state_done_ratio),
             "next_done_ratio": _to_safe_float(next_done_ratio),
 
@@ -3279,6 +3667,8 @@ def collect_dataset_episode(
             "out_removed_ratio": _to_safe_float(removed_volume / max(vol_before, 1e-9)),
             "out_cycle_time": _to_safe_float(result.get("cycle_time", 0.0)),
             "out_ok": bool(result.get("ok", True)),
+            "state_obj_path": str(result.get("state_obj_path", "")),
+            "next_state_obj_path": str(result.get("next_state_obj_path", "")),
 
             # ── Octree occupancy transition target
             "octree_centers": _as_f32(octree_centers_norm).reshape(-1) if octree_centers_norm is not None else None,
@@ -3289,8 +3679,21 @@ def collect_dataset_episode(
             # Used for the monotonicity training constraint:
             #   once a cell is empty (before=0) it must remain empty (after=0).
             "octree_occ_labels_before": _as_f32(octree_occ_labels_before) if octree_occ_labels_before is not None else None,
+            "octree_fill_before": _as_f32(octree_fill_before) if octree_fill_before is not None else None,
+            "octree_fill_after": _as_f32(octree_fill_after) if octree_fill_after is not None else None,
+            "octree_removed_fraction": _as_f32(octree_removed_fraction) if octree_removed_fraction is not None else None,
+            "octree_tsdf_before": _as_f32(octree_tsdf_before) if octree_tsdf_before is not None else None,
+            "octree_tsdf_after": _as_f32(octree_tsdf_after) if octree_tsdf_after is not None else None,
+            "octree_delta_tsdf": _as_f32(octree_delta_tsdf) if octree_delta_tsdf is not None else None,
+            "octree_target_tsdf": _as_f32(octree_target_tsdf) if octree_target_tsdf is not None else None,
             "octree_bbox_min": _as_f32(octree_bbox_min_norm) if octree_bbox_min_norm is not None else None,
             "octree_bbox_max": _as_f32(octree_bbox_max_norm) if octree_bbox_max_norm is not None else None,
+
+            "sdf_query_points": _as_f32(sdf_query_points_norm).reshape(-1) if sdf_query_points_norm is not None else None,
+            "sdf_tsdf_before": _as_f32(sdf_tsdf_before) if sdf_tsdf_before is not None else None,
+            "sdf_tsdf_after": _as_f32(sdf_tsdf_after) if sdf_tsdf_after is not None else None,
+            "sdf_delta_tsdf": _as_f32(sdf_delta_tsdf) if sdf_delta_tsdf is not None else None,
+            "sdf_target_tsdf": _as_f32(sdf_target_tsdf) if sdf_target_tsdf is not None else None,
         }
 
     rng = np.random.default_rng(int(seed))
@@ -3544,6 +3947,13 @@ def collect_dataset_episode(
                     allow_finish=bool(t >= EARLY_ROUGH_ONLY_STEPS),
                     rng=rng,
                 )
+                if MAX_CANDIDATES_PER_BRANCH > 0 and len(candidates) > MAX_CANDIDATES_PER_BRANCH:
+                    keep_idx = rng.choice(
+                        np.arange(len(candidates), dtype=np.int32),
+                        size=int(MAX_CANDIDATES_PER_BRANCH),
+                        replace=False,
+                    )
+                    candidates = [candidates[int(i)] for i in sorted(keep_idx.tolist())]
                 candidate_tools = sorted({
                     f"{c['tool_kind']}_{float(c['tool_diameter']):.1f}" for c in candidates
                 })
@@ -3592,6 +4002,21 @@ def collect_dataset_episode(
                     memory_log_label = None
                     if MEMORY_DEBUG and (ci % MEMORY_DEBUG_CANDIDATE_EVERY == 0 or ci == len(candidates) - 1):
                         memory_log_label = f"candidate:t{t}:b{branch['id']}:c{ci}"
+                    state_obj_before_path, state_obj_after_path = _build_row_state_obj_paths(
+                        int(t), str(branch["id"]), int(ci), action,
+                    )
+                    focus_center_raw = None
+                    focus_radius_raw = None
+                    action_face_id = int(action.get("action_face_id", -1))
+                    if 0 <= action_face_id < face_pc_raw_512.shape[0]:
+                        focus_points = np.asarray(face_pc_raw_512[action_face_id], dtype=np.float32).reshape(-1, 3)
+                        focus_valid = np.any(np.abs(focus_points) > 1e-12, axis=1)
+                        focus_points = focus_points[focus_valid]
+                        if focus_points.size > 0:
+                            focus_center_raw = focus_points.mean(axis=0).astype(np.float32)
+                            local_radius = float(np.max(np.linalg.norm(focus_points - focus_center_raw.reshape(1, 3), axis=1)))
+                            fine_cell = float(np.max(np.maximum(_oct_raw_max - _oct_raw_min, 1e-6)) / max(1, 2 ** OCTREE_FINE_DEPTH))
+                            focus_radius_raw = max(local_radius, fine_cell * 6.0)
                     cand_chain_snapshot = list(workpiece_name_chain)
                     memory_guard_token = _wait_for_memory_headroom(
                         "candidate",
@@ -3637,7 +4062,21 @@ def collect_dataset_episode(
                             octree_max_nodes=OCTREE_MAX_NODES,
                             octree_bbox_padding=OCTREE_BBOX_PADDING,
                             octree_enabled=OCTREE_ENABLED,
+                            octree_fill_samples_per_axis=OCTREE_FILL_SAMPLES_PER_AXIS,
+                            octree_tsdf_enabled=OCTREE_TSDF_ENABLED,
+                            octree_tsdf_truncation=OCTREE_TSDF_TRUNCATION,
+                            sdf_query_enabled=SDF_QUERY_ENABLED,
+                            sdf_query_count=SDF_QUERY_COUNT,
+                            sdf_query_truncation=SDF_QUERY_TRUNCATION,
+                            sdf_query_surface_jitter=SDF_QUERY_SURFACE_JITTER,
+                            sdf_face_points_raw_512x100x3=face_pc_raw_512,
+                            affected_face_delta_tol=AFFECTED_FACE_DELTA_TOL,
                             memory_log_label=memory_log_label,
+                            state_obj_before_path=state_obj_before_path or None,
+                            state_obj_after_path=state_obj_after_path or None,
+                            octree_focus_center_raw=focus_center_raw,
+                            octree_focus_radius_raw=focus_radius_raw,
+                            target_sdf_query=target_sdf_query,
                         )
                     except Exception as exc:
                         candidate_error_snapshot_path = _save_candidate_error_part(
@@ -3684,6 +4123,7 @@ def collect_dataset_episode(
                     if candidate_error is not None:
                         if bool(FAIL_ON_CANDIDATE_ERROR):
                             raise candidate_error
+                        _delete_row_state_obj_paths(state_obj_before_path, state_obj_after_path)
                         reject_stats["cam_error"] += 1
                         if len(reject_examples) < 5:
                             reject_examples.append(
@@ -3726,6 +4166,7 @@ def collect_dataset_episode(
                     is_zero_effect = bool(effect_eval["is_zero_effect"])
                     is_effective = bool(effect_eval["is_effective"])
                     if is_zero_effect or not is_effective:
+                        _delete_row_state_obj_paths(state_obj_before_path, state_obj_after_path)
                         stat_key = "no_effect" if is_zero_effect else "below_min_effect"
                         reject_stats[stat_key] += 1
                         if len(reject_examples) < 5:

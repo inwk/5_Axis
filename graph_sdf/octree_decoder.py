@@ -180,7 +180,7 @@ class OctreeDecoder(nn.Module):
             nn.LayerNorm(hidden),
         )
         self.current_occ_proj = nn.Sequential(
-            nn.Linear(2, hidden),
+            nn.Linear(4, hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden),
@@ -206,6 +206,95 @@ class OctreeDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(hidden // 2, 1),
         )
+        self.tsdf_head = nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.Linear(hidden // 2, 1),
+            nn.Tanh(),
+        )
+
+    def _current_query_features(
+        self,
+        octree_occ_before: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Builds [before_tsdf, target_tsdf, before_fill_or_occ, known]."""
+        if octree_occ_before is None:
+            return None
+        q = octree_occ_before.float()
+        if q.ndim == 2:
+            before_fill = q.clamp(0.0, 1.0)
+            zeros = torch.zeros_like(before_fill)
+            known = torch.ones_like(before_fill)
+            return torch.stack([zeros, zeros, before_fill, known], dim=-1)
+        if q.ndim == 3:
+            if q.shape[-1] == 1:
+                before_fill = q[..., 0].clamp(0.0, 1.0)
+                zeros = torch.zeros_like(before_fill)
+                known = torch.ones_like(before_fill)
+                return torch.stack([zeros, zeros, before_fill, known], dim=-1)
+            if q.shape[-1] >= 4:
+                return q[..., :4]
+            pad = torch.zeros(
+                (*q.shape[:-1], 4 - q.shape[-1]),
+                device=q.device,
+                dtype=q.dtype,
+            )
+            return torch.cat([q, pad], dim=-1)
+        raise ValueError(f"Unsupported octree_occ_before shape: {tuple(q.shape)}")
+
+    def _decode_features(
+        self,
+        node_embeddings: torch.Tensor,
+        action_context: torch.Tensor,
+        octree_centers: torch.Tensor,
+        octree_depths: torch.Tensor,
+        octree_occ_before: Optional[torch.Tensor] = None,
+        node_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        norm_depth = octree_depths.float() / float(max(self.max_depth, 1))
+        xyzd = torch.cat([octree_centers, norm_depth.unsqueeze(-1)], dim=-1)
+        query_features = self.input_proj(self.pos_enc(xyzd))
+
+        current_query_features = self._current_query_features(octree_occ_before)
+        if current_query_features is not None:
+            query_features = query_features + self.current_occ_proj(
+                current_query_features.to(query_features.device)
+            )
+
+        depth_clamped = octree_depths.long().clamp(0, self.max_depth)
+        query_features = query_features + self.depth_embedding(depth_clamped)
+
+        for block in self.decoder_blocks:
+            query_features = block(
+                query_features=query_features,
+                node_embeddings=node_embeddings,
+                action_context=action_context,
+                node_key_padding_mask=node_mask,
+            )
+        return query_features
+
+    def forward_outputs(
+        self,
+        node_embeddings: torch.Tensor,
+        action_context: torch.Tensor,
+        octree_centers: torch.Tensor,
+        octree_depths: torch.Tensor,
+        octree_occ_before: Optional[torch.Tensor] = None,
+        node_mask: Optional[torch.Tensor] = None,
+    ) -> dict[str, torch.Tensor]:
+        features = self._decode_features(
+            node_embeddings=node_embeddings,
+            action_context=action_context,
+            octree_centers=octree_centers,
+            octree_depths=octree_depths,
+            octree_occ_before=octree_occ_before,
+            node_mask=node_mask,
+        )
+        return {
+            "occ_logits": self.output_head(features).squeeze(-1),
+            "tsdf": self.tsdf_head(features).squeeze(-1),
+        }
 
     def forward(
         self,
@@ -219,35 +308,14 @@ class OctreeDecoder(nn.Module):
         """Returns occupancy logits [B, K]."""
 
         # Build (x, y, z, normalised_depth) ← all ∈ [-1,1] or [0,1]
-        norm_depth = octree_depths.float() / float(max(self.max_depth, 1))  # [B, K]
-        xyzd = torch.cat([octree_centers, norm_depth.unsqueeze(-1)], dim=-1)  # [B, K, 4]
-
-        # Fourier-encode + project
-        pos_encoded     = self.pos_enc(xyzd)                   # [B, K, pos_dim]
-        query_features  = self.input_proj(pos_encoded)          # [B, K, H]
-
-        if octree_occ_before is not None:
-            occ_before = octree_occ_before.float().clamp(0.0, 1.0)
-            if occ_before.ndim == 3 and occ_before.shape[-1] == 1:
-                occ_before = occ_before.squeeze(-1)
-            known = torch.ones_like(occ_before)
-            current_occ_features = torch.stack([occ_before, known], dim=-1)
-            query_features = query_features + self.current_occ_proj(current_occ_features)
-
-        # Add depth embedding
-        depth_clamped = octree_depths.long().clamp(0, self.max_depth)
-        query_features = query_features + self.depth_embedding(depth_clamped)  # [B, K, H]
-
-        # Cross-attend to face-graph nodes with FiLM conditioning
-        for block in self.decoder_blocks:
-            query_features = block(
-                query_features=query_features,
-                node_embeddings=node_embeddings,
-                action_context=action_context,
-                node_key_padding_mask=node_mask,
-            )
-
-        return self.output_head(query_features).squeeze(-1)     # [B, K]
+        return self.forward_outputs(
+            node_embeddings=node_embeddings,
+            action_context=action_context,
+            octree_centers=octree_centers,
+            octree_depths=octree_depths,
+            octree_occ_before=octree_occ_before,
+            node_mask=node_mask,
+        )["occ_logits"]
 
     # ── Mesh extraction helpers ────────────────────────────────────────────
 

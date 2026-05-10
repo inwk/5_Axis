@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from .losses import (
     monotonicity_occupancy_loss,
@@ -193,6 +194,15 @@ def _compute_octree_loss(
     octree_pos_weight_factor: float,
     octree_depth_weight_base: float = 2.0,
     monotonicity_weight: float = 0.1,
+    fill_fraction_weight: float = 0.5,
+    removed_fraction_weight: float = 2.0,
+    tsdf_loss_weight: float = 1.0,
+    delta_tsdf_loss_weight: float = 0.5,
+    tsdf_monotonicity_weight: float = 0.1,
+    tsdf_monotonicity_empty_margin: float = 0.2,
+    occupancy_loss_weight: float = 0.1,
+    affected_face_loss_weight: float = 1.0,
+    affected_delta_loss_weight: float = 0.0,
 ) -> torch.Tensor:
     """Computes octree occupancy loss (depth-weighted BCE + optional monotonicity).
 
@@ -209,6 +219,20 @@ def _compute_octree_loss(
     """
     if octree_loss_weight <= 0.0:
         return torch.zeros((), device=device, dtype=inputs["state_points"].dtype)
+    if "sdf_query_points" in batch and "sdf_tsdf_after" in batch:
+        return _compute_transition_only_sdf_query_loss(
+            model=model,
+            batch=batch,
+            inputs=inputs,
+            device=device,
+            tsdf_loss_weight=tsdf_loss_weight,
+            delta_tsdf_loss_weight=delta_tsdf_loss_weight,
+            tsdf_monotonicity_weight=tsdf_monotonicity_weight,
+            tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
+            affected_face_loss_weight=affected_face_loss_weight,
+            affected_delta_loss_weight=affected_delta_loss_weight,
+            state_embedding=outputs.get("state_embedding"),
+        )
     if model.octree_decoder is None:
         return torch.zeros((), device=device, dtype=inputs["state_points"].dtype)
     if "octree_centers" not in batch or "octree_depths" not in batch or "octree_occ_labels" not in batch:
@@ -217,16 +241,7 @@ def _compute_octree_loss(
     octree_centers = batch["octree_centers"].to(device)
     octree_depths = batch["octree_depths"].to(device)
     octree_labels = batch["octree_occ_labels"].to(device)
-    octree_occ_before = None
-    if "octree_occ_labels_before" in batch:
-        labels_before_for_decoder = batch["octree_occ_labels_before"].to(device)
-        before_valid_for_decoder = (
-            batch["octree_occ_labels_before_valid"].to(device)
-            if "octree_occ_labels_before_valid" in batch
-            else None
-        )
-        if before_valid_for_decoder is None or bool(before_valid_for_decoder.sum().item() >= before_valid_for_decoder.numel()):
-            octree_occ_before = labels_before_for_decoder
+    octree_occ_before = _octree_before_decoder_input(batch, device)
 
     octree_outputs = model.forward_octree(
         state_points=inputs["state_points"],
@@ -272,7 +287,302 @@ def _compute_octree_loss(
             valid_mask=before_valid,
         )
 
-    return bce + monotonicity_weight * mono
+    fill = _compute_octree_fill_fraction_loss(
+        occ_logits=occ_logits,
+        batch=batch,
+        device=device,
+        fill_fraction_weight=fill_fraction_weight,
+        removed_fraction_weight=removed_fraction_weight,
+    )
+    tsdf = _compute_octree_tsdf_loss(
+        octree_outputs=octree_outputs,
+        batch=batch,
+        device=device,
+        tsdf_loss_weight=tsdf_loss_weight,
+        delta_tsdf_loss_weight=delta_tsdf_loss_weight,
+        tsdf_monotonicity_weight=tsdf_monotonicity_weight,
+        tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
+    )
+
+    return float(occupancy_loss_weight) * bce + monotonicity_weight * mono + fill + tsdf
+
+
+def _octree_before_decoder_input(batch: dict, device: torch.device) -> torch.Tensor | None:
+    """Returns per-query condition: before TSDF, target TSDF, before fill, known."""
+    before_fill = None
+    if "octree_fill_before" in batch:
+        before_fill = batch["octree_fill_before"].to(device).float().clamp(0.0, 1.0)
+    elif "octree_occ_labels_before" in batch:
+        labels_before = batch["octree_occ_labels_before"].to(device).float().clamp(0.0, 1.0)
+        before_valid = (
+            batch["octree_occ_labels_before_valid"].to(device)
+            if "octree_occ_labels_before_valid" in batch
+            else None
+        )
+        if before_valid is None or bool(before_valid.sum().item() >= before_valid.numel()):
+            before_fill = labels_before
+
+    before_tsdf = (
+        batch["octree_tsdf_before"].to(device).float().clamp(-1.0, 1.0)
+        if "octree_tsdf_before" in batch
+        else None
+    )
+    target_tsdf = (
+        batch["octree_target_tsdf"].to(device).float().clamp(-1.0, 1.0)
+        if "octree_target_tsdf" in batch
+        else None
+    )
+    if before_fill is None and before_tsdf is None and target_tsdf is None:
+        return None
+
+    ref = before_tsdf if before_tsdf is not None else target_tsdf if target_tsdf is not None else before_fill
+    zeros = torch.zeros_like(ref)
+    ones = torch.ones_like(ref)
+    return torch.stack([
+        before_tsdf if before_tsdf is not None else zeros,
+        target_tsdf if target_tsdf is not None else zeros,
+        before_fill if before_fill is not None else zeros,
+        ones,
+    ], dim=-1)
+
+
+def _compute_octree_tsdf_loss(
+    octree_outputs: dict,
+    batch: dict,
+    device: torch.device,
+    tsdf_loss_weight: float = 1.0,
+    delta_tsdf_loss_weight: float = 0.5,
+    tsdf_monotonicity_weight: float = 0.1,
+    tsdf_monotonicity_empty_margin: float = 0.2,
+) -> torch.Tensor:
+    """Primary TSDF supervision for 3D transition learning."""
+    loss = torch.zeros((), device=device)
+    if "tsdf" not in octree_outputs or "octree_tsdf_after" not in batch:
+        return loss
+
+    pred_after = octree_outputs["tsdf"]
+    target_after = batch["octree_tsdf_after"].to(device).float().clamp(-1.0, 1.0)
+    if tsdf_loss_weight > 0.0:
+        loss = loss + float(tsdf_loss_weight) * F.smooth_l1_loss(
+            pred_after,
+            target_after,
+            reduction="mean",
+        )
+
+    if "octree_tsdf_before" in batch:
+        before = batch["octree_tsdf_before"].to(device).float().clamp(-1.0, 1.0)
+        target_delta = (
+            batch["octree_delta_tsdf"].to(device).float().clamp(-2.0, 2.0)
+            if "octree_delta_tsdf" in batch
+            else target_after - before
+        )
+        if delta_tsdf_loss_weight > 0.0:
+            pred_delta = pred_after - before
+            loss = loss + float(delta_tsdf_loss_weight) * F.smooth_l1_loss(
+                pred_delta,
+                target_delta,
+                reduction="mean",
+            )
+        if tsdf_monotonicity_weight > 0.0:
+            empty_mask = before > float(tsdf_monotonicity_empty_margin)
+            if bool(empty_mask.any().item()):
+                loss = loss + float(tsdf_monotonicity_weight) * F.relu(before - pred_after)[empty_mask].mean()
+    return loss
+
+
+def _compute_octree_fill_fraction_loss(
+    occ_logits: torch.Tensor,
+    batch: dict,
+    device: torch.device,
+    fill_fraction_weight: float = 0.5,
+    removed_fraction_weight: float = 2.0,
+) -> torch.Tensor:
+    """Adds dense fill-fraction supervision when those parquet targets exist."""
+    loss = torch.zeros((), device=device, dtype=occ_logits.dtype)
+    if fill_fraction_weight <= 0.0 and removed_fraction_weight <= 0.0:
+        return loss
+
+    pred_after_fill = torch.sigmoid(occ_logits)
+    if fill_fraction_weight > 0.0 and "octree_fill_after" in batch:
+        target_after_fill = batch["octree_fill_after"].to(device).float().clamp(0.0, 1.0)
+        loss = loss + float(fill_fraction_weight) * F.smooth_l1_loss(
+            pred_after_fill,
+            target_after_fill,
+            reduction="mean",
+        )
+
+    if removed_fraction_weight > 0.0 and "octree_removed_fraction" in batch:
+        before_fill = None
+        if "octree_fill_before" in batch:
+            before_fill = batch["octree_fill_before"].to(device).float().clamp(0.0, 1.0)
+        elif "octree_occ_labels_before" in batch:
+            before_fill = batch["octree_occ_labels_before"].to(device).float().clamp(0.0, 1.0)
+        if before_fill is not None:
+            target_removed = batch["octree_removed_fraction"].to(device).float().clamp(0.0, 1.0)
+            pred_removed = F.relu(before_fill - pred_after_fill)
+            loss = loss + float(removed_fraction_weight) * F.smooth_l1_loss(
+                pred_removed,
+                target_removed,
+                reduction="mean",
+            )
+    return loss
+
+
+def _sdf_query_state_input(batch: dict, device: torch.device) -> torch.Tensor | None:
+    """Builds [before_tsdf, target_tsdf, known] for SDF query decoder."""
+    before = (
+        batch["sdf_tsdf_before"].to(device).float().clamp(-1.0, 1.0)
+        if "sdf_tsdf_before" in batch
+        else None
+    )
+    target = (
+        batch["sdf_target_tsdf"].to(device).float().clamp(-1.0, 1.0)
+        if "sdf_target_tsdf" in batch
+        else None
+    )
+    if before is None and target is None:
+        return None
+    ref = before if before is not None else target
+    zeros = torch.zeros_like(ref)
+    ones = torch.ones_like(ref)
+    return torch.stack([
+        before if before is not None else zeros,
+        target if target is not None else zeros,
+        ones,
+    ], dim=-1)
+
+
+def _compute_affected_face_loss(
+    model: GraphSdfPlanningModel,
+    batch: dict,
+    inputs: dict,
+    device: torch.device,
+    state_embedding: torch.Tensor,
+    affected_face_loss_weight: float = 1.0,
+    affected_delta_loss_weight: float = 0.0,
+) -> torch.Tensor:
+    """Auxiliary loss: predict which faces change under the current action."""
+    if affected_face_loss_weight <= 0.0 and affected_delta_loss_weight <= 0.0:
+        return torch.zeros((), device=device, dtype=state_embedding.dtype)
+    if "affected_face_mask" not in batch:
+        return torch.zeros((), device=device, dtype=state_embedding.dtype)
+
+    out = model.forward_affected_faces(
+        state_points=inputs["state_points"],
+        macro_class_id=inputs["target_macro_class"],
+        tool_choice_id=inputs["target_tool_choice"],
+        action_face_id=inputs["target_action_face"].clamp_min(0),
+        axis_visible=inputs["axis_visible"],
+        node_process_state=inputs["node_process_state"],
+        node_centrality=inputs["node_centrality"],
+        spatial_pos=inputs["spatial_pos"],
+        face_area=inputs["face_area"],
+        node_face_type=inputs["node_face_type"],
+        node_mask=inputs["node_mask"],
+        point_mask=inputs["point_mask"],
+        state_embedding=state_embedding,
+    )
+    logits = out["affected_logits"]
+    target = batch["affected_face_mask"].to(device).float().clamp(0.0, 1.0)
+    valid = ~inputs["node_mask"] if inputs["node_mask"] is not None else torch.ones_like(target, dtype=torch.bool)
+
+    loss = torch.zeros((), device=device, dtype=logits.dtype)
+    if affected_face_loss_weight > 0.0:
+        valid_target = target[valid]
+        pos = valid_target.sum()
+        neg = valid_target.numel() - pos
+        pos_weight = torch.clamp(neg / pos.clamp_min(1.0), min=1.0, max=50.0)
+        bce = F.binary_cross_entropy_with_logits(
+            logits,
+            target,
+            pos_weight=pos_weight,
+            reduction="none",
+        )
+        loss = loss + float(affected_face_loss_weight) * (
+            bce[valid].sum() / valid.float().sum().clamp_min(1.0)
+        )
+
+    if affected_delta_loss_weight > 0.0 and "affected_face_delta" in batch:
+        positive = valid & (target > 0.5)
+        if bool(positive.any().item()):
+            target_delta = batch["affected_face_delta"].to(device).float().clamp_min(0.0)
+            loss = loss + float(affected_delta_loss_weight) * F.smooth_l1_loss(
+                out["affected_delta"][positive],
+                target_delta[positive],
+                reduction="mean",
+            )
+    return loss
+
+
+def _compute_transition_only_sdf_query_loss(
+    model: GraphSdfPlanningModel,
+    batch: dict,
+    inputs: dict,
+    device: torch.device,
+    tsdf_loss_weight: float = 1.0,
+    delta_tsdf_loss_weight: float = 0.5,
+    tsdf_monotonicity_weight: float = 0.1,
+    tsdf_monotonicity_empty_margin: float = 0.2,
+    affected_face_loss_weight: float = 1.0,
+    affected_delta_loss_weight: float = 0.0,
+    state_embedding: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Computes SDF-only transition loss with GT action labels."""
+    if getattr(model, "sdf_query_decoder", None) is None:
+        raise RuntimeError("SDF-only training requires model.sdf_query_decoder to be enabled.")
+    if "sdf_query_points" not in batch or "sdf_tsdf_after" not in batch:
+        raise RuntimeError("SDF-only training requires 'sdf_query_points' and 'sdf_tsdf_after'.")
+
+    if state_embedding is None:
+        state_embedding = _encode_state_only(model, inputs)
+    outputs = model.forward_sdf_query(
+        state_points=inputs["state_points"],
+        macro_class_id=inputs["target_macro_class"],
+        tool_choice_id=inputs["target_tool_choice"],
+        action_face_id=inputs["target_action_face"].clamp_min(0),
+        sdf_query_points=batch["sdf_query_points"].to(device),
+        sdf_query_state=_sdf_query_state_input(batch, device),
+        axis_visible=inputs["axis_visible"],
+        node_process_state=inputs["node_process_state"],
+        node_centrality=inputs["node_centrality"],
+        spatial_pos=inputs["spatial_pos"],
+        face_area=inputs["face_area"],
+        node_face_type=inputs["node_face_type"],
+        node_mask=inputs["node_mask"],
+        point_mask=inputs["point_mask"],
+        state_embedding=state_embedding,
+    )
+    pred_after = outputs["sdf_tsdf"]
+    target_after = batch["sdf_tsdf_after"].to(device).float().clamp(-1.0, 1.0)
+    loss = float(tsdf_loss_weight) * F.smooth_l1_loss(pred_after, target_after, reduction="mean")
+
+    if "sdf_tsdf_before" in batch:
+        before = batch["sdf_tsdf_before"].to(device).float().clamp(-1.0, 1.0)
+        target_delta = (
+            batch["sdf_delta_tsdf"].to(device).float().clamp(-2.0, 2.0)
+            if "sdf_delta_tsdf" in batch
+            else target_after - before
+        )
+        if delta_tsdf_loss_weight > 0.0:
+            loss = loss + float(delta_tsdf_loss_weight) * F.smooth_l1_loss(
+                pred_after - before,
+                target_delta,
+                reduction="mean",
+            )
+        if tsdf_monotonicity_weight > 0.0:
+            empty_mask = before > float(tsdf_monotonicity_empty_margin)
+            if bool(empty_mask.any().item()):
+                loss = loss + float(tsdf_monotonicity_weight) * F.relu(before - pred_after)[empty_mask].mean()
+    loss = loss + _compute_affected_face_loss(
+        model=model,
+        batch=batch,
+        inputs=inputs,
+        device=device,
+        state_embedding=state_embedding,
+        affected_face_loss_weight=affected_face_loss_weight,
+        affected_delta_loss_weight=affected_delta_loss_weight,
+    )
+    return loss
 
 
 def _compute_transition_only_octree_loss(
@@ -283,6 +593,13 @@ def _compute_transition_only_octree_loss(
     octree_pos_weight_factor: float,
     octree_depth_weight_base: float = 2.0,
     monotonicity_weight: float = 0.1,
+    fill_fraction_weight: float = 0.5,
+    removed_fraction_weight: float = 2.0,
+    tsdf_loss_weight: float = 1.0,
+    delta_tsdf_loss_weight: float = 0.5,
+    tsdf_monotonicity_weight: float = 0.1,
+    tsdf_monotonicity_empty_margin: float = 0.2,
+    occupancy_loss_weight: float = 0.1,
 ) -> torch.Tensor:
     """Computes octree occupancy loss with action labels as inputs and no planner path.
 
@@ -298,16 +615,7 @@ def _compute_transition_only_octree_loss(
         )
 
     octree_depths = batch["octree_depths"].to(device)
-    octree_occ_before = None
-    if "octree_occ_labels_before" in batch:
-        labels_before_for_decoder = batch["octree_occ_labels_before"].to(device)
-        before_valid_for_decoder = (
-            batch["octree_occ_labels_before_valid"].to(device)
-            if "octree_occ_labels_before_valid" in batch
-            else None
-        )
-        if before_valid_for_decoder is None or bool(before_valid_for_decoder.sum().item() >= before_valid_for_decoder.numel()):
-            octree_occ_before = labels_before_for_decoder
+    octree_occ_before = _octree_before_decoder_input(batch, device)
     state_embedding = _encode_state_only(model, inputs)
     octree_outputs = model.forward_octree(
         state_points=inputs["state_points"],
@@ -352,7 +660,24 @@ def _compute_transition_only_octree_loss(
             valid_mask=before_valid,
         )
 
-    return bce + monotonicity_weight * mono
+    fill = _compute_octree_fill_fraction_loss(
+        occ_logits=occ_logits,
+        batch=batch,
+        device=device,
+        fill_fraction_weight=fill_fraction_weight,
+        removed_fraction_weight=removed_fraction_weight,
+    )
+    tsdf = _compute_octree_tsdf_loss(
+        octree_outputs=octree_outputs,
+        batch=batch,
+        device=device,
+        tsdf_loss_weight=tsdf_loss_weight,
+        delta_tsdf_loss_weight=delta_tsdf_loss_weight,
+        tsdf_monotonicity_weight=tsdf_monotonicity_weight,
+        tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
+    )
+
+    return float(occupancy_loss_weight) * bce + monotonicity_weight * mono + fill + tsdf
 
 
 def planner_train_step(
@@ -370,8 +695,16 @@ def planner_train_step(
     octree_pos_weight_factor: float = 2.0,
     octree_depth_weight_base: float = 2.0,
     monotonicity_weight: float = 0.1,
+    fill_fraction_weight: float = 0.5,
+    removed_fraction_weight: float = 2.0,
+    tsdf_loss_weight: float = 1.0,
+    delta_tsdf_loss_weight: float = 0.5,
+    tsdf_monotonicity_weight: float = 0.1,
+    tsdf_monotonicity_empty_margin: float = 0.2,
     occupancy_loss_weight: float | None = None,
     occ_pos_weight_factor: float | None = None,
+    affected_face_loss_weight: float = 1.0,
+    affected_delta_loss_weight: float = 0.0,
     balancer: "EMALossBalancer | None" = None,
 ) -> float:
     """Runs one optimizer step for planner plus octree-only transition learning.
@@ -387,8 +720,6 @@ def planner_train_step(
             octree terms contribute with comparable gradient magnitudes.
     """
     del transition_loss_weight, point_sdf_loss_weight, changed_mask_loss_weight
-    if occupancy_loss_weight is not None:
-        octree_loss_weight = occupancy_loss_weight
     if occ_pos_weight_factor is not None:
         octree_pos_weight_factor = occ_pos_weight_factor
 
@@ -415,6 +746,15 @@ def planner_train_step(
         octree_pos_weight_factor,
         octree_depth_weight_base=octree_depth_weight_base,
         monotonicity_weight=monotonicity_weight,
+        fill_fraction_weight=fill_fraction_weight,
+        removed_fraction_weight=removed_fraction_weight,
+        tsdf_loss_weight=tsdf_loss_weight,
+        delta_tsdf_loss_weight=delta_tsdf_loss_weight,
+        tsdf_monotonicity_weight=tsdf_monotonicity_weight,
+        tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
+        occupancy_loss_weight=float(occupancy_loss_weight if occupancy_loss_weight is not None else 0.1),
+        affected_face_loss_weight=affected_face_loss_weight,
+        affected_delta_loss_weight=affected_delta_loss_weight,
     )
 
     # ── Loss combination with optional EMA balancing ──────────────────────
@@ -440,6 +780,15 @@ def transition_train_step(
     octree_pos_weight_factor: float = 2.0,
     octree_depth_weight_base: float = 2.0,
     monotonicity_weight: float = 0.1,
+    fill_fraction_weight: float = 0.5,
+    removed_fraction_weight: float = 2.0,
+    tsdf_loss_weight: float = 1.0,
+    delta_tsdf_loss_weight: float = 0.5,
+    tsdf_monotonicity_weight: float = 0.1,
+    tsdf_monotonicity_empty_margin: float = 0.2,
+    occupancy_loss_weight: float = 0.1,
+    affected_face_loss_weight: float = 1.0,
+    affected_delta_loss_weight: float = 0.0,
 ) -> float:
     """Runs one optimizer step for transition-only octree learning.
 
@@ -455,15 +804,36 @@ def transition_train_step(
     optimizer.zero_grad(set_to_none=True)
 
     inputs = _collect_common_inputs(batch, device)
-    loss = _compute_transition_only_octree_loss(
-        model=model,
-        batch=batch,
-        inputs=inputs,
-        device=device,
-        octree_pos_weight_factor=octree_pos_weight_factor,
-        octree_depth_weight_base=octree_depth_weight_base,
-        monotonicity_weight=monotonicity_weight,
-    )
+    if "sdf_query_points" in batch and "sdf_tsdf_after" in batch:
+        loss = _compute_transition_only_sdf_query_loss(
+            model=model,
+            batch=batch,
+            inputs=inputs,
+            device=device,
+            tsdf_loss_weight=tsdf_loss_weight,
+            delta_tsdf_loss_weight=delta_tsdf_loss_weight,
+            tsdf_monotonicity_weight=tsdf_monotonicity_weight,
+            tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
+            affected_face_loss_weight=affected_face_loss_weight,
+            affected_delta_loss_weight=affected_delta_loss_weight,
+        )
+    else:
+        loss = _compute_transition_only_octree_loss(
+            model=model,
+            batch=batch,
+            inputs=inputs,
+            device=device,
+            octree_pos_weight_factor=octree_pos_weight_factor,
+            octree_depth_weight_base=octree_depth_weight_base,
+            monotonicity_weight=monotonicity_weight,
+            fill_fraction_weight=fill_fraction_weight,
+            removed_fraction_weight=removed_fraction_weight,
+            tsdf_loss_weight=tsdf_loss_weight,
+            delta_tsdf_loss_weight=delta_tsdf_loss_weight,
+            tsdf_monotonicity_weight=tsdf_monotonicity_weight,
+            tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
+            occupancy_loss_weight=occupancy_loss_weight,
+        )
     loss.backward()
     optimizer.step()
     return float(loss.item())
@@ -484,13 +854,19 @@ def planner_validation_step(
     octree_pos_weight_factor: float = 2.0,
     octree_depth_weight_base: float = 2.0,
     monotonicity_weight: float = 0.1,
+    fill_fraction_weight: float = 0.5,
+    removed_fraction_weight: float = 2.0,
+    tsdf_loss_weight: float = 1.0,
+    delta_tsdf_loss_weight: float = 0.5,
+    tsdf_monotonicity_weight: float = 0.1,
+    tsdf_monotonicity_empty_margin: float = 0.2,
     occupancy_loss_weight: float | None = None,
     occ_pos_weight_factor: float | None = None,
+    affected_face_loss_weight: float = 1.0,
+    affected_delta_loss_weight: float = 0.0,
 ) -> float:
     """Computes validation loss for planner plus octree-only transition learning."""
     del transition_loss_weight, point_sdf_loss_weight, changed_mask_loss_weight
-    if occupancy_loss_weight is not None:
-        octree_loss_weight = occupancy_loss_weight
     if occ_pos_weight_factor is not None:
         octree_pos_weight_factor = occ_pos_weight_factor
 
@@ -515,6 +891,15 @@ def planner_validation_step(
         octree_pos_weight_factor,
         octree_depth_weight_base=octree_depth_weight_base,
         monotonicity_weight=monotonicity_weight,
+        fill_fraction_weight=fill_fraction_weight,
+        removed_fraction_weight=removed_fraction_weight,
+        tsdf_loss_weight=tsdf_loss_weight,
+        delta_tsdf_loss_weight=delta_tsdf_loss_weight,
+        tsdf_monotonicity_weight=tsdf_monotonicity_weight,
+        tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
+        occupancy_loss_weight=float(occupancy_loss_weight if occupancy_loss_weight is not None else 0.1),
+        affected_face_loss_weight=affected_face_loss_weight,
+        affected_delta_loss_weight=affected_delta_loss_weight,
     )
     loss = planner_loss + octree_loss_weight * octree_loss
     return float(loss.item())
@@ -528,17 +913,47 @@ def transition_validation_step(
     octree_pos_weight_factor: float = 2.0,
     octree_depth_weight_base: float = 2.0,
     monotonicity_weight: float = 0.1,
+    fill_fraction_weight: float = 0.5,
+    removed_fraction_weight: float = 2.0,
+    tsdf_loss_weight: float = 1.0,
+    delta_tsdf_loss_weight: float = 0.5,
+    tsdf_monotonicity_weight: float = 0.1,
+    tsdf_monotonicity_empty_margin: float = 0.2,
+    occupancy_loss_weight: float = 0.1,
+    affected_face_loss_weight: float = 1.0,
+    affected_delta_loss_weight: float = 0.0,
 ) -> float:
     """Computes validation loss for transition-only octree learning."""
     model.eval()
     inputs = _collect_common_inputs(batch, device)
-    loss = _compute_transition_only_octree_loss(
-        model=model,
-        batch=batch,
-        inputs=inputs,
-        device=device,
-        octree_pos_weight_factor=octree_pos_weight_factor,
-        octree_depth_weight_base=octree_depth_weight_base,
-        monotonicity_weight=monotonicity_weight,
-    )
+    if "sdf_query_points" in batch and "sdf_tsdf_after" in batch:
+        loss = _compute_transition_only_sdf_query_loss(
+            model=model,
+            batch=batch,
+            inputs=inputs,
+            device=device,
+            tsdf_loss_weight=tsdf_loss_weight,
+            delta_tsdf_loss_weight=delta_tsdf_loss_weight,
+            tsdf_monotonicity_weight=tsdf_monotonicity_weight,
+            tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
+            affected_face_loss_weight=affected_face_loss_weight,
+            affected_delta_loss_weight=affected_delta_loss_weight,
+        )
+    else:
+        loss = _compute_transition_only_octree_loss(
+            model=model,
+            batch=batch,
+            inputs=inputs,
+            device=device,
+            octree_pos_weight_factor=octree_pos_weight_factor,
+            octree_depth_weight_base=octree_depth_weight_base,
+            monotonicity_weight=monotonicity_weight,
+            fill_fraction_weight=fill_fraction_weight,
+            removed_fraction_weight=removed_fraction_weight,
+            tsdf_loss_weight=tsdf_loss_weight,
+            delta_tsdf_loss_weight=delta_tsdf_loss_weight,
+            tsdf_monotonicity_weight=tsdf_monotonicity_weight,
+            tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
+            occupancy_loss_weight=occupancy_loss_weight,
+        )
     return float(loss.item())

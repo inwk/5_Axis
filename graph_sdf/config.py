@@ -35,6 +35,7 @@ class GraphSdfModelConfig:
     # inside ShapeTransitionHead is still used to build action_context).
     use_sdf_decoder: bool = False
     use_octree_decoder: bool = True
+    use_sdf_query_decoder: bool = True
 
     # ── Octree decoder ────────────────────────────────────────────────────
     # Data collection parameters (used by collect_axis_dataset.py / CAM/measurements.py)
@@ -48,7 +49,8 @@ class GraphSdfModelConfig:
     #   octree_decoder_layers   : number of CrossAttn + FiLM residual blocks
     octree_coarse_depth: int = 3          # 8³ = 512 coarse cells checked (NX API calls)
     octree_fine_depth: int = 5            # refine boundary cells → effective 32³ at surface
-    octree_query_nodes: int = 2048        # K nodes per training step (sampled from stored octree)
+    octree_query_nodes: int = 4096        # K nodes per training step (sampled from stored octree)
+    sdf_query_nodes: int = 32768           # Q query points per training step for TSDF transition
     octree_fourier_bands: int = 6         # positional encoding bandwidth
     octree_cross_attn_heads: int = 4      # must divide hidden_dim
     octree_decoder_layers: int = 3
@@ -89,5 +91,7 @@ class GraphSdfModelConfig:
             raise ValueError("octree_fine_depth must be >= octree_coarse_depth")
         if self.octree_query_nodes <= 0:
             raise ValueError("octree_query_nodes must be positive")
+        if self.sdf_query_nodes <= 0:
+            raise ValueError("sdf_query_nodes must be positive")
         if self.octree_fourier_bands <= 0:
             raise ValueError("octree_fourier_bands must be positive")

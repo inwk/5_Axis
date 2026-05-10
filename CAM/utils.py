@@ -1012,6 +1012,559 @@ def query_ipw_occupancy_at_positions(
         _undo_to_mark_and_delete(session, markId, "query_ipw_occ")
 
 
+def export_ipw_object_blank_to_obj(
+    session=None,
+    work_part=None,
+    object_blank=None,
+    tool_name=None,
+    output_path=None,
+):
+    """Exports the input IPW associated with a CAM object_blank as an OBJ mesh."""
+    if session is None:
+        session = NXOpen.Session.GetSession()
+    if work_part is None:
+        work_part = session.Parts.Work
+    if object_blank is None or tool_name is None or output_path is None:
+        raise ValueError("object_blank, tool_name, and output_path are all required")
+
+    session.ApplicationSwitchImmediate("UG_APP_MANUFACTURING")
+    work_part = session.Parts.Work
+    session.CAMSession.PathDisplay.SetIpwResolution(NXOpen.CAM.PathDisplay.IpwResolutionType.Coarse)
+
+    markId = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "export_ipw_obj")
+    try:
+        nCGroup = work_part.CAMSetup.CAMGroupCollection.FindObject("NC_PROGRAM")
+        method = work_part.CAMSetup.CAMGroupCollection.FindObject("METHOD")
+        tool = work_part.CAMSetup.CAMGroupCollection.FindObject(tool_name)
+        operation = work_part.CAMSetup.CAMOperationCollection.Create(
+            nCGroup,
+            method,
+            tool,
+            object_blank,
+            "mill_contour",
+            "AREA_MILL",
+            NXOpen.CAM.OperationCollection.UseDefaultName.TrueValue,
+            "AREA_MILL",
+        )
+        ipw = operation.GetInputIpw()
+        ipw_objects = convert_facet_to_body(ipw)
+        if not ipw_objects:
+            raise RuntimeError("GetInputIpw returned no convertible body")
+        return _export_nx_body_to_obj(session, ipw_objects[0], output_path)
+    finally:
+        _undo_to_mark_and_delete(session, markId, "export_ipw_obj")
+
+
+def _octree_cell_subsample_offsets(samples_per_axis: int) -> np.ndarray:
+    """Returns normalized offsets inside one octree cell."""
+    samples_per_axis = max(1, int(samples_per_axis))
+    axis_offsets = (np.arange(samples_per_axis, dtype=np.float64) + 0.5) / float(samples_per_axis) - 0.5
+    grid = np.stack(np.meshgrid(axis_offsets, axis_offsets, axis_offsets, indexing="ij"), axis=-1)
+    return grid.reshape(-1, 3)
+
+
+def compute_octree_fill_fractions(
+    contains_points_fn,
+    centers_xyz,
+    depths,
+    bbox_min,
+    bbox_max,
+    samples_per_axis: int = 2,
+) -> np.ndarray:
+    """Estimates per-cell material fill fraction using fixed sub-cell samples."""
+    centers = np.asarray(centers_xyz, dtype=np.float64).reshape(-1, 3)
+    depths_arr = np.asarray(depths, dtype=np.int32).reshape(-1)
+    if centers.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    count = min(centers.shape[0], depths_arr.shape[0])
+    centers = centers[:count]
+    depths_arr = depths_arr[:count]
+    bbox_min_arr = np.asarray(bbox_min, dtype=np.float64).reshape(3)
+    bbox_max_arr = np.asarray(bbox_max, dtype=np.float64).reshape(3)
+    extent = np.maximum(bbox_max_arr - bbox_min_arr, 1e-9)
+    offsets = _octree_cell_subsample_offsets(samples_per_axis)
+    samples_per_cell = int(offsets.shape[0])
+    fill = np.zeros((count,), dtype=np.float32)
+    cell_chunk = max(1, int(os.getenv("OCTREE_FILL_CELL_CHUNK", "512")))
+
+    for start in range(0, count, cell_chunk):
+        stop = min(start + cell_chunk, count)
+        cell_size = extent.reshape(1, 3) / np.power(2.0, depths_arr[start:stop].astype(np.float64)).reshape(-1, 1)
+        points = centers[start:stop, None, :] + offsets.reshape(1, samples_per_cell, 3) * cell_size[:, None, :]
+        labels = np.asarray(contains_points_fn(points.reshape(-1, 3)), dtype=np.float32).reshape(-1, samples_per_cell)
+        fill[start:stop] = labels.mean(axis=1, dtype=np.float32)
+    return fill
+
+
+def compute_mesh_signed_distances(mesh: "trimesh.Trimesh", points) -> np.ndarray:
+    """Returns signed distance in model units; inside material is negative."""
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if pts.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    signed = np.zeros((pts.shape[0],), dtype=np.float32)
+    chunk = max(1, int(os.getenv("OCTREE_TSDF_POINT_CHUNK", "4096")))
+    try:
+        prox = trimesh.proximity.ProximityQuery(mesh)
+        for start in range(0, pts.shape[0], chunk):
+            stop = min(start + chunk, pts.shape[0])
+            # Use trimesh for distance magnitude, but use our bounded ray test
+            # for the sign so the convention is stable: material = negative.
+            dist = np.abs(np.asarray(prox.signed_distance(pts[start:stop]), dtype=np.float64))
+            inside = _contains_points_mesh(mesh, pts[start:stop]) >= 0.5
+            signed[start:stop] = np.where(inside, -dist, dist).astype(np.float32)
+        return signed
+    except Exception:
+        from scipy.spatial import cKDTree
+
+        vertices = np.asarray(mesh.vertices, dtype=np.float64).reshape(-1, 3)
+        tree = cKDTree(vertices)
+        for start in range(0, pts.shape[0], chunk):
+            stop = min(start + chunk, pts.shape[0])
+            dist, _ = tree.query(pts[start:stop], k=1)
+            inside = _contains_points_mesh(mesh, pts[start:stop]) >= 0.5
+            signed[start:stop] = np.where(inside, -dist, dist).astype(np.float32)
+        return signed
+
+
+def compute_mesh_tsdf(mesh: "trimesh.Trimesh", points, truncation: float) -> np.ndarray:
+    """Returns TSDF in [-1, 1], with negative values inside material."""
+    tau = float(max(float(truncation), 1e-6))
+    sdf = compute_mesh_signed_distances(mesh, points)
+    return np.clip(sdf / tau, -1.0, 1.0).astype(np.float32)
+
+
+class IpwOccupancySnapshot:
+    """In-memory mesh snapshot for repeatable occupancy, fill, and TSDF queries."""
+
+    def __init__(self, mesh):
+        self.mesh = mesh
+
+    def __call__(self, points):
+        return _contains_points_mesh(self.mesh, points)
+
+    def signed_distances(self, points) -> np.ndarray:
+        return compute_mesh_signed_distances(self.mesh, points)
+
+    def tsdf(self, points, truncation: float) -> np.ndarray:
+        return compute_mesh_tsdf(self.mesh, points, truncation)
+
+    def fill_fractions(self, centers_xyz, depths, bbox_min, bbox_max, samples_per_axis: int = 2) -> np.ndarray:
+        return compute_octree_fill_fractions(
+            self,
+            centers_xyz=centers_xyz,
+            depths=depths,
+            bbox_min=bbox_min,
+            bbox_max=bbox_max,
+            samples_per_axis=samples_per_axis,
+        )
+
+
+def load_obj_sdf_query(obj_path: str) -> IpwOccupancySnapshot:
+    """Loads an OBJ mesh and returns the same query object used for IPW snapshots."""
+    return IpwOccupancySnapshot(_load_obj_as_trimesh(obj_path))
+
+
+def snapshot_ipw_occupancy_query(
+    session=None,
+    work_part=None,
+    object_blank=None,
+    tool_name=None,
+):
+    """Snapshots an object_blank input IPW mesh and returns a point occupancy query."""
+    if session is None:
+        session = NXOpen.Session.GetSession()
+    if work_part is None:
+        work_part = session.Parts.Work
+    if object_blank is None or tool_name is None:
+        raise ValueError("object_blank and tool_name are required")
+
+    session.ApplicationSwitchImmediate("UG_APP_MANUFACTURING")
+    work_part = session.Parts.Work
+    session.CAMSession.PathDisplay.SetIpwResolution(NXOpen.CAM.PathDisplay.IpwResolutionType.Coarse)
+
+    markId = session.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, "snapshot_ipw_occ")
+    try:
+        nCGroup = work_part.CAMSetup.CAMGroupCollection.FindObject("NC_PROGRAM")
+        method = work_part.CAMSetup.CAMGroupCollection.FindObject("METHOD")
+        tool = work_part.CAMSetup.CAMGroupCollection.FindObject(tool_name)
+        operation = work_part.CAMSetup.CAMOperationCollection.Create(
+            nCGroup,
+            method,
+            tool,
+            object_blank,
+            "mill_contour",
+            "AREA_MILL",
+            NXOpen.CAM.OperationCollection.UseDefaultName.TrueValue,
+            "AREA_MILL",
+        )
+        ipw = operation.GetInputIpw()
+        ipw_objects = convert_facet_to_body(ipw)
+        if not ipw_objects:
+            raise RuntimeError("GetInputIpw returned no convertible body")
+        with tempfile.TemporaryDirectory(prefix="ai_cam_snapshot_ipw_") as tmp_dir:
+            obj_path = _export_nx_body_to_obj(session, ipw_objects[0], os.path.join(tmp_dir, "ipw.obj"))
+            ipw_mesh = _load_obj_as_trimesh(obj_path)
+    finally:
+        _undo_to_mark_and_delete(session, markId, "snapshot_ipw_occ")
+
+    return IpwOccupancySnapshot(ipw_mesh)
+
+
+def query_ipw_fill_fractions_at_cells(
+    session=None,
+    work_part=None,
+    object_blank=None,
+    tool_name=None,
+    centers_xyz=None,
+    depths=None,
+    bbox_min=None,
+    bbox_max=None,
+    samples_per_axis: int = 2,
+):
+    """Snapshots object_blank input IPW and estimates per-octree-cell fill fraction."""
+    if centers_xyz is None or depths is None or bbox_min is None or bbox_max is None:
+        raise ValueError("centers_xyz, depths, bbox_min, and bbox_max are required")
+    snapshot = snapshot_ipw_occupancy_query(
+        session=session,
+        work_part=work_part,
+        object_blank=object_blank,
+        tool_name=tool_name,
+    )
+    return snapshot.fill_fractions(
+        centers_xyz=centers_xyz,
+        depths=depths,
+        bbox_min=bbox_min,
+        bbox_max=bbox_max,
+        samples_per_axis=samples_per_axis,
+    )
+
+
+def query_ipw_tsdf_at_positions(
+    session=None,
+    work_part=None,
+    object_blank=None,
+    tool_name=None,
+    centers_xyz=None,
+    truncation: float = 5.0,
+):
+    """Snapshots object_blank input IPW and returns TSDF values at query positions."""
+    if centers_xyz is None:
+        raise ValueError("centers_xyz is required")
+    snapshot = snapshot_ipw_occupancy_query(
+        session=session,
+        work_part=work_part,
+        object_blank=object_blank,
+        tool_name=tool_name,
+    )
+    return snapshot.tsdf(centers_xyz, truncation=truncation)
+
+
+def _sample_mesh_surface_near_points(
+    mesh: "trimesh.Trimesh",
+    count: int,
+    jitter: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Samples points near a mesh surface with optional Gaussian jitter."""
+    count = int(max(0, count))
+    if count <= 0:
+        return np.empty((0, 3), dtype=np.float32)
+    try:
+        points, _ = trimesh.sample.sample_surface(mesh, count)
+        points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    except Exception:
+        vertices = np.asarray(mesh.vertices, dtype=np.float64).reshape(-1, 3)
+        if vertices.shape[0] == 0:
+            return np.empty((0, 3), dtype=np.float32)
+        idx = rng.choice(vertices.shape[0], size=count, replace=vertices.shape[0] < count)
+        points = vertices[idx]
+    if float(jitter) > 0.0:
+        points = points + rng.normal(0.0, float(jitter), size=points.shape)
+    return points.astype(np.float32)
+
+
+def _sample_regular_bbox_grid_points(
+    bbox_min,
+    bbox_max,
+    count: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Samples a subset from a regular bbox grid for reconstruction-aware queries."""
+    count = int(max(0, count))
+    if count <= 0:
+        return np.empty((0, 3), dtype=np.float32)
+    bbox_min_arr = np.asarray(bbox_min, dtype=np.float64).reshape(3)
+    bbox_max_arr = np.asarray(bbox_max, dtype=np.float64).reshape(3)
+    cells_per_axis = int(max(2, math.ceil(float(count) ** (1.0 / 3.0)) + 1))
+    axes = [
+        np.linspace(float(bbox_min_arr[i]), float(bbox_max_arr[i]), cells_per_axis, dtype=np.float32)
+        for i in range(3)
+    ]
+    grid = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+    if grid.shape[0] > count:
+        keep = rng.choice(grid.shape[0], size=count, replace=False)
+        grid = grid[keep]
+    elif grid.shape[0] < count:
+        extra = rng.choice(grid.shape[0], size=count - grid.shape[0], replace=True)
+        grid = np.vstack([grid, grid[extra]])
+    return grid.astype(np.float32)
+
+
+def sample_sdf_transition_query_points(
+    before_snapshot: IpwOccupancySnapshot,
+    after_snapshot: IpwOccupancySnapshot,
+    target_snapshot: IpwOccupancySnapshot | None = None,
+    bbox_min=None,
+    bbox_max=None,
+    count: int = 16384,
+    region_points=None,
+    focus_center=None,
+    focus_radius=None,
+    surface_jitter: float = 1.0,
+    seed: int = 0,
+) -> np.ndarray:
+    """Samples 3D query points for TSDF transition learning.
+
+    Distribution prioritises the GT/predicted affected-face region when
+    available, then before/after surfaces, target CAD surface, and global bbox.
+    This is intentionally not octree/depth based.
+    """
+    total = int(max(1, count))
+    rng = np.random.default_rng(int(seed))
+    bbox_min_arr = np.asarray(bbox_min if bbox_min is not None else before_snapshot.mesh.bounds[0], dtype=np.float64).reshape(3)
+    bbox_max_arr = np.asarray(bbox_max if bbox_max is not None else before_snapshot.mesh.bounds[1], dtype=np.float64).reshape(3)
+    bbox_min_arr = np.minimum(bbox_min_arr, np.asarray(before_snapshot.mesh.bounds[0], dtype=np.float64))
+    bbox_max_arr = np.maximum(bbox_max_arr, np.asarray(before_snapshot.mesh.bounds[1], dtype=np.float64))
+    bbox_min_arr = np.minimum(bbox_min_arr, np.asarray(after_snapshot.mesh.bounds[0], dtype=np.float64))
+    bbox_max_arr = np.maximum(bbox_max_arr, np.asarray(after_snapshot.mesh.bounds[1], dtype=np.float64))
+    if target_snapshot is not None:
+        bbox_min_arr = np.minimum(bbox_min_arr, np.asarray(target_snapshot.mesh.bounds[0], dtype=np.float64))
+        bbox_max_arr = np.maximum(bbox_max_arr, np.asarray(target_snapshot.mesh.bounds[1], dtype=np.float64))
+    extent = np.maximum(bbox_max_arr - bbox_min_arr, 1e-6)
+    pad = extent * 0.03
+    bbox_min_arr = bbox_min_arr - pad
+    bbox_max_arr = bbox_max_arr + pad
+
+    region_arr = None
+    if region_points is not None:
+        region_arr = np.asarray(region_points, dtype=np.float64).reshape(-1, 3)
+        if region_arr.shape[0] <= 0:
+            region_arr = None
+
+    n_region = int(total * 0.25) if region_arr is not None else 0
+    n_before = int(total * 0.20)
+    n_after = int(total * 0.20)
+    n_target = int(total * 0.10) if target_snapshot is not None else 0
+    n_uniform = int(total * 0.15)
+    n_regular = int(total * 0.10)
+    n_focus = int(total * 0.10) if region_arr is None and focus_center is not None and focus_radius is not None else 0
+    n_global = max(0, total - n_region - n_before - n_after - n_target - n_uniform - n_regular - n_focus)
+
+    parts = []
+    if n_region > 0 and region_arr is not None:
+        idx = rng.choice(region_arr.shape[0], size=n_region, replace=region_arr.shape[0] < n_region)
+        region_sample = region_arr[idx]
+        if float(surface_jitter) > 0.0:
+            region_sample = region_sample + rng.normal(0.0, float(surface_jitter), size=region_sample.shape)
+        parts.append(region_sample.astype(np.float32))
+    parts.extend([
+        _sample_mesh_surface_near_points(before_snapshot.mesh, n_before, surface_jitter, rng),
+        _sample_mesh_surface_near_points(after_snapshot.mesh, n_after, surface_jitter, rng),
+    ])
+    if n_target > 0 and target_snapshot is not None:
+        parts.append(_sample_mesh_surface_near_points(target_snapshot.mesh, n_target, surface_jitter, rng))
+    if n_uniform > 0:
+        parts.append(rng.uniform(bbox_min_arr, bbox_max_arr, size=(n_uniform, 3)).astype(np.float32))
+    if n_regular > 0:
+        parts.append(_sample_regular_bbox_grid_points(bbox_min_arr, bbox_max_arr, n_regular, rng))
+    if n_focus > 0:
+        center = np.asarray(focus_center, dtype=np.float64).reshape(1, 3)
+        radius = float(max(float(focus_radius), 1e-6))
+        parts.append((center + rng.normal(0.0, radius * 0.5, size=(n_focus, 3))).astype(np.float32))
+    if n_global > 0:
+        parts.append(rng.uniform(bbox_min_arr, bbox_max_arr, size=(n_global, 3)).astype(np.float32))
+
+    points = np.vstack([p for p in parts if p.size > 0]).astype(np.float32)
+    if points.shape[0] < total:
+        extra = rng.uniform(bbox_min_arr, bbox_max_arr, size=(total - points.shape[0], 3)).astype(np.float32)
+        points = np.vstack([points, extra])
+    elif points.shape[0] > total:
+        keep = rng.choice(points.shape[0], size=total, replace=False)
+        points = points[keep]
+    return points.astype(np.float32)
+
+
+def _dedupe_octree_cells(centers: np.ndarray, depths: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Deduplicates cells by rounded center and depth while preserving order."""
+    centers_arr = np.asarray(centers, dtype=np.float32).reshape(-1, 3)
+    depths_arr = np.asarray(depths, dtype=np.int16).reshape(-1)
+    count = min(centers_arr.shape[0], depths_arr.shape[0])
+    centers_arr = centers_arr[:count]
+    depths_arr = depths_arr[:count]
+    seen: set[tuple] = set()
+    keep: list[int] = []
+    for idx, (center, depth) in enumerate(zip(centers_arr, depths_arr)):
+        key = (
+            int(depth),
+            round(float(center[0]), 6),
+            round(float(center[1]), 6),
+            round(float(center[2]), 6),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        keep.append(idx)
+    if not keep:
+        return centers_arr[:0], depths_arr[:0]
+    keep_arr = np.asarray(keep, dtype=np.int64)
+    return centers_arr[keep_arr], depths_arr[keep_arr]
+
+
+def _sample_focus_octree_cells(
+    focus_center,
+    focus_radius,
+    bbox_min,
+    bbox_max,
+    fine_depth: int,
+    max_nodes: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Samples fine-depth cells around the action focus region."""
+    if focus_center is None or focus_radius is None or int(max_nodes) <= 0:
+        return np.empty((0, 3), dtype=np.float32), np.empty((0,), dtype=np.int16)
+    center = np.asarray(focus_center, dtype=np.float64).reshape(3)
+    radius = float(max(float(focus_radius), 1e-9))
+    bbox_min_arr = np.asarray(bbox_min, dtype=np.float64).reshape(3)
+    bbox_max_arr = np.asarray(bbox_max, dtype=np.float64).reshape(3)
+    extent = np.maximum(bbox_max_arr - bbox_min_arr, 1e-9)
+    depth = int(max(0, fine_depth))
+    cell = extent / float(2 ** depth)
+    local_min = np.maximum(center - radius, bbox_min_arr)
+    local_max = np.minimum(center + radius, bbox_max_arr)
+    if np.any(local_max <= local_min):
+        return np.empty((0, 3), dtype=np.float32), np.empty((0,), dtype=np.int16)
+
+    idx_min = np.floor((local_min - bbox_min_arr) / cell).astype(np.int64)
+    idx_max = np.ceil((local_max - bbox_min_arr) / cell).astype(np.int64)
+    grid_max = int(2 ** depth)
+    idx_min = np.clip(idx_min, 0, grid_max - 1)
+    idx_max = np.clip(idx_max, 0, grid_max)
+    ranges = [np.arange(idx_min[axis], idx_max[axis], dtype=np.int64) for axis in range(3)]
+    if any(r.size == 0 for r in ranges):
+        return np.empty((0, 3), dtype=np.float32), np.empty((0,), dtype=np.int16)
+
+    indices = np.stack(np.meshgrid(*ranges, indexing="ij"), axis=-1).reshape(-1, 3)
+    centers = bbox_min_arr.reshape(1, 3) + (indices.astype(np.float64) + 0.5) * cell.reshape(1, 3)
+    inside_focus = np.linalg.norm(centers - center.reshape(1, 3), axis=1) <= radius
+    centers = centers[inside_focus]
+    if centers.shape[0] > int(max_nodes):
+        rng = np.random.default_rng(0)
+        keep = rng.choice(centers.shape[0], size=int(max_nodes), replace=False)
+        centers = centers[keep]
+    depths = np.full((centers.shape[0],), depth, dtype=np.int16)
+    return centers.astype(np.float32), depths
+
+
+def sample_transition_ipw_octree_state(
+    session=None,
+    work_part=None,
+    object_blank_after=None,
+    tool_name=None,
+    before_snapshot: IpwOccupancySnapshot | None = None,
+    bbox_min=None,
+    bbox_max=None,
+    coarse_depth: int = 3,
+    fine_depth: int = 5,
+    max_nodes: int = 16384,
+    bbox_padding: float = 0.05,
+    focus_center=None,
+    focus_radius=None,
+):
+    """Samples octree cells from before/after boundary union plus changed/focus cells."""
+    if before_snapshot is None:
+        raise ValueError("before_snapshot is required")
+    if object_blank_after is None or tool_name is None or bbox_min is None or bbox_max is None:
+        raise ValueError("object_blank_after, tool_name, bbox_min, and bbox_max are required")
+
+    after_snapshot = snapshot_ipw_occupancy_query(
+        session=session,
+        work_part=work_part,
+        object_blank=object_blank_after,
+        tool_name=tool_name,
+    )
+    bbox_min_use = np.asarray(bbox_min, dtype=np.float32).reshape(3)
+    bbox_max_use = np.asarray(bbox_max, dtype=np.float32).reshape(3)
+    bbox_min_use = np.minimum(bbox_min_use, np.asarray(before_snapshot.mesh.bounds[0], dtype=np.float32))
+    bbox_max_use = np.maximum(bbox_max_use, np.asarray(before_snapshot.mesh.bounds[1], dtype=np.float32))
+    bbox_min_use = np.minimum(bbox_min_use, np.asarray(after_snapshot.mesh.bounds[0], dtype=np.float32))
+    bbox_max_use = np.maximum(bbox_max_use, np.asarray(after_snapshot.mesh.bounds[1], dtype=np.float32))
+    bbox_extent = np.maximum(bbox_max_use - bbox_min_use, 1e-6)
+    bbox_pad = bbox_extent * float(max(bbox_padding, 0.0))
+    bbox_min_use = bbox_min_use - bbox_pad
+    bbox_max_use = bbox_max_use + bbox_pad
+
+    before_centers, before_depths, _ = sample_octree_occupancy(
+        body=None,
+        bbox_min=bbox_min_use,
+        bbox_max=bbox_max_use,
+        coarse_depth=coarse_depth,
+        fine_depth=fine_depth,
+        max_nodes=max_nodes,
+        contains_points_fn=before_snapshot,
+    )
+    after_centers, after_depths, _ = sample_octree_occupancy(
+        body=None,
+        bbox_min=bbox_min_use,
+        bbox_max=bbox_max_use,
+        coarse_depth=coarse_depth,
+        fine_depth=fine_depth,
+        max_nodes=max_nodes,
+        contains_points_fn=after_snapshot,
+    )
+    focus_budget = max(0, int(max_nodes) // 4)
+    focus_centers, focus_depths = _sample_focus_octree_cells(
+        focus_center=focus_center,
+        focus_radius=focus_radius,
+        bbox_min=bbox_min_use,
+        bbox_max=bbox_max_use,
+        fine_depth=fine_depth,
+        max_nodes=focus_budget,
+    )
+
+    centers_all = np.vstack([before_centers, after_centers, focus_centers]).astype(np.float32)
+    depths_all = np.concatenate([before_depths, after_depths, focus_depths]).astype(np.int16)
+    centers_all, depths_all = _dedupe_octree_cells(centers_all, depths_all)
+    before_labels_all = np.asarray(before_snapshot(centers_all), dtype=np.float32).reshape(-1)
+    after_labels_all = np.asarray(after_snapshot(centers_all), dtype=np.float32).reshape(-1)
+
+    count = centers_all.shape[0]
+    if count > int(max_nodes):
+        changed = before_labels_all != after_labels_all
+        fine = depths_all == int(fine_depth)
+        focus_like = np.zeros((count,), dtype=bool)
+        if focus_centers.shape[0] > 0:
+            focus_center_arr = np.asarray(focus_center, dtype=np.float32).reshape(1, 3)
+            focus_radius_f = float(max(float(focus_radius), 1e-9))
+            focus_like = np.linalg.norm(centers_all - focus_center_arr, axis=1) <= focus_radius_f
+        priority = changed.astype(np.int32) * 4 + focus_like.astype(np.int32) * 2 + fine.astype(np.int32)
+        order = np.lexsort((np.arange(count), -priority))
+        keep = order[: int(max_nodes)]
+        centers_all = centers_all[keep]
+        depths_all = depths_all[keep]
+        before_labels_all = before_labels_all[keep]
+        after_labels_all = after_labels_all[keep]
+
+    return (
+        centers_all.astype(np.float32),
+        depths_all.astype(np.int16),
+        after_labels_all.astype(np.float32),
+        before_labels_all.astype(np.float32),
+        bbox_min_use.astype(np.float32),
+        bbox_max_use.astype(np.float32),
+    )
+
+
 def CAMFilter(dec_input_list,dec_output_list, cycle_time_list, volume_diff_list):
     """Performs: camfilter."""
     indices_to_remove = [index for index, value in enumerate(volume_diff_list) if value <= 0.0]

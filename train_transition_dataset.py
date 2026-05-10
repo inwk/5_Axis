@@ -55,12 +55,21 @@ PRETRAINED_ENCODER_STRICT = True
 FREEZE_STATE_ENCODER = False
 STATE_ENCODER_LR_MULTIPLIER = 1.0
 
-# For a 24GB GPU, start here. If GPU memory is still low, try BATCH_SIZE=16
-# and then OCTREE_QUERY_NODES=4096.
-OCTREE_QUERY_NODES = 2048
+# For SDF-only transition learning, query points are randomly subsampled per row.
+SDF_QUERY_NODES = 8192
+OCTREE_QUERY_NODES = 4096
 OCTREE_POS_WEIGHT_FACTOR = 2.0
 OCTREE_DEPTH_WEIGHT_BASE = 2.0
 MONOTONICITY_WEIGHT = 0.1
+OCCUPANCY_LOSS_WEIGHT = 0.1
+OCTREE_FILL_FRACTION_WEIGHT = 0.5
+OCTREE_REMOVED_FRACTION_WEIGHT = 2.0
+TSDF_LOSS_WEIGHT = 1.0
+DELTA_TSDF_LOSS_WEIGHT = 0.5
+TSDF_MONOTONICITY_WEIGHT = 0.1
+TSDF_MONOTONICITY_EMPTY_MARGIN = 0.2
+AFFECTED_FACE_LOSS_WEIGHT = 1.0
+AFFECTED_FACE_DELTA_LOSS_WEIGHT = 0.0
 
 SAVE_CHECKPOINTS = True
 CHECKPOINT_ROOT = r"C:\Users\inwoo\Desktop\5_Axis\checkpoints_transition"
@@ -141,32 +150,31 @@ def _cap_files(files: list[str], max_files: int) -> list[str]:
 
 def _build_valid_transition_indices(dataset: ProcessSkeletonParquetDataset) -> list[int]:
     if getattr(dataset, "lazy_load", False):
-        required = {"octree_centers", "octree_depths", "octree_occ_labels"}
+        required = {"sdf_query_points", "sdf_tsdf_after"}
         indices: list[int] = []
         for idx in dataset.row_indices():
             row = dataset._row_from_lazy_index(int(idx))
             if all(col in row.index and not dataset._is_missing(row[col]) for col in required):
                 indices.append(int(idx))
         if not indices:
-            raise ValueError("No rows with complete octree supervision were found.")
+            raise ValueError("No rows with complete SDF query supervision were found.")
         return indices
 
     indices: list[int] = []
     df = dataset.df
-    required = {"octree_centers", "octree_depths", "octree_occ_labels"}
+    required = {"sdf_query_points", "sdf_tsdf_after"}
     missing_cols = [c for c in required if c not in df.columns]
     if missing_cols:
-        raise ValueError(f"Dataset is missing required octree columns: {missing_cols}")
+        raise ValueError(f"Dataset is missing required SDF query columns: {missing_cols}")
 
     for idx, row in df.iterrows():
         if (
-            not dataset._is_missing(row["octree_centers"])
-            and not dataset._is_missing(row["octree_depths"])
-            and not dataset._is_missing(row["octree_occ_labels"])
+            not dataset._is_missing(row["sdf_query_points"])
+            and not dataset._is_missing(row["sdf_tsdf_after"])
         ):
             indices.append(int(idx))
     if not indices:
-        raise ValueError("No rows with complete octree supervision were found.")
+        raise ValueError("No rows with complete SDF query supervision were found.")
     return indices
 
 
@@ -305,6 +313,39 @@ def _build_optimizer(
     return torch.optim.AdamW(param_groups)
 
 
+def _octree_before_for_decoder(batch: dict, device: torch.device) -> torch.Tensor | None:
+    """Builds [before_tsdf, target_tsdf, before_fill_or_occ, known] query features."""
+    before_fill = None
+    if batch.get("octree_fill_before") is not None:
+        before_fill = batch["octree_fill_before"].to(device).float().clamp(0.0, 1.0)
+    elif batch.get("octree_occ_labels_before") is not None:
+        before_valid = batch.get("octree_occ_labels_before_valid")
+        if before_valid is None or bool(before_valid.sum().item() >= before_valid.numel()):
+            before_fill = batch["octree_occ_labels_before"].to(device).float().clamp(0.0, 1.0)
+
+    before_tsdf = (
+        batch["octree_tsdf_before"].to(device).float().clamp(-1.0, 1.0)
+        if batch.get("octree_tsdf_before") is not None
+        else None
+    )
+    target_tsdf = (
+        batch["octree_target_tsdf"].to(device).float().clamp(-1.0, 1.0)
+        if batch.get("octree_target_tsdf") is not None
+        else None
+    )
+    if before_fill is None and before_tsdf is None and target_tsdf is None:
+        return None
+    ref = before_tsdf if before_tsdf is not None else target_tsdf if target_tsdf is not None else before_fill
+    zeros = torch.zeros_like(ref)
+    ones = torch.ones_like(ref)
+    return torch.stack([
+        before_tsdf if before_tsdf is not None else zeros,
+        target_tsdf if target_tsdf is not None else zeros,
+        before_fill if before_fill is not None else zeros,
+        ones,
+    ], dim=-1)
+
+
 @torch.no_grad()
 def _evaluate_octree_metrics(model: GraphSdfPlanningModel, batch: dict, device: torch.device) -> dict[str, float]:
     model.eval()
@@ -325,15 +366,7 @@ def _evaluate_octree_metrics(model: GraphSdfPlanningModel, batch: dict, device: 
         action_face_id=batch["action_face_id"].clamp_min(0).to(device),
         octree_centers=batch["octree_centers"].to(device),
         octree_depths=batch["octree_depths"].to(device),
-        octree_occ_before=(
-            batch.get("octree_occ_labels_before").to(device)
-            if batch.get("octree_occ_labels_before") is not None
-            and (
-                batch.get("octree_occ_labels_before_valid") is None
-                or bool(batch.get("octree_occ_labels_before_valid").sum().item() >= batch.get("octree_occ_labels_before_valid").numel())
-            )
-            else None
-        ),
+        octree_occ_before=_octree_before_for_decoder(batch, device),
         axis_visible=batch.get("axis_visible").to(device) if batch.get("axis_visible") is not None else None,
         node_process_state=batch.get("node_process_state").to(device) if batch.get("node_process_state") is not None else None,
         node_centrality=batch.get("node_centrality").to(device) if batch.get("node_centrality") is not None else None,
@@ -354,6 +387,44 @@ def _evaluate_octree_metrics(model: GraphSdfPlanningModel, batch: dict, device: 
         "prob_mean": float(prob.mean().item()),
         "num_cells": float(gt.numel()),
     }
+    if batch.get("octree_tsdf_after") is not None and out.get("tsdf") is not None:
+        pred_tsdf = out["tsdf"]
+        target_tsdf = batch["octree_tsdf_after"].to(device).float()
+        metrics["tsdf_mae"] = float((pred_tsdf - target_tsdf).abs().mean().item())
+        metrics["pred_tsdf_mean"] = float(pred_tsdf.mean().item())
+        metrics["gt_tsdf_mean"] = float(target_tsdf.mean().item())
+        if batch.get("octree_tsdf_before") is not None:
+            before_tsdf = batch["octree_tsdf_before"].to(device).float()
+            target_delta = (
+                batch["octree_delta_tsdf"].to(device).float()
+                if batch.get("octree_delta_tsdf") is not None
+                else target_tsdf - before_tsdf
+            )
+            pred_delta = pred_tsdf - before_tsdf
+            changed_tsdf = target_delta.abs() > 1e-3
+            metrics["delta_tsdf_mae"] = float((pred_delta - target_delta).abs().mean().item())
+            metrics["tsdf_changed_ratio"] = float(changed_tsdf.float().mean().item())
+            if bool(changed_tsdf.any().item()):
+                metrics["changed_tsdf_mae"] = float(
+                    (pred_delta[changed_tsdf] - target_delta[changed_tsdf]).abs().mean().item()
+                )
+    if batch.get("octree_fill_after") is not None:
+        fill_after = batch["octree_fill_after"].to(device).float()
+        metrics["fill_mae"] = float((prob - fill_after).abs().mean().item())
+        metrics["gt_fill_mean"] = float(fill_after.mean().item())
+    if batch.get("octree_removed_fraction") is not None:
+        before_fill = (
+            batch["octree_fill_before"].to(device).float()
+            if batch.get("octree_fill_before") is not None
+            else batch["octree_occ_labels_before"].to(device).float()
+            if batch.get("octree_occ_labels_before") is not None
+            else None
+        )
+        if before_fill is not None:
+            removed_target = batch["octree_removed_fraction"].to(device).float()
+            removed_pred = torch.relu(before_fill - prob)
+            metrics["removed_fraction_mae"] = float((removed_pred - removed_target).abs().mean().item())
+            metrics["gt_removed_fraction_mean"] = float(removed_target.mean().item())
     if batch.get("octree_occ_labels_before") is not None:
         before = batch["octree_occ_labels_before"].to(device)
         valid = (
@@ -386,6 +457,98 @@ def _evaluate_octree_metrics(model: GraphSdfPlanningModel, batch: dict, device: 
                 metrics["changed_cell_acc"] = float((((pred == gt_bin).float() * changed_mask).sum() / changed_mask.sum().clamp_min(1.0)).item())
             if removed_count > 0.0:
                 metrics["removed_cell_recall"] = float((((pred < 0.5).float() * removed_mask).sum() / removed_mask.sum().clamp_min(1.0)).item())
+    return metrics
+
+
+@torch.no_grad()
+def _evaluate_sdf_metrics(model: GraphSdfPlanningModel, batch: dict, device: torch.device) -> dict[str, float]:
+    model.eval()
+    state_embedding = model.encode_state(
+        state_points=batch["state_points"].to(device),
+        node_process_state=batch.get("node_process_state").to(device) if batch.get("node_process_state") is not None else None,
+        node_centrality=batch.get("node_centrality").to(device) if batch.get("node_centrality") is not None else None,
+        spatial_pos=batch.get("spatial_pos").to(device) if batch.get("spatial_pos") is not None else None,
+        face_area=batch.get("face_area").to(device) if batch.get("face_area") is not None else None,
+        node_face_type=batch.get("node_face_type").to(device) if batch.get("node_face_type") is not None else None,
+        node_mask=batch.get("node_mask").to(device) if batch.get("node_mask") is not None else None,
+        point_mask=batch.get("point_mask").to(device) if batch.get("point_mask") is not None else None,
+    )
+    query_state = None
+    before = batch["sdf_tsdf_before"].to(device).float() if batch.get("sdf_tsdf_before") is not None else None
+    target = batch["sdf_target_tsdf"].to(device).float() if batch.get("sdf_target_tsdf") is not None else None
+    if before is not None or target is not None:
+        ref = before if before is not None else target
+        zeros = torch.zeros_like(ref)
+        ones = torch.ones_like(ref)
+        query_state = torch.stack([
+            before if before is not None else zeros,
+            target if target is not None else zeros,
+            ones,
+        ], dim=-1)
+    out = model.forward_sdf_query(
+        state_points=batch["state_points"].to(device),
+        macro_class_id=batch["macro_class_id"].to(device),
+        tool_choice_id=batch["tool_choice_id"].to(device),
+        action_face_id=batch["action_face_id"].clamp_min(0).to(device),
+        sdf_query_points=batch["sdf_query_points"].to(device),
+        sdf_query_state=query_state,
+        axis_visible=batch.get("axis_visible").to(device) if batch.get("axis_visible") is not None else None,
+        node_process_state=batch.get("node_process_state").to(device) if batch.get("node_process_state") is not None else None,
+        node_centrality=batch.get("node_centrality").to(device) if batch.get("node_centrality") is not None else None,
+        spatial_pos=batch.get("spatial_pos").to(device) if batch.get("spatial_pos") is not None else None,
+        face_area=batch.get("face_area").to(device) if batch.get("face_area") is not None else None,
+        node_face_type=batch.get("node_face_type").to(device) if batch.get("node_face_type") is not None else None,
+        node_mask=batch.get("node_mask").to(device) if batch.get("node_mask") is not None else None,
+        point_mask=batch.get("point_mask").to(device) if batch.get("point_mask") is not None else None,
+        state_embedding=state_embedding,
+    )
+    pred = out["sdf_tsdf"]
+    gt = batch["sdf_tsdf_after"].to(device).float()
+    metrics = {
+        "tsdf_mae": float((pred - gt).abs().mean().item()),
+        "pred_tsdf_mean": float(pred.mean().item()),
+        "gt_tsdf_mean": float(gt.mean().item()),
+        "num_points": float(gt.numel()),
+    }
+    if before is not None:
+        target_delta = batch["sdf_delta_tsdf"].to(device).float() if batch.get("sdf_delta_tsdf") is not None else gt - before
+        pred_delta = pred - before
+        changed = target_delta.abs() > 1e-3
+        metrics["delta_tsdf_mae"] = float((pred_delta - target_delta).abs().mean().item())
+        metrics["tsdf_changed_ratio"] = float(changed.float().mean().item())
+        if bool(changed.any().item()):
+            metrics["changed_tsdf_mae"] = float((pred_delta[changed] - target_delta[changed]).abs().mean().item())
+    if batch.get("affected_face_mask") is not None:
+        affected_out = model.forward_affected_faces(
+            state_points=batch["state_points"].to(device),
+            macro_class_id=batch["macro_class_id"].to(device),
+            tool_choice_id=batch["tool_choice_id"].to(device),
+            action_face_id=batch["action_face_id"].clamp_min(0).to(device),
+            axis_visible=batch.get("axis_visible").to(device) if batch.get("axis_visible") is not None else None,
+            node_process_state=batch.get("node_process_state").to(device) if batch.get("node_process_state") is not None else None,
+            node_centrality=batch.get("node_centrality").to(device) if batch.get("node_centrality") is not None else None,
+            spatial_pos=batch.get("spatial_pos").to(device) if batch.get("spatial_pos") is not None else None,
+            face_area=batch.get("face_area").to(device) if batch.get("face_area") is not None else None,
+            node_face_type=batch.get("node_face_type").to(device) if batch.get("node_face_type") is not None else None,
+            node_mask=batch.get("node_mask").to(device) if batch.get("node_mask") is not None else None,
+            point_mask=batch.get("point_mask").to(device) if batch.get("point_mask") is not None else None,
+            state_embedding=state_embedding,
+        )
+        affected_gt = batch["affected_face_mask"].to(device).float().clamp(0.0, 1.0)
+        affected_prob = torch.sigmoid(affected_out["affected_logits"])
+        affected_pred = (affected_prob >= 0.5).float()
+        valid = ~batch["node_mask"].to(device) if batch.get("node_mask") is not None else torch.ones_like(affected_gt, dtype=torch.bool)
+        valid_count = valid.float().sum().clamp_min(1.0)
+        tp = ((affected_pred == 1.0) & (affected_gt == 1.0) & valid).float().sum()
+        pred_pos = ((affected_pred == 1.0) & valid).float().sum()
+        gt_pos = ((affected_gt == 1.0) & valid).float().sum()
+        metrics["affected_face_acc"] = float(((affected_pred == affected_gt).float()[valid].sum() / valid_count).item())
+        metrics["affected_pred_pos"] = float((pred_pos / valid_count).item())
+        metrics["affected_gt_pos"] = float((gt_pos / valid_count).item())
+        metrics["affected_precision"] = float((tp / pred_pos.clamp_min(1.0)).item())
+        metrics["affected_recall"] = float((tp / gt_pos.clamp_min(1.0)).item())
+        metrics["num_faces"] = float(valid_count.item())
+        metrics["affected_faces"] = float(gt_pos.item())
     return metrics
 
 
@@ -432,8 +595,8 @@ def _limited_batches(loader, max_batches: int):
 
 
 def main() -> None:
-    if OCTREE_QUERY_NODES is None or int(OCTREE_QUERY_NODES) <= 0:
-        raise ValueError("For full dataset batched training, set OCTREE_QUERY_NODES to a positive integer.")
+    if SDF_QUERY_NODES is None or int(SDF_QUERY_NODES) <= 0:
+        raise ValueError("For SDF-only training, set SDF_QUERY_NODES to a positive integer.")
     if BATCH_SIZE <= 0:
         raise ValueError("BATCH_SIZE must be positive.")
 
@@ -447,12 +610,14 @@ def main() -> None:
         train_base_dataset = ProcessSkeletonParquetDataset(
             train_files,
             octree_query_nodes=int(OCTREE_QUERY_NODES),
+            sdf_query_nodes=int(SDF_QUERY_NODES),
             lazy_load=LAZY_PARQUET_LOADING,
             parquet_cache_size=PARQUET_ROW_GROUP_CACHE_SIZE,
         )
         val_base_dataset = ProcessSkeletonParquetDataset(
             val_files,
             octree_query_nodes=int(OCTREE_QUERY_NODES),
+            sdf_query_nodes=int(SDF_QUERY_NODES),
             lazy_load=LAZY_PARQUET_LOADING,
             parquet_cache_size=PARQUET_ROW_GROUP_CACHE_SIZE,
         )
@@ -471,6 +636,7 @@ def main() -> None:
         base_dataset = ProcessSkeletonParquetDataset(
             parquet_files,
             octree_query_nodes=int(OCTREE_QUERY_NODES),
+            sdf_query_nodes=int(SDF_QUERY_NODES),
             lazy_load=LAZY_PARQUET_LOADING,
             parquet_cache_size=PARQUET_ROW_GROUP_CACHE_SIZE,
         )
@@ -496,7 +662,13 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
-    model_cfg = replace(GraphSdfModelConfig(), octree_query_nodes=int(OCTREE_QUERY_NODES))
+    model_cfg = replace(
+        GraphSdfModelConfig(),
+        octree_query_nodes=int(OCTREE_QUERY_NODES),
+        sdf_query_nodes=int(SDF_QUERY_NODES),
+        use_octree_decoder=False,
+        use_sdf_query_decoder=True,
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GraphSdfPlanningModel(model_cfg).to(device)
     pretrained_encoder_info: dict[str, object] | None = None
@@ -545,10 +717,20 @@ def main() -> None:
                 "lazy_parquet_loading": LAZY_PARQUET_LOADING,
                 "parquet_row_group_cache_size": PARQUET_ROW_GROUP_CACHE_SIZE,
                 "learning_rate": LEARNING_RATE,
+                "sdf_query_nodes": int(SDF_QUERY_NODES),
                 "octree_query_nodes": int(OCTREE_QUERY_NODES),
                 "octree_pos_weight_factor": OCTREE_POS_WEIGHT_FACTOR,
                 "octree_depth_weight_base": OCTREE_DEPTH_WEIGHT_BASE,
                 "monotonicity_weight": MONOTONICITY_WEIGHT,
+                "occupancy_loss_weight": OCCUPANCY_LOSS_WEIGHT,
+                "octree_fill_fraction_weight": OCTREE_FILL_FRACTION_WEIGHT,
+                "octree_removed_fraction_weight": OCTREE_REMOVED_FRACTION_WEIGHT,
+                "tsdf_loss_weight": TSDF_LOSS_WEIGHT,
+                "delta_tsdf_loss_weight": DELTA_TSDF_LOSS_WEIGHT,
+                "tsdf_monotonicity_weight": TSDF_MONOTONICITY_WEIGHT,
+                "tsdf_monotonicity_empty_margin": TSDF_MONOTONICITY_EMPTY_MARGIN,
+                "affected_face_loss_weight": AFFECTED_FACE_LOSS_WEIGHT,
+                "affected_face_delta_loss_weight": AFFECTED_FACE_DELTA_LOSS_WEIGHT,
                 "pretrained_encoder_checkpoint": PRETRAINED_ENCODER_CHECKPOINT,
                 "pretrained_encoder_strict": PRETRAINED_ENCODER_STRICT,
                 "pretrained_encoder_info": pretrained_encoder_info,
@@ -565,7 +747,7 @@ def main() -> None:
     print(f"[File Caps] max_train_files={MAX_TRAIN_FILES or 'all'} max_val_files={MAX_VAL_FILES or 'all'}")
     print(f"[Parquet Loading] lazy={LAZY_PARQUET_LOADING} row_group_cache={PARQUET_ROW_GROUP_CACHE_SIZE}")
     print(f"[Rows] train={len(train_indices)} val={len(val_indices)}")
-    print(f"[Train] epochs={NUM_EPOCHS} lr={LEARNING_RATE} batch={BATCH_SIZE} octree_query_nodes={OCTREE_QUERY_NODES}")
+    print(f"[Train] epochs={NUM_EPOCHS} lr={LEARNING_RATE} batch={BATCH_SIZE} sdf_query_nodes={SDF_QUERY_NODES}")
     print(
         f"[Pilot Limits] max_train_batches={MAX_TRAIN_BATCHES_PER_EPOCH or 'all'} "
         f"max_val_batches={MAX_VAL_BATCHES or 'all'}"
@@ -577,7 +759,15 @@ def main() -> None:
     print(
         f"[Loss] pos_weight={OCTREE_POS_WEIGHT_FACTOR} "
         f"depth_weight_base={OCTREE_DEPTH_WEIGHT_BASE} "
-        f"monotonicity_weight={MONOTONICITY_WEIGHT}"
+        f"monotonicity_weight={MONOTONICITY_WEIGHT} "
+        f"occ_weight={OCCUPANCY_LOSS_WEIGHT} "
+        f"fill_weight={OCTREE_FILL_FRACTION_WEIGHT} "
+        f"removed_weight={OCTREE_REMOVED_FRACTION_WEIGHT} "
+        f"tsdf_weight={TSDF_LOSS_WEIGHT} "
+        f"delta_tsdf_weight={DELTA_TSDF_LOSS_WEIGHT} "
+        f"tsdf_mono_empty_margin={TSDF_MONOTONICITY_EMPTY_MARGIN} "
+        f"affected_face_weight={AFFECTED_FACE_LOSS_WEIGHT} "
+        f"affected_delta_weight={AFFECTED_FACE_DELTA_LOSS_WEIGHT}"
     )
     print(f"[Train Macro Dist] { _macro_distribution(macro_train_dataset, train_indices) }")
     print(f"[Val Macro Dist] { _macro_distribution(macro_val_dataset, val_indices) }")
@@ -601,6 +791,15 @@ def main() -> None:
                     octree_pos_weight_factor=OCTREE_POS_WEIGHT_FACTOR,
                     octree_depth_weight_base=OCTREE_DEPTH_WEIGHT_BASE,
                     monotonicity_weight=MONOTONICITY_WEIGHT,
+                    fill_fraction_weight=OCTREE_FILL_FRACTION_WEIGHT,
+                    removed_fraction_weight=OCTREE_REMOVED_FRACTION_WEIGHT,
+                    tsdf_loss_weight=TSDF_LOSS_WEIGHT,
+                    delta_tsdf_loss_weight=DELTA_TSDF_LOSS_WEIGHT,
+                    tsdf_monotonicity_weight=TSDF_MONOTONICITY_WEIGHT,
+                    tsdf_monotonicity_empty_margin=TSDF_MONOTONICITY_EMPTY_MARGIN,
+                    occupancy_loss_weight=OCCUPANCY_LOSS_WEIGHT,
+                    affected_face_loss_weight=AFFECTED_FACE_LOSS_WEIGHT,
+                    affected_delta_loss_weight=AFFECTED_FACE_DELTA_LOSS_WEIGHT,
                 )
             except RuntimeError as exc:
                 if _is_cuda_oom(exc):
@@ -608,8 +807,8 @@ def main() -> None:
                         torch.cuda.empty_cache()
                     print(
                         "[OOM] CUDA ran out of memory during training. "
-                        "Reduce BATCH_SIZE first, then OCTREE_QUERY_NODES. "
-                        f"Current batch={BATCH_SIZE} octree_query_nodes={OCTREE_QUERY_NODES} "
+                        "Reduce BATCH_SIZE first, then SDF_QUERY_NODES. "
+                        f"Current batch={BATCH_SIZE} sdf_query_nodes={SDF_QUERY_NODES} "
                         f"{_cuda_memory_text()}",
                         flush=True,
                     )
@@ -635,11 +834,23 @@ def main() -> None:
                         octree_pos_weight_factor=OCTREE_POS_WEIGHT_FACTOR,
                         octree_depth_weight_base=OCTREE_DEPTH_WEIGHT_BASE,
                         monotonicity_weight=MONOTONICITY_WEIGHT,
+                        fill_fraction_weight=OCTREE_FILL_FRACTION_WEIGHT,
+                        removed_fraction_weight=OCTREE_REMOVED_FRACTION_WEIGHT,
+                        tsdf_loss_weight=TSDF_LOSS_WEIGHT,
+                        delta_tsdf_loss_weight=DELTA_TSDF_LOSS_WEIGHT,
+                        tsdf_monotonicity_weight=TSDF_MONOTONICITY_WEIGHT,
+                        tsdf_monotonicity_empty_margin=TSDF_MONOTONICITY_EMPTY_MARGIN,
+                        occupancy_loss_weight=OCCUPANCY_LOSS_WEIGHT,
+                        affected_face_loss_weight=AFFECTED_FACE_LOSS_WEIGHT,
+                        affected_delta_loss_weight=AFFECTED_FACE_DELTA_LOSS_WEIGHT,
                     )
                 )
-                metrics = _evaluate_octree_metrics(model, batch, device)
+                if batch.get("sdf_query_points") is not None:
+                    metrics = _evaluate_sdf_metrics(model, batch, device)
+                else:
+                    metrics = _evaluate_octree_metrics(model, batch, device)
                 for key, value in metrics.items():
-                    if key in {"num_cells", "mono_valid_cells", "before_valid_cells", "changed_cells", "removed_cells", "added_cells"}:
+                    if key in {"num_cells", "num_points", "num_faces", "affected_faces", "mono_valid_cells", "before_valid_cells", "changed_cells", "removed_cells", "added_cells"}:
                         continue
                     if key == "mono_viol":
                         metric_weight = max(float(metrics.get("mono_valid_cells", 0.0)), 1.0)
@@ -649,8 +860,10 @@ def main() -> None:
                         metric_weight = max(float(metrics.get("removed_cells", 0.0)), 1.0)
                     elif key in {"changed_cell_ratio", "removed_cell_ratio", "gt_added_cell_ratio"}:
                         metric_weight = max(float(metrics.get("before_valid_cells", 0.0)), 1.0)
+                    elif key.startswith("affected_"):
+                        metric_weight = max(float(metrics.get("num_faces", 1.0)), 1.0)
                     else:
-                        metric_weight = max(float(metrics.get("num_cells", 1.0)), 1.0)
+                        metric_weight = max(float(metrics.get("num_points", metrics.get("num_cells", 1.0))), 1.0)
                     val_metric_sums[key] = val_metric_sums.get(key, 0.0) + float(value) * metric_weight
                     val_metric_weights[key] = val_metric_weights.get(key, 0.0) + metric_weight
             except RuntimeError as exc:
@@ -659,9 +872,9 @@ def main() -> None:
                         torch.cuda.empty_cache()
                     print(
                         "[OOM] CUDA ran out of memory during validation. "
-                        "Reduce MAX_VAL_BATCHES, BATCH_SIZE, or OCTREE_QUERY_NODES. "
+                        "Reduce MAX_VAL_BATCHES, BATCH_SIZE, or SDF_QUERY_NODES. "
                         f"Current max_val_batches={MAX_VAL_BATCHES} batch={BATCH_SIZE} "
-                        f"octree_query_nodes={OCTREE_QUERY_NODES} {_cuda_memory_text()}",
+                        f"sdf_query_nodes={SDF_QUERY_NODES} {_cuda_memory_text()}",
                         flush=True,
                     )
                 raise
@@ -698,14 +911,35 @@ def main() -> None:
         if epoch == 1 or epoch % PRINT_EVERY == 0 or epoch == NUM_EPOCHS:
             log = f"[Epoch {epoch:04d}] train={train_loss:.6f} val={val_loss:.6f}"
             if val_metrics:
-                log += (
-                    f" val_octree_acc={val_metrics['acc']:.4f}"
-                    f" pred_pos={val_metrics['pred_pos']:.4f}"
-                    f" gt_pos={val_metrics['gt_pos']:.4f}"
-                    f" prob_mean={val_metrics['prob_mean']:.4f}"
-                )
+                if "acc" in val_metrics:
+                    log += (
+                        f" val_octree_acc={val_metrics['acc']:.4f}"
+                        f" pred_pos={val_metrics['pred_pos']:.4f}"
+                        f" gt_pos={val_metrics['gt_pos']:.4f}"
+                        f" prob_mean={val_metrics['prob_mean']:.4f}"
+                    )
                 if "mono_viol" in val_metrics:
                     log += f" mono_viol={val_metrics['mono_viol']:.4f}"
+                if "fill_mae" in val_metrics:
+                    log += f" fill_mae={val_metrics['fill_mae']:.4f}"
+                if "removed_fraction_mae" in val_metrics:
+                    log += f" removed_frac_mae={val_metrics['removed_fraction_mae']:.4f}"
+                if "tsdf_mae" in val_metrics:
+                    log += f" tsdf_mae={val_metrics['tsdf_mae']:.4f}"
+                if "delta_tsdf_mae" in val_metrics:
+                    log += f" delta_tsdf_mae={val_metrics['delta_tsdf_mae']:.4f}"
+                if "changed_tsdf_mae" in val_metrics:
+                    log += f" changed_tsdf_mae={val_metrics['changed_tsdf_mae']:.4f}"
+                if "tsdf_changed_ratio" in val_metrics:
+                    log += f" tsdf_changed_ratio={val_metrics['tsdf_changed_ratio']:.4f}"
+                if "affected_face_acc" in val_metrics:
+                    log += f" affected_acc={val_metrics['affected_face_acc']:.4f}"
+                if "affected_recall" in val_metrics:
+                    log += f" affected_recall={val_metrics['affected_recall']:.4f}"
+                if "affected_precision" in val_metrics:
+                    log += f" affected_precision={val_metrics['affected_precision']:.4f}"
+                if "affected_gt_pos" in val_metrics:
+                    log += f" affected_gt_pos={val_metrics['affected_gt_pos']:.4f}"
                 if "changed_cell_ratio" in val_metrics:
                     log += f" changed_ratio={val_metrics['changed_cell_ratio']:.4f}"
                 if "changed_cell_acc" in val_metrics:

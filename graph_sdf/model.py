@@ -10,6 +10,7 @@ from .config import GraphSdfModelConfig
 from .octree_decoder import OctreeDecoder
 from .process_planner import ProcessPlannerHead
 from .schema import MACRO_CLASS_TO_ID
+from .sdf_query_decoder import SdfQueryDecoder
 from .shape_transition import ShapeTransitionHead
 from .state_encoder import StateEncoder
 
@@ -56,6 +57,19 @@ class GraphSdfPlanningModel(nn.Module):
 
         self.octree_decoder: Optional[OctreeDecoder] = (
             OctreeDecoder(config) if config.use_octree_decoder else None
+        )
+        self.sdf_query_decoder: Optional[SdfQueryDecoder] = (
+            SdfQueryDecoder(config) if config.use_sdf_query_decoder else None
+        )
+        self.affected_face_head = nn.Sequential(
+            nn.Linear(config.hidden_dim * 2, config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.hidden_dim, 1),
+        )
+        self.affected_delta_head = nn.Sequential(
+            nn.Linear(config.hidden_dim * 2, config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.hidden_dim, 1),
         )
 
         self.indexed_ids = torch.tensor(
@@ -235,7 +249,7 @@ class GraphSdfPlanningModel(nn.Module):
         )
         action_context = action_out["action_context"]
 
-        occ_logits = self.octree_decoder(
+        octree_pred = self.octree_decoder.forward_outputs(
             node_embeddings=state_embedding,
             action_context=action_context,
             octree_centers=octree_centers,
@@ -244,8 +258,112 @@ class GraphSdfPlanningModel(nn.Module):
             node_mask=node_mask,
         )
         return {
-            "occ_logits":      occ_logits,
+            "occ_logits":      octree_pred["occ_logits"],
+            "tsdf":            octree_pred["tsdf"],
             "action_context":  action_context,
+            "state_embedding": state_embedding,
+        }
+
+    def forward_sdf_query(
+        self,
+        state_points: torch.Tensor,
+        macro_class_id: torch.Tensor,
+        tool_choice_id: torch.Tensor,
+        action_face_id: torch.Tensor,
+        sdf_query_points: torch.Tensor,
+        sdf_query_state: Optional[torch.Tensor] = None,
+        axis_visible: Optional[torch.Tensor] = None,
+        node_process_state: Optional[torch.Tensor] = None,
+        node_centrality: Optional[torch.Tensor] = None,
+        spatial_pos: Optional[torch.Tensor] = None,
+        face_area: Optional[torch.Tensor] = None,
+        node_face_type: Optional[torch.Tensor] = None,
+        node_mask: Optional[torch.Tensor] = None,
+        point_mask: Optional[torch.Tensor] = None,
+        state_embedding: Optional[torch.Tensor] = None,
+    ) -> dict[str, torch.Tensor]:
+        """Predicts after-operation TSDF at arbitrary query points."""
+        if self.sdf_query_decoder is None:
+            raise RuntimeError("SdfQueryDecoder is disabled (use_sdf_query_decoder=False).")
+        if state_embedding is None:
+            state_embedding = self.encode_state(
+                state_points,
+                node_process_state=node_process_state,
+                node_centrality=node_centrality,
+                spatial_pos=spatial_pos,
+                face_area=face_area,
+                node_face_type=node_face_type,
+                node_mask=node_mask,
+                point_mask=point_mask,
+            )
+        action_out = self._build_action_context(
+            state_embedding=state_embedding,
+            state_points=state_points,
+            macro_class_id=macro_class_id,
+            tool_choice_id=tool_choice_id,
+            action_face_id=action_face_id,
+            axis_visible=axis_visible,
+            node_process_state=node_process_state,
+            node_mask=node_mask,
+        )
+        tsdf = self.sdf_query_decoder(
+            node_embeddings=state_embedding,
+            action_context=action_out["action_context"],
+            query_points=sdf_query_points,
+            query_state=sdf_query_state,
+            node_mask=node_mask,
+        )
+        return {
+            "sdf_tsdf": tsdf,
+            "action_context": action_out["action_context"],
+            "state_embedding": state_embedding,
+        }
+
+    def forward_affected_faces(
+        self,
+        state_points: torch.Tensor,
+        macro_class_id: torch.Tensor,
+        tool_choice_id: torch.Tensor,
+        action_face_id: torch.Tensor,
+        axis_visible: Optional[torch.Tensor] = None,
+        node_process_state: Optional[torch.Tensor] = None,
+        node_centrality: Optional[torch.Tensor] = None,
+        spatial_pos: Optional[torch.Tensor] = None,
+        face_area: Optional[torch.Tensor] = None,
+        node_face_type: Optional[torch.Tensor] = None,
+        node_mask: Optional[torch.Tensor] = None,
+        point_mask: Optional[torch.Tensor] = None,
+        state_embedding: Optional[torch.Tensor] = None,
+    ) -> dict[str, torch.Tensor]:
+        """Predicts which graph nodes/faces are affected by the GT action."""
+        if state_embedding is None:
+            state_embedding = self.encode_state(
+                state_points,
+                node_process_state=node_process_state,
+                node_centrality=node_centrality,
+                spatial_pos=spatial_pos,
+                face_area=face_area,
+                node_face_type=node_face_type,
+                node_mask=node_mask,
+                point_mask=point_mask,
+            )
+        action_out = self._build_action_context(
+            state_embedding=state_embedding,
+            state_points=state_points,
+            macro_class_id=macro_class_id,
+            tool_choice_id=tool_choice_id,
+            action_face_id=action_face_id,
+            axis_visible=axis_visible,
+            node_process_state=node_process_state,
+            node_mask=node_mask,
+        )
+        action_context = action_out["action_context"]
+        action_per_node = action_context[:, None, :].expand(-1, state_embedding.shape[1], -1)
+        features = torch.cat([state_embedding, action_per_node], dim=-1)
+        return {
+            "affected_logits": self.affected_face_head(features).squeeze(-1),
+            "affected_delta": F.relu(self.affected_delta_head(features).squeeze(-1)),
+            "action_context": action_context,
             "state_embedding": state_embedding,
         }
 
@@ -415,6 +533,7 @@ class GraphSdfPlanningModel(nn.Module):
                 state_embedding=outputs["state_embedding"],
             )
             outputs["occ_logits"]     = oct_out["occ_logits"]
+            outputs["tsdf"]           = oct_out.get("tsdf")
             outputs["action_context"] = oct_out["action_context"]
 
         return outputs

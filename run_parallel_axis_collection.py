@@ -23,6 +23,16 @@ RUNNER_MEMORY_POLL_SEC = max(5.0, float(os.getenv("RUNNER_MEMORY_POLL_SEC", "120
 RUNNER_MIN_AVAIL_GB = float(os.getenv("RUNNER_MIN_AVAIL_GB", os.getenv("MEMORY_GUARD_MIN_AVAIL_GB", "5.0")))
 RUNNER_WORKER_START_BUDGET_GB = float(os.getenv("RUNNER_WORKER_START_BUDGET_GB", "3.0"))
 RUNNER_MAX_LOAD_PCT = int(os.getenv("RUNNER_MAX_LOAD_PCT", os.getenv("MEMORY_GUARD_MAX_LOAD_PCT", "100")))
+WORKER_ENV_DEFAULTS = {
+    "SDF_QUERY_COUNT": "32768",
+    "EXPORT_ROW_STATE_OBJS": "0",
+    "OCTREE_ENABLED": "0",
+    "SDF_QUERY_ENABLED": "1",
+    "MAX_CANDIDATES_PER_BRANCH": "5",
+    "MEMORY_GUARD_STOP_ON_WAIT": "1",
+    "MEMORY_GUARD_MIN_AVAIL_GB": "5",
+    "MEMORY_GUARD_MIN_COMMIT_AVAIL_GB": "0",
+}
 
 # Shared network paths for distributed collection machines.
 SHARED_BASE_DIR = r"Y:\04_개별폴더\22. 통합과정 오인욱"
@@ -383,6 +393,8 @@ def process_file_safe(file_info: tuple[str, str, str]) -> None:
         if pc_slug:
             cmd.extend(["--pc-name", pc_slug])
         env = os.environ.copy()
+        for key, value in WORKER_ENV_DEFAULTS.items():
+            env.setdefault(key, value)
         if pc_slug:
             env["PC_NAME"] = pc_slug
         attempt = 0

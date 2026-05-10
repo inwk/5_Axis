@@ -34,6 +34,7 @@ class ProcessSkeletonParquetDataset(Dataset):
         self,
         parquet_files: Iterable[str | Path],
         octree_query_nodes: int | None = 2048,
+        sdf_query_nodes: int | None = None,
         lazy_load: bool = False,
         parquet_cache_size: int | None = None,
     ) -> None:
@@ -45,6 +46,7 @@ class ProcessSkeletonParquetDataset(Dataset):
         self.parquet_files = files
         self.lazy_load = bool(lazy_load)
         self.octree_query_nodes = octree_query_nodes
+        self.sdf_query_nodes = sdf_query_nodes
         self._parquet_cache_size = max(
             1,
             int(parquet_cache_size if parquet_cache_size is not None else os.getenv("PARQUET_ROW_GROUP_CACHE_SIZE", "2")),
@@ -278,6 +280,24 @@ class ProcessSkeletonParquetDataset(Dataset):
             rng.shuffle(indices)
         return centers[indices], depths[indices], labels[indices]
 
+    def _sdf_sample_indices(self, count: int, index: int) -> np.ndarray:
+        """Returns aligned query-point sample indices for one row."""
+        target = self.sdf_query_nodes
+        if target is None:
+            return np.arange(int(count), dtype=np.int64)
+        target = int(target)
+        if target <= 0:
+            return np.arange(int(count), dtype=np.int64)
+        if count <= 0:
+            return np.zeros((target,), dtype=np.int64)
+        rng = np.random.default_rng(seed=abs(int(index)) % (2 ** 31))
+        if count >= target:
+            return rng.choice(count, size=target, replace=False).astype(np.int64)
+        extra = rng.choice(count, size=target - count, replace=True).astype(np.int64)
+        indices = np.concatenate([np.arange(count, dtype=np.int64), extra])
+        rng.shuffle(indices)
+        return indices.astype(np.int64)
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         """Converts one dataframe row into the training batch schema."""
         row = self._row_from_lazy_index(int(index)) if self.lazy_load else self.df.iloc[int(index)]
@@ -408,6 +428,14 @@ class ProcessSkeletonParquetDataset(Dataset):
             batch["action_face_mask"] = torch.from_numpy(
                 self._array(row["target_node_mask"], np.int16).reshape(num_nodes).astype(np.bool_)
             )
+        if "affected_face_mask_512" in row.index and not self._is_missing(row["affected_face_mask_512"]):
+            batch["affected_face_mask"] = torch.from_numpy(
+                self._array(row["affected_face_mask_512"], np.float32).reshape(num_nodes)
+            )
+        if "affected_face_delta_512" in row.index and not self._is_missing(row["affected_face_delta_512"]):
+            batch["affected_face_delta"] = torch.from_numpy(
+                self._array(row["affected_face_delta_512"], np.float32).reshape(num_nodes)
+            )
         if "macro_class_mask" in row.index:
             batch["macro_class_mask"] = torch.from_numpy(
                 self._array(row["macro_class_mask"], np.int16).reshape(-1).astype(np.bool_)
@@ -514,6 +542,42 @@ class ProcessSkeletonParquetDataset(Dataset):
                 batch["octree_occ_labels_before_valid"] = torch.from_numpy(labels_before_valid.astype(np.float32, copy=False))
                 batch["octree_occ_before"] = batch["octree_occ_labels_before"]
 
+                def _sample_aligned_octree_value(raw_value, dtype=np.float32):
+                    if self._is_missing(raw_value):
+                        return None
+                    values = self._array(raw_value, dtype).reshape(-1)
+                    aligned_count = min(values.shape[0], count)
+                    if aligned_count <= 0:
+                        return None
+                    sample_rng_value = np.random.default_rng(seed=abs(int(index)) % (2 ** 31))
+                    centers_orig = self._array(centers_raw, np.float32).reshape(-1, 3)
+                    depths_orig = (
+                        self._array(depths_raw, np.int16).reshape(-1)
+                        if not self._is_missing(depths_raw)
+                        else np.full((centers_orig.shape[0],), 5, dtype=np.int16)
+                    )
+                    _, _, sampled = self._fit_octree_sample(
+                        centers_orig[:aligned_count],
+                        depths_orig[:aligned_count].astype(np.int64),
+                        values[:aligned_count],
+                        rng=sample_rng_value,
+                    )
+                    return sampled.astype(np.float32, copy=False)
+
+                for batch_key, row_key in (
+                    ("octree_fill_before", "octree_fill_before"),
+                    ("octree_fill_after", "octree_fill_after"),
+                    ("octree_removed_fraction", "octree_removed_fraction"),
+                    ("octree_tsdf_before", "octree_tsdf_before"),
+                    ("octree_tsdf_after", "octree_tsdf_after"),
+                    ("octree_delta_tsdf", "octree_delta_tsdf"),
+                    ("octree_target_tsdf", "octree_target_tsdf"),
+                ):
+                    raw_value = row[row_key] if row_key in row.index else None
+                    sampled_value = _sample_aligned_octree_value(raw_value, np.float32)
+                    if sampled_value is not None:
+                        batch[batch_key] = torch.from_numpy(sampled_value)
+
         bbox_min_raw = row["octree_bbox_min"] if "octree_bbox_min" in row.index else None
         bbox_max_raw = row["octree_bbox_max"] if "octree_bbox_max" in row.index else None
         if self._is_missing(bbox_min_raw) and "occ_bbox_min" in row.index:
@@ -525,4 +589,35 @@ class ProcessSkeletonParquetDataset(Dataset):
             batch["octree_bbox_min"] = torch.from_numpy(self._array(bbox_min_raw, np.float32).reshape(3))
         if not self._is_missing(bbox_max_raw):
             batch["octree_bbox_max"] = torch.from_numpy(self._array(bbox_max_raw, np.float32).reshape(3))
+
+        sdf_points_raw = row["sdf_query_points"] if "sdf_query_points" in row.index else None
+        sdf_after_raw = row["sdf_tsdf_after"] if "sdf_tsdf_after" in row.index else None
+        if not self._is_missing(sdf_points_raw) and not self._is_missing(sdf_after_raw):
+            sdf_points = self._array(sdf_points_raw, np.float32).reshape(-1, 3)
+            sdf_after = self._array(sdf_after_raw, np.float32).reshape(-1)
+            count = min(sdf_points.shape[0], sdf_after.shape[0])
+            if count > 0:
+                sample_idx = self._sdf_sample_indices(count, int(index))
+                batch["sdf_query_points"] = torch.from_numpy(sdf_points[:count][sample_idx].astype(np.float32, copy=False))
+                batch["sdf_tsdf_after"] = torch.from_numpy(sdf_after[:count][sample_idx].astype(np.float32, copy=False))
+
+                def _sample_sdf_value(row_key: str):
+                    raw = row[row_key] if row_key in row.index else None
+                    if self._is_missing(raw):
+                        return None
+                    values = self._array(raw, np.float32).reshape(-1)
+                    v_count = min(values.shape[0], count)
+                    if v_count <= 0:
+                        return None
+                    safe_idx = np.minimum(sample_idx, v_count - 1)
+                    return torch.from_numpy(values[:v_count][safe_idx].astype(np.float32, copy=False))
+
+                for batch_key, row_key in (
+                    ("sdf_tsdf_before", "sdf_tsdf_before"),
+                    ("sdf_delta_tsdf", "sdf_delta_tsdf"),
+                    ("sdf_target_tsdf", "sdf_target_tsdf"),
+                ):
+                    sampled = _sample_sdf_value(row_key)
+                    if sampled is not None:
+                        batch[batch_key] = sampled
         return batch
