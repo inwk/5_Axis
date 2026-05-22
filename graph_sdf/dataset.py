@@ -44,6 +44,8 @@ class ProcessSkeletonParquetDataset(Dataset):
             raise ValueError("At least one parquet file is required")
 
         self.parquet_files = files
+        self._static_feature_roots = self._infer_static_feature_roots(files)
+        self._static_feature_dir_cache: dict[str, str | None] = {}
         self.lazy_load = bool(lazy_load)
         self.octree_query_nodes = octree_query_nodes
         self.sdf_query_nodes = sdf_query_nodes
@@ -63,6 +65,26 @@ class ProcessSkeletonParquetDataset(Dataset):
         else:
             frames = [pd.read_parquet(path) for path in files]
             self.df = pd.concat(frames, ignore_index=True)
+
+    @staticmethod
+    def _infer_static_feature_roots(files: list[str]) -> list[Path]:
+        """Infers candidate sdf_dataset_out roots from the parquet file locations."""
+        roots: list[Path] = []
+        seen: set[str] = set()
+        for file_path in files:
+            path = Path(file_path).expanduser()
+            parent = path.parent
+            candidates = []
+            if parent.name == "_ALL_PARQUET_FILES":
+                candidates.append(parent.parent)
+            candidates.extend([parent, parent.parent])
+            for candidate in candidates:
+                key = str(candidate).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                roots.append(candidate)
+        return roots
 
     def _init_lazy_index(self, files: list[str]) -> None:
         """Builds row-group offsets without materializing parquet payload columns."""
@@ -138,7 +160,27 @@ class ProcessSkeletonParquetDataset(Dataset):
         raw_value = row["static_feature_dir"]
         if self._is_missing(raw_value):
             return None
-        return str(Path(str(raw_value)).expanduser().resolve())
+        raw_text = str(raw_value)
+        if raw_text in self._static_feature_dir_cache:
+            return self._static_feature_dir_cache[raw_text]
+
+        raw_path = Path(raw_text).expanduser()
+        if raw_path.exists():
+            resolved = str(raw_path.resolve())
+            self._static_feature_dir_cache[raw_text] = resolved
+            return resolved
+
+        run_dir_name = raw_path.name
+        for root in self._static_feature_roots:
+            candidate = root / run_dir_name
+            if candidate.exists():
+                resolved = str(candidate.resolve())
+                self._static_feature_dir_cache[raw_text] = resolved
+                return resolved
+
+        resolved = str(raw_path.resolve())
+        self._static_feature_dir_cache[raw_text] = resolved
+        return resolved
 
     def _load_static_feature(self, row, key: str, dtype=None) -> np.ndarray:
         """Loads a cached per-part static feature from sidecar files."""
@@ -162,7 +204,11 @@ class ProcessSkeletonParquetDataset(Dataset):
         if key not in cache:
             path = Path(static_dir) / self._STATIC_FEATURE_FILES[key]
             if not path.exists():
-                raise FileNotFoundError(f"Static feature file not found: {path}")
+                roots_text = ", ".join(str(root) for root in self._static_feature_roots)
+                raise FileNotFoundError(
+                    f"Static feature file not found: {path} "
+                    f"(static roots tried: {roots_text})"
+                )
             cache[key] = np.load(path, allow_pickle=False)
         arr = cache[key]
         if dtype is None:
