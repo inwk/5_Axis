@@ -21,7 +21,7 @@ import pyvista as pv
 # ---------------------------------------------------------------------------
 # User config: edit these directly in VS Code.
 # ---------------------------------------------------------------------------
-PARQUET_PATH = r"Y:\04_개별폴더\22. 통합과정 오인욱\sdf_dataset_out\_ALL_PARQUET_FILES\3dDataset0347_seed0_20260510_175722.parquet"
+PARQUET_PATH = r"Y:\04_개별폴더\22. 통합과정 오인욱\sdf_dataset_out\_ALL_PARQUET_FILES\3dDataset2264_seed0_20260510_184822.parquet"
 PARQUET_DIR = r""
 PARQUET_GLOB = "*.parquet"
 EXPLICIT_PARQUET_PATHS: list[str] = []
