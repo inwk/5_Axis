@@ -90,6 +90,37 @@ def _cuda_memory_text() -> str:
     return f"cuda_alloc={allocated:.2f}GB cuda_reserved={reserved:.2f}GB cuda_peak={peak:.2f}GB"
 
 
+LOSS_COMPONENT_LOG_ORDER = [
+    "tsdf",
+    "delta_tsdf",
+    "changed_tsdf",
+    "changed_delta_tsdf",
+    "tsdf_mono",
+    "affected_face",
+    "affected_delta",
+]
+
+
+def _accumulate_loss_components(sums: dict[str, float], components: dict[str, float]) -> None:
+    """Accumulates weighted loss contributions for epoch-level logging."""
+    for key, value in components.items():
+        sums[key] = sums.get(key, 0.0) + float(value)
+
+
+def _average_loss_components(sums: dict[str, float], count: int) -> dict[str, float]:
+    denom = max(int(count), 1)
+    return {key: value / denom for key, value in sums.items()}
+
+
+def _format_loss_components(label: str, components: dict[str, float]) -> str:
+    if not components:
+        return ""
+    ordered = [key for key in LOSS_COMPONENT_LOG_ORDER if key in components]
+    ordered.extend(sorted(key for key in components if key not in set(ordered)))
+    body = " ".join(f"{key}={components[key]:.4f}" for key in ordered)
+    return f" {label}_losses({body})"
+
+
 def _is_cuda_oom(exc: RuntimeError) -> bool:
     return "out of memory" in str(exc).lower() and "cuda" in str(exc).lower()
 
@@ -818,9 +849,11 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         train_losses = []
+        train_component_sums: dict[str, float] = {}
+        train_component_count = 0
         for batch_idx, batch in _limited_batches(train_loader, MAX_TRAIN_BATCHES_PER_EPOCH):
             try:
-                loss = transition_train_step(
+                step_result = transition_train_step(
                     model,
                     batch,
                     optimizer,
@@ -840,7 +873,12 @@ def main() -> None:
                     occupancy_loss_weight=OCCUPANCY_LOSS_WEIGHT,
                     affected_face_loss_weight=AFFECTED_FACE_LOSS_WEIGHT,
                     affected_delta_loss_weight=AFFECTED_FACE_DELTA_LOSS_WEIGHT,
+                    return_components=True,
                 )
+                if isinstance(step_result, tuple):
+                    loss, loss_components = step_result
+                else:
+                    loss, loss_components = step_result, {}
             except RuntimeError as exc:
                 if _is_cuda_oom(exc):
                     if torch.cuda.is_available():
@@ -854,6 +892,8 @@ def main() -> None:
                     )
                 raise
             train_losses.append(loss)
+            _accumulate_loss_components(train_component_sums, loss_components)
+            train_component_count += 1
             if TRAIN_LOG_EVERY_BATCHES > 0 and batch_idx % TRAIN_LOG_EVERY_BATCHES == 0:
                 print(
                     f"[Epoch {epoch:04d} Batch {batch_idx:05d}] "
@@ -862,32 +902,40 @@ def main() -> None:
                 )
 
         val_losses = []
+        val_component_sums: dict[str, float] = {}
+        val_component_count = 0
         val_metric_sums: dict[str, float] = {}
         val_metric_weights: dict[str, float] = {}
         for _, batch in _limited_batches(val_loader, MAX_VAL_BATCHES):
             try:
-                val_losses.append(
-                    transition_validation_step(
-                        model,
-                        batch,
-                        device,
-                        octree_pos_weight_factor=OCTREE_POS_WEIGHT_FACTOR,
-                        octree_depth_weight_base=OCTREE_DEPTH_WEIGHT_BASE,
-                        monotonicity_weight=MONOTONICITY_WEIGHT,
-                        fill_fraction_weight=OCTREE_FILL_FRACTION_WEIGHT,
-                        removed_fraction_weight=OCTREE_REMOVED_FRACTION_WEIGHT,
-                        tsdf_loss_weight=TSDF_LOSS_WEIGHT,
-                        delta_tsdf_loss_weight=DELTA_TSDF_LOSS_WEIGHT,
-                        changed_tsdf_loss_weight=CHANGED_TSDF_LOSS_WEIGHT,
-                        changed_delta_tsdf_loss_weight=CHANGED_DELTA_TSDF_LOSS_WEIGHT,
-                        tsdf_change_eps=TSDF_CHANGE_EPS,
-                        tsdf_monotonicity_weight=TSDF_MONOTONICITY_WEIGHT,
-                        tsdf_monotonicity_empty_margin=TSDF_MONOTONICITY_EMPTY_MARGIN,
-                        occupancy_loss_weight=OCCUPANCY_LOSS_WEIGHT,
-                        affected_face_loss_weight=AFFECTED_FACE_LOSS_WEIGHT,
-                        affected_delta_loss_weight=AFFECTED_FACE_DELTA_LOSS_WEIGHT,
-                    )
+                val_result = transition_validation_step(
+                    model,
+                    batch,
+                    device,
+                    octree_pos_weight_factor=OCTREE_POS_WEIGHT_FACTOR,
+                    octree_depth_weight_base=OCTREE_DEPTH_WEIGHT_BASE,
+                    monotonicity_weight=MONOTONICITY_WEIGHT,
+                    fill_fraction_weight=OCTREE_FILL_FRACTION_WEIGHT,
+                    removed_fraction_weight=OCTREE_REMOVED_FRACTION_WEIGHT,
+                    tsdf_loss_weight=TSDF_LOSS_WEIGHT,
+                    delta_tsdf_loss_weight=DELTA_TSDF_LOSS_WEIGHT,
+                    changed_tsdf_loss_weight=CHANGED_TSDF_LOSS_WEIGHT,
+                    changed_delta_tsdf_loss_weight=CHANGED_DELTA_TSDF_LOSS_WEIGHT,
+                    tsdf_change_eps=TSDF_CHANGE_EPS,
+                    tsdf_monotonicity_weight=TSDF_MONOTONICITY_WEIGHT,
+                    tsdf_monotonicity_empty_margin=TSDF_MONOTONICITY_EMPTY_MARGIN,
+                    occupancy_loss_weight=OCCUPANCY_LOSS_WEIGHT,
+                    affected_face_loss_weight=AFFECTED_FACE_LOSS_WEIGHT,
+                    affected_delta_loss_weight=AFFECTED_FACE_DELTA_LOSS_WEIGHT,
+                    return_components=True,
                 )
+                if isinstance(val_result, tuple):
+                    val_loss_item, val_loss_components = val_result
+                else:
+                    val_loss_item, val_loss_components = val_result, {}
+                val_losses.append(val_loss_item)
+                _accumulate_loss_components(val_component_sums, val_loss_components)
+                val_component_count += 1
                 if batch.get("sdf_query_points") is not None:
                     metrics = _evaluate_sdf_metrics(model, batch, device)
                 else:
@@ -928,6 +976,8 @@ def main() -> None:
             key: val_metric_sums[key] / max(val_metric_weights.get(key, 0.0), 1.0)
             for key in val_metric_sums
         }
+        train_loss_components = _average_loss_components(train_component_sums, train_component_count)
+        val_loss_components = _average_loss_components(val_component_sums, val_component_count)
 
         if run_dir is not None and (epoch == 1 or epoch % PRINT_EVERY == 0 or epoch == NUM_EPOCHS):
             _save_checkpoint(
@@ -953,6 +1003,8 @@ def main() -> None:
 
         if epoch == 1 or epoch % PRINT_EVERY == 0 or epoch == NUM_EPOCHS:
             log = f"[Epoch {epoch:04d}] train={train_loss:.6f} val={val_loss:.6f}"
+            log += _format_loss_components("train", train_loss_components)
+            log += _format_loss_components("val", val_loss_components)
             if val_metrics:
                 if "acc" in val_metrics:
                     log += (

@@ -14,6 +14,11 @@ from .losses import (
 from .model import GraphSdfPlanningModel
 
 
+def _loss_value(loss: torch.Tensor) -> float:
+    """Returns a detached Python scalar for optional loss breakdown logging."""
+    return float(loss.detach().item())
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # EMA-based loss scale balancer
 # ─────────────────────────────────────────────────────────────────────────────
@@ -460,12 +465,16 @@ def _compute_affected_face_loss(
     state_embedding: torch.Tensor,
     affected_face_loss_weight: float = 1.0,
     affected_delta_loss_weight: float = 0.0,
+    return_components: bool = False,
 ) -> torch.Tensor:
     """Auxiliary loss: predict which faces change under the current action."""
+    components: dict[str, float] = {}
     if affected_face_loss_weight <= 0.0 and affected_delta_loss_weight <= 0.0:
-        return torch.zeros((), device=device, dtype=state_embedding.dtype)
+        loss = torch.zeros((), device=device, dtype=state_embedding.dtype)
+        return (loss, components) if return_components else loss
     if "affected_face_mask" not in batch:
-        return torch.zeros((), device=device, dtype=state_embedding.dtype)
+        loss = torch.zeros((), device=device, dtype=state_embedding.dtype)
+        return (loss, components) if return_components else loss
 
     out = model.forward_affected_faces(
         state_points=inputs["state_points"],
@@ -498,20 +507,24 @@ def _compute_affected_face_loss(
             pos_weight=pos_weight,
             reduction="none",
         )
-        loss = loss + float(affected_face_loss_weight) * (
+        face_loss = float(affected_face_loss_weight) * (
             bce[valid].sum() / valid.float().sum().clamp_min(1.0)
         )
+        loss = loss + face_loss
+        components["affected_face"] = _loss_value(face_loss)
 
     if affected_delta_loss_weight > 0.0 and "affected_face_delta" in batch:
         positive = valid & (target > 0.5)
         if bool(positive.any().item()):
             target_delta = batch["affected_face_delta"].to(device).float().clamp_min(0.0)
-            loss = loss + float(affected_delta_loss_weight) * F.smooth_l1_loss(
+            delta_loss = float(affected_delta_loss_weight) * F.smooth_l1_loss(
                 out["affected_delta"][positive],
                 target_delta[positive],
                 reduction="mean",
             )
-    return loss
+            loss = loss + delta_loss
+            components["affected_delta"] = _loss_value(delta_loss)
+    return (loss, components) if return_components else loss
 
 
 def _compute_transition_only_sdf_query_loss(
@@ -529,6 +542,7 @@ def _compute_transition_only_sdf_query_loss(
     affected_face_loss_weight: float = 1.0,
     affected_delta_loss_weight: float = 0.0,
     state_embedding: torch.Tensor | None = None,
+    return_components: bool = False,
 ) -> torch.Tensor:
     """Computes SDF-only transition loss with GT action labels."""
     if getattr(model, "sdf_query_decoder", None) is None:
@@ -557,7 +571,16 @@ def _compute_transition_only_sdf_query_loss(
     )
     pred_after = outputs["sdf_tsdf"]
     target_after = batch["sdf_tsdf_after"].to(device).float().clamp(-1.0, 1.0)
-    loss = float(tsdf_loss_weight) * F.smooth_l1_loss(pred_after, target_after, reduction="mean")
+    components: dict[str, float] = {}
+    loss = torch.zeros((), device=device, dtype=pred_after.dtype)
+    if tsdf_loss_weight > 0.0:
+        tsdf_loss = float(tsdf_loss_weight) * F.smooth_l1_loss(
+            pred_after,
+            target_after,
+            reduction="mean",
+        )
+        loss = loss + tsdf_loss
+        components["tsdf"] = _loss_value(tsdf_loss)
 
     if "sdf_tsdf_before" in batch:
         before = batch["sdf_tsdf_before"].to(device).float().clamp(-1.0, 1.0)
@@ -567,30 +590,38 @@ def _compute_transition_only_sdf_query_loss(
             else target_after - before
         )
         if delta_tsdf_loss_weight > 0.0:
-            loss = loss + float(delta_tsdf_loss_weight) * F.smooth_l1_loss(
+            delta_loss = float(delta_tsdf_loss_weight) * F.smooth_l1_loss(
                 pred_after - before,
                 target_delta,
                 reduction="mean",
             )
+            loss = loss + delta_loss
+            components["delta_tsdf"] = _loss_value(delta_loss)
         changed_mask = target_delta.abs() > float(tsdf_change_eps)
         if bool(changed_mask.any().item()):
             if changed_tsdf_loss_weight > 0.0:
-                loss = loss + float(changed_tsdf_loss_weight) * F.smooth_l1_loss(
+                changed_tsdf_loss = float(changed_tsdf_loss_weight) * F.smooth_l1_loss(
                     pred_after[changed_mask],
                     target_after[changed_mask],
                     reduction="mean",
                 )
+                loss = loss + changed_tsdf_loss
+                components["changed_tsdf"] = _loss_value(changed_tsdf_loss)
             if changed_delta_tsdf_loss_weight > 0.0:
-                loss = loss + float(changed_delta_tsdf_loss_weight) * F.smooth_l1_loss(
+                changed_delta_loss = float(changed_delta_tsdf_loss_weight) * F.smooth_l1_loss(
                     (pred_after - before)[changed_mask],
                     target_delta[changed_mask],
                     reduction="mean",
                 )
+                loss = loss + changed_delta_loss
+                components["changed_delta_tsdf"] = _loss_value(changed_delta_loss)
         if tsdf_monotonicity_weight > 0.0:
             empty_mask = before > float(tsdf_monotonicity_empty_margin)
             if bool(empty_mask.any().item()):
-                loss = loss + float(tsdf_monotonicity_weight) * F.relu(before - pred_after)[empty_mask].mean()
-    loss = loss + _compute_affected_face_loss(
+                mono_loss = float(tsdf_monotonicity_weight) * F.relu(before - pred_after)[empty_mask].mean()
+                loss = loss + mono_loss
+                components["tsdf_mono"] = _loss_value(mono_loss)
+    affected_result = _compute_affected_face_loss(
         model=model,
         batch=batch,
         inputs=inputs,
@@ -598,8 +629,15 @@ def _compute_transition_only_sdf_query_loss(
         state_embedding=state_embedding,
         affected_face_loss_weight=affected_face_loss_weight,
         affected_delta_loss_weight=affected_delta_loss_weight,
+        return_components=return_components,
     )
-    return loss
+    if return_components:
+        affected_loss, affected_components = affected_result
+        components.update(affected_components)
+    else:
+        affected_loss = affected_result
+    loss = loss + affected_loss
+    return (loss, components) if return_components else loss
 
 
 def _compute_transition_only_octree_loss(
@@ -809,6 +847,7 @@ def transition_train_step(
     occupancy_loss_weight: float = 0.1,
     affected_face_loss_weight: float = 1.0,
     affected_delta_loss_weight: float = 0.0,
+    return_components: bool = False,
 ) -> float:
     """Runs one optimizer step for transition-only octree learning.
 
@@ -825,7 +864,7 @@ def transition_train_step(
 
     inputs = _collect_common_inputs(batch, device)
     if "sdf_query_points" in batch and "sdf_tsdf_after" in batch:
-        loss = _compute_transition_only_sdf_query_loss(
+        loss_result = _compute_transition_only_sdf_query_loss(
             model=model,
             batch=batch,
             inputs=inputs,
@@ -839,9 +878,10 @@ def transition_train_step(
             tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
             affected_face_loss_weight=affected_face_loss_weight,
             affected_delta_loss_weight=affected_delta_loss_weight,
+            return_components=return_components,
         )
     else:
-        loss = _compute_transition_only_octree_loss(
+        loss_result = _compute_transition_only_octree_loss(
             model=model,
             batch=batch,
             inputs=inputs,
@@ -857,9 +897,14 @@ def transition_train_step(
             tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
             occupancy_loss_weight=occupancy_loss_weight,
         )
+    if return_components and isinstance(loss_result, tuple):
+        loss, components = loss_result
+    else:
+        loss, components = loss_result, {}
     loss.backward()
     optimizer.step()
-    return float(loss.item())
+    loss_value = float(loss.item())
+    return (loss_value, components) if return_components else loss_value
 
 
 @torch.no_grad()
@@ -948,12 +993,13 @@ def transition_validation_step(
     occupancy_loss_weight: float = 0.1,
     affected_face_loss_weight: float = 1.0,
     affected_delta_loss_weight: float = 0.0,
+    return_components: bool = False,
 ) -> float:
     """Computes validation loss for transition-only octree learning."""
     model.eval()
     inputs = _collect_common_inputs(batch, device)
     if "sdf_query_points" in batch and "sdf_tsdf_after" in batch:
-        loss = _compute_transition_only_sdf_query_loss(
+        loss_result = _compute_transition_only_sdf_query_loss(
             model=model,
             batch=batch,
             inputs=inputs,
@@ -967,9 +1013,10 @@ def transition_validation_step(
             tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
             affected_face_loss_weight=affected_face_loss_weight,
             affected_delta_loss_weight=affected_delta_loss_weight,
+            return_components=return_components,
         )
     else:
-        loss = _compute_transition_only_octree_loss(
+        loss_result = _compute_transition_only_octree_loss(
             model=model,
             batch=batch,
             inputs=inputs,
@@ -985,4 +1032,9 @@ def transition_validation_step(
             tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
             occupancy_loss_weight=occupancy_loss_weight,
         )
-    return float(loss.item())
+    if return_components and isinstance(loss_result, tuple):
+        loss, components = loss_result
+    else:
+        loss, components = loss_result, {}
+    loss_value = float(loss.item())
+    return (loss_value, components) if return_components else loss_value
