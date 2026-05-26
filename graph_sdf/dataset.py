@@ -46,6 +46,7 @@ class ProcessSkeletonParquetDataset(Dataset):
         self.parquet_files = files
         self._static_feature_roots = self._infer_static_feature_roots(files)
         self._static_feature_dir_cache: dict[str, str | None] = {}
+        self._parquet_schema_cache: dict[str, set[str]] = {}
         self.lazy_load = bool(lazy_load)
         self.octree_query_nodes = octree_query_nodes
         self.sdf_query_nodes = sdf_query_nodes
@@ -104,6 +105,57 @@ class ProcessSkeletonParquetDataset(Dataset):
                 total += row_count
                 self._row_group_ends.append(total)
 
+    def _schema_names_for_file(self, path: str) -> set[str]:
+        """Returns top-level parquet schema names with a small per-file cache."""
+        cached = self._parquet_schema_cache.get(path)
+        if cached is not None:
+            return cached
+        import pyarrow.parquet as pq
+
+        names = set(pq.ParquetFile(path).schema_arrow.names)
+        self._parquet_schema_cache[path] = names
+        return names
+
+    def _read_lazy_row_group_columns(self, path: str, row_group_index: int, columns: Iterable[str]) -> pd.DataFrame:
+        """Reads only selected scalar/metadata columns for one lazy row group."""
+        import pyarrow.parquet as pq
+
+        requested = [str(col) for col in columns]
+        available = self._schema_names_for_file(path)
+        selected = [col for col in requested if col in available]
+        if not selected:
+            return pd.DataFrame()
+        return pq.ParquetFile(path).read_row_group(int(row_group_index), columns=selected).to_pandas()
+
+    def valid_sdf_indices(self, required: Iterable[str] = ("sdf_query_points", "sdf_tsdf_after")) -> list[int]:
+        """Returns row indices whose files contain the required SDF supervision columns."""
+        required_cols = [str(col) for col in required]
+        if self.lazy_load:
+            indices: list[int] = []
+            start = 0
+            for path, _row_group_index, row_count in self._row_group_refs:
+                available = self._schema_names_for_file(path)
+                if all(col in available for col in required_cols):
+                    indices.extend(range(start, start + int(row_count)))
+                start += int(row_count)
+            return indices
+
+        if self.df is None:
+            return []
+        missing_cols = [col for col in required_cols if col not in self.df.columns]
+        if missing_cols:
+            return []
+        indices: list[int] = []
+        for idx, row in self.df.iterrows():
+            if all(not self._is_missing(row[col]) for col in required_cols):
+                indices.append(int(idx))
+        return indices
+
+    @staticmethod
+    def sort_indices_by_storage_order(indices: Iterable[int]) -> list[int]:
+        """Sorts indices so lazy row-group reads are mostly sequential."""
+        return sorted(int(idx) for idx in indices)
+
     def __len__(self) -> int:
         """Returns the number of operation rows."""
         if self.lazy_load:
@@ -138,11 +190,32 @@ class ProcessSkeletonParquetDataset(Dataset):
         """Counts macro classes while respecting lazy loading."""
         out: dict[str, int] = {}
         if self.lazy_load:
-            row_indices = self.row_indices() if indices is None else [int(i) for i in indices]
-            for idx in row_indices:
-                row = self._row_from_lazy_index(idx)
-                name = str(row.get("macro_class_name", "unknown"))
-                out[name] = out.get(name, 0) + 1
+            row_indices = self.row_indices() if indices is None else self.sort_indices_by_storage_order(indices)
+            cursor = 0
+            for group_pos, (path, row_group_index, row_count) in enumerate(self._row_group_refs):
+                group_start = 0 if group_pos == 0 else self._row_group_ends[group_pos - 1]
+                group_stop = int(group_start) + int(row_count)
+                while cursor < len(row_indices) and int(row_indices[cursor]) < group_start:
+                    cursor += 1
+                if cursor >= len(row_indices):
+                    break
+                local_indices: list[int] = []
+                scan = cursor
+                while scan < len(row_indices) and int(row_indices[scan]) < group_stop:
+                    local_indices.append(int(row_indices[scan]) - int(group_start))
+                    scan += 1
+                if not local_indices:
+                    continue
+                frame = self._read_lazy_row_group_columns(path, int(row_group_index), ["macro_class_name"])
+                if "macro_class_name" not in frame.columns:
+                    name = "unknown"
+                    out[name] = out.get(name, 0) + len(local_indices)
+                else:
+                    values = frame["macro_class_name"]
+                    for local_idx in local_indices:
+                        name = str(values.iloc[int(local_idx)])
+                        out[name] = out.get(name, 0) + 1
+                cursor = scan
             return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
 
         if self.df is None or "macro_class_name" not in self.df.columns:

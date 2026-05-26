@@ -36,7 +36,7 @@ VAL_RATIO = 0.2
 SEED = 0
 
 BATCH_SIZE = 8
-NUM_WORKERS = 0
+NUM_WORKERS = 2
 NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
 PRINT_EVERY = 1
@@ -46,7 +46,8 @@ MAX_VAL_BATCHES = 64             # cap pilot validation cost/memory churn
 MAX_TRAIN_FILES = 32             # 0 = use all train files from the split
 MAX_VAL_FILES = 8                # 0 = use all val files from the split
 LAZY_PARQUET_LOADING = True      # keep RAM bounded by loading parquet row groups on demand
-PARQUET_ROW_GROUP_CACHE_SIZE = 2
+PARQUET_ROW_GROUP_CACHE_SIZE = 16
+LOCALITY_SORT_LAZY_INDICES = True
 
 # Optional StateEncoder initialization from SSL pretraining.
 # Set this to ssl_pretraining/train_state_encoder_ssl.py's best.pt.
@@ -149,6 +150,12 @@ def _cap_files(files: list[str], max_files: int) -> list[str]:
 
 
 def _build_valid_transition_indices(dataset: ProcessSkeletonParquetDataset) -> list[int]:
+    if hasattr(dataset, "valid_sdf_indices"):
+        indices = dataset.valid_sdf_indices(required=("sdf_query_points", "sdf_tsdf_after"))
+        if not indices:
+            raise ValueError("No rows with complete SDF query supervision were found.")
+        return indices
+
     if getattr(dataset, "lazy_load", False):
         required = {"sdf_query_points", "sdf_tsdf_after"}
         indices: list[int] = []
@@ -204,6 +211,28 @@ def _macro_distribution(dataset: ProcessSkeletonParquetDataset, indices: list[in
         name = str(dataset.df.iloc[int(idx)].get("macro_class_name", "unknown"))
         out[name] = out.get(name, 0) + 1
     return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def _locality_sort_indices(dataset: ProcessSkeletonParquetDataset, indices: list[int]) -> list[int]:
+    """Keeps random split membership but orders rows for sequential parquet reads."""
+    if not bool(LOCALITY_SORT_LAZY_INDICES) or not getattr(dataset, "lazy_load", False):
+        return indices
+    if hasattr(dataset, "sort_indices_by_storage_order"):
+        return dataset.sort_indices_by_storage_order(indices)
+    return sorted(int(idx) for idx in indices)
+
+
+def _make_dataloader(dataset: Dataset, shuffle: bool) -> DataLoader:
+    kwargs = {
+        "batch_size": BATCH_SIZE,
+        "shuffle": bool(shuffle),
+        "num_workers": int(NUM_WORKERS),
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if int(NUM_WORKERS) > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 2
+    return DataLoader(dataset, **kwargs)
 
 
 def _strip_prefix_state_dict(state_dict: dict, prefix: str) -> dict:
@@ -623,6 +652,8 @@ def main() -> None:
         )
         train_indices = _build_valid_transition_indices(train_base_dataset)
         val_indices = _build_valid_transition_indices(val_base_dataset)
+        train_indices = _locality_sort_indices(train_base_dataset, train_indices)
+        val_indices = _locality_sort_indices(val_base_dataset, val_indices)
         train_dataset: Dataset = Subset(train_base_dataset, train_indices)
         val_dataset: Dataset = Subset(val_base_dataset, val_indices)
         macro_train_dataset = train_base_dataset
@@ -642,25 +673,15 @@ def main() -> None:
         )
         valid_indices = _build_valid_transition_indices(base_dataset)
         train_indices, val_indices = _split_indices(valid_indices, VAL_RATIO, SEED)
+        train_indices = _locality_sort_indices(base_dataset, train_indices)
+        val_indices = _locality_sort_indices(base_dataset, val_indices)
         train_dataset = Subset(base_dataset, train_indices)
         val_dataset = Subset(base_dataset, val_indices)
         macro_train_dataset = base_dataset
         macro_val_dataset = base_dataset
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=not bool(LAZY_PARQUET_LOADING),
-        num_workers=NUM_WORKERS,
-        pin_memory=torch.cuda.is_available(),
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=torch.cuda.is_available(),
-    )
+    train_loader = _make_dataloader(train_dataset, shuffle=not bool(LAZY_PARQUET_LOADING))
+    val_loader = _make_dataloader(val_dataset, shuffle=False)
 
     model_cfg = replace(
         GraphSdfModelConfig(),
@@ -716,6 +737,7 @@ def main() -> None:
                 "max_val_files": MAX_VAL_FILES,
                 "lazy_parquet_loading": LAZY_PARQUET_LOADING,
                 "parquet_row_group_cache_size": PARQUET_ROW_GROUP_CACHE_SIZE,
+                "locality_sort_lazy_indices": LOCALITY_SORT_LAZY_INDICES,
                 "learning_rate": LEARNING_RATE,
                 "sdf_query_nodes": int(SDF_QUERY_NODES),
                 "octree_query_nodes": int(OCTREE_QUERY_NODES),
@@ -745,7 +767,11 @@ def main() -> None:
     print(f"[Device] {device}")
     print(f"[Files] {len(parquet_files)} parquet files")
     print(f"[File Caps] max_train_files={MAX_TRAIN_FILES or 'all'} max_val_files={MAX_VAL_FILES or 'all'}")
-    print(f"[Parquet Loading] lazy={LAZY_PARQUET_LOADING} row_group_cache={PARQUET_ROW_GROUP_CACHE_SIZE}")
+    print(
+        f"[Parquet Loading] lazy={LAZY_PARQUET_LOADING} "
+        f"row_group_cache={PARQUET_ROW_GROUP_CACHE_SIZE} "
+        f"locality_sort={LOCALITY_SORT_LAZY_INDICES}"
+    )
     print(f"[Rows] train={len(train_indices)} val={len(val_indices)}")
     print(f"[Train] epochs={NUM_EPOCHS} lr={LEARNING_RATE} batch={BATCH_SIZE} sdf_query_nodes={SDF_QUERY_NODES}")
     print(
