@@ -521,6 +521,9 @@ def _compute_transition_only_sdf_query_loss(
     device: torch.device,
     tsdf_loss_weight: float = 1.0,
     delta_tsdf_loss_weight: float = 0.5,
+    changed_tsdf_loss_weight: float = 0.0,
+    changed_delta_tsdf_loss_weight: float = 0.0,
+    tsdf_change_eps: float = 1e-3,
     tsdf_monotonicity_weight: float = 0.1,
     tsdf_monotonicity_empty_margin: float = 0.2,
     affected_face_loss_weight: float = 1.0,
@@ -569,6 +572,20 @@ def _compute_transition_only_sdf_query_loss(
                 target_delta,
                 reduction="mean",
             )
+        changed_mask = target_delta.abs() > float(tsdf_change_eps)
+        if bool(changed_mask.any().item()):
+            if changed_tsdf_loss_weight > 0.0:
+                loss = loss + float(changed_tsdf_loss_weight) * F.smooth_l1_loss(
+                    pred_after[changed_mask],
+                    target_after[changed_mask],
+                    reduction="mean",
+                )
+            if changed_delta_tsdf_loss_weight > 0.0:
+                loss = loss + float(changed_delta_tsdf_loss_weight) * F.smooth_l1_loss(
+                    (pred_after - before)[changed_mask],
+                    target_delta[changed_mask],
+                    reduction="mean",
+                )
         if tsdf_monotonicity_weight > 0.0:
             empty_mask = before > float(tsdf_monotonicity_empty_margin)
             if bool(empty_mask.any().item()):
@@ -784,6 +801,9 @@ def transition_train_step(
     removed_fraction_weight: float = 2.0,
     tsdf_loss_weight: float = 1.0,
     delta_tsdf_loss_weight: float = 0.5,
+    changed_tsdf_loss_weight: float = 0.0,
+    changed_delta_tsdf_loss_weight: float = 0.0,
+    tsdf_change_eps: float = 1e-3,
     tsdf_monotonicity_weight: float = 0.1,
     tsdf_monotonicity_empty_margin: float = 0.2,
     occupancy_loss_weight: float = 0.1,
@@ -812,6 +832,9 @@ def transition_train_step(
             device=device,
             tsdf_loss_weight=tsdf_loss_weight,
             delta_tsdf_loss_weight=delta_tsdf_loss_weight,
+            changed_tsdf_loss_weight=changed_tsdf_loss_weight,
+            changed_delta_tsdf_loss_weight=changed_delta_tsdf_loss_weight,
+            tsdf_change_eps=tsdf_change_eps,
             tsdf_monotonicity_weight=tsdf_monotonicity_weight,
             tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
             affected_face_loss_weight=affected_face_loss_weight,
@@ -917,6 +940,9 @@ def transition_validation_step(
     removed_fraction_weight: float = 2.0,
     tsdf_loss_weight: float = 1.0,
     delta_tsdf_loss_weight: float = 0.5,
+    changed_tsdf_loss_weight: float = 0.0,
+    changed_delta_tsdf_loss_weight: float = 0.0,
+    tsdf_change_eps: float = 1e-3,
     tsdf_monotonicity_weight: float = 0.1,
     tsdf_monotonicity_empty_margin: float = 0.2,
     occupancy_loss_weight: float = 0.1,
@@ -934,6 +960,9 @@ def transition_validation_step(
             device=device,
             tsdf_loss_weight=tsdf_loss_weight,
             delta_tsdf_loss_weight=delta_tsdf_loss_weight,
+            changed_tsdf_loss_weight=changed_tsdf_loss_weight,
+            changed_delta_tsdf_loss_weight=changed_delta_tsdf_loss_weight,
+            tsdf_change_eps=tsdf_change_eps,
             tsdf_monotonicity_weight=tsdf_monotonicity_weight,
             tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
             affected_face_loss_weight=affected_face_loss_weight,

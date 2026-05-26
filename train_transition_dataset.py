@@ -67,6 +67,9 @@ OCTREE_FILL_FRACTION_WEIGHT = 0.5
 OCTREE_REMOVED_FRACTION_WEIGHT = 2.0
 TSDF_LOSS_WEIGHT = 1.0
 DELTA_TSDF_LOSS_WEIGHT = 0.5
+CHANGED_TSDF_LOSS_WEIGHT = 1.0
+CHANGED_DELTA_TSDF_LOSS_WEIGHT = 1.0
+TSDF_CHANGE_EPS = 1e-3
 TSDF_MONOTONICITY_WEIGHT = 0.1
 TSDF_MONOTONICITY_EMPTY_MARGIN = 0.2
 AFFECTED_FACE_LOSS_WEIGHT = 1.0
@@ -430,13 +433,13 @@ def _evaluate_octree_metrics(model: GraphSdfPlanningModel, batch: dict, device: 
                 else target_tsdf - before_tsdf
             )
             pred_delta = pred_tsdf - before_tsdf
-            changed_tsdf = target_delta.abs() > 1e-3
+            changed_tsdf = target_delta.abs() > float(TSDF_CHANGE_EPS)
             metrics["delta_tsdf_mae"] = float((pred_delta - target_delta).abs().mean().item())
             metrics["tsdf_changed_ratio"] = float(changed_tsdf.float().mean().item())
             if bool(changed_tsdf.any().item()):
-                metrics["changed_tsdf_mae"] = float(
-                    (pred_delta[changed_tsdf] - target_delta[changed_tsdf]).abs().mean().item()
-                )
+                changed_err = (pred_delta[changed_tsdf] - target_delta[changed_tsdf]).abs()
+                metrics["changed_tsdf_mae"] = float(changed_err.mean().item())
+                metrics["changed_delta_tsdf_mae"] = float(changed_err.mean().item())
     if batch.get("octree_fill_after") is not None:
         fill_after = batch["octree_fill_after"].to(device).float()
         metrics["fill_mae"] = float((prob - fill_after).abs().mean().item())
@@ -542,11 +545,13 @@ def _evaluate_sdf_metrics(model: GraphSdfPlanningModel, batch: dict, device: tor
     if before is not None:
         target_delta = batch["sdf_delta_tsdf"].to(device).float() if batch.get("sdf_delta_tsdf") is not None else gt - before
         pred_delta = pred - before
-        changed = target_delta.abs() > 1e-3
+        changed = target_delta.abs() > float(TSDF_CHANGE_EPS)
         metrics["delta_tsdf_mae"] = float((pred_delta - target_delta).abs().mean().item())
         metrics["tsdf_changed_ratio"] = float(changed.float().mean().item())
         if bool(changed.any().item()):
-            metrics["changed_tsdf_mae"] = float((pred_delta[changed] - target_delta[changed]).abs().mean().item())
+            changed_err = (pred_delta[changed] - target_delta[changed]).abs()
+            metrics["changed_tsdf_mae"] = float(changed_err.mean().item())
+            metrics["changed_delta_tsdf_mae"] = float(changed_err.mean().item())
     if batch.get("affected_face_mask") is not None:
         affected_out = model.forward_affected_faces(
             state_points=batch["state_points"].to(device),
@@ -749,6 +754,9 @@ def main() -> None:
                 "octree_removed_fraction_weight": OCTREE_REMOVED_FRACTION_WEIGHT,
                 "tsdf_loss_weight": TSDF_LOSS_WEIGHT,
                 "delta_tsdf_loss_weight": DELTA_TSDF_LOSS_WEIGHT,
+                "changed_tsdf_loss_weight": CHANGED_TSDF_LOSS_WEIGHT,
+                "changed_delta_tsdf_loss_weight": CHANGED_DELTA_TSDF_LOSS_WEIGHT,
+                "tsdf_change_eps": TSDF_CHANGE_EPS,
                 "tsdf_monotonicity_weight": TSDF_MONOTONICITY_WEIGHT,
                 "tsdf_monotonicity_empty_margin": TSDF_MONOTONICITY_EMPTY_MARGIN,
                 "affected_face_loss_weight": AFFECTED_FACE_LOSS_WEIGHT,
@@ -791,6 +799,9 @@ def main() -> None:
         f"removed_weight={OCTREE_REMOVED_FRACTION_WEIGHT} "
         f"tsdf_weight={TSDF_LOSS_WEIGHT} "
         f"delta_tsdf_weight={DELTA_TSDF_LOSS_WEIGHT} "
+        f"changed_tsdf_weight={CHANGED_TSDF_LOSS_WEIGHT} "
+        f"changed_delta_tsdf_weight={CHANGED_DELTA_TSDF_LOSS_WEIGHT} "
+        f"tsdf_change_eps={TSDF_CHANGE_EPS} "
         f"tsdf_mono_empty_margin={TSDF_MONOTONICITY_EMPTY_MARGIN} "
         f"affected_face_weight={AFFECTED_FACE_LOSS_WEIGHT} "
         f"affected_delta_weight={AFFECTED_FACE_DELTA_LOSS_WEIGHT}"
@@ -821,6 +832,9 @@ def main() -> None:
                     removed_fraction_weight=OCTREE_REMOVED_FRACTION_WEIGHT,
                     tsdf_loss_weight=TSDF_LOSS_WEIGHT,
                     delta_tsdf_loss_weight=DELTA_TSDF_LOSS_WEIGHT,
+                    changed_tsdf_loss_weight=CHANGED_TSDF_LOSS_WEIGHT,
+                    changed_delta_tsdf_loss_weight=CHANGED_DELTA_TSDF_LOSS_WEIGHT,
+                    tsdf_change_eps=TSDF_CHANGE_EPS,
                     tsdf_monotonicity_weight=TSDF_MONOTONICITY_WEIGHT,
                     tsdf_monotonicity_empty_margin=TSDF_MONOTONICITY_EMPTY_MARGIN,
                     occupancy_loss_weight=OCCUPANCY_LOSS_WEIGHT,
@@ -864,6 +878,9 @@ def main() -> None:
                         removed_fraction_weight=OCTREE_REMOVED_FRACTION_WEIGHT,
                         tsdf_loss_weight=TSDF_LOSS_WEIGHT,
                         delta_tsdf_loss_weight=DELTA_TSDF_LOSS_WEIGHT,
+                        changed_tsdf_loss_weight=CHANGED_TSDF_LOSS_WEIGHT,
+                        changed_delta_tsdf_loss_weight=CHANGED_DELTA_TSDF_LOSS_WEIGHT,
+                        tsdf_change_eps=TSDF_CHANGE_EPS,
                         tsdf_monotonicity_weight=TSDF_MONOTONICITY_WEIGHT,
                         tsdf_monotonicity_empty_margin=TSDF_MONOTONICITY_EMPTY_MARGIN,
                         occupancy_loss_weight=OCCUPANCY_LOSS_WEIGHT,
@@ -956,6 +973,8 @@ def main() -> None:
                     log += f" delta_tsdf_mae={val_metrics['delta_tsdf_mae']:.4f}"
                 if "changed_tsdf_mae" in val_metrics:
                     log += f" changed_tsdf_mae={val_metrics['changed_tsdf_mae']:.4f}"
+                if "changed_delta_tsdf_mae" in val_metrics:
+                    log += f" changed_delta_tsdf_mae={val_metrics['changed_delta_tsdf_mae']:.4f}"
                 if "tsdf_changed_ratio" in val_metrics:
                     log += f" tsdf_changed_ratio={val_metrics['tsdf_changed_ratio']:.4f}"
                 if "affected_face_acc" in val_metrics:
