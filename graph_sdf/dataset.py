@@ -50,6 +50,8 @@ class ProcessSkeletonParquetDataset(Dataset):
         self.lazy_load = bool(lazy_load)
         self.octree_query_nodes = octree_query_nodes
         self.sdf_query_nodes = sdf_query_nodes
+        self.sdf_sample_epoch = 0
+        self.sdf_sample_seed = int(os.getenv("SDF_SAMPLE_SEED", "0"))
         self._parquet_cache_size = max(
             1,
             int(parquet_cache_size if parquet_cache_size is not None else os.getenv("PARQUET_ROW_GROUP_CACHE_SIZE", "2")),
@@ -185,6 +187,61 @@ class ProcessSkeletonParquetDataset(Dataset):
     def row_indices(self) -> list[int]:
         """Returns all row indices without scanning payload columns."""
         return list(range(len(self)))
+
+    def set_sdf_sample_epoch(self, epoch: int) -> None:
+        """Changes the deterministic SDF query subset used for each row."""
+        self.sdf_sample_epoch = int(epoch)
+
+    def row_metadata(self, indices: Iterable[int], columns: Iterable[str]) -> dict[int, dict[str, object]]:
+        """Reads scalar row metadata columns without materializing payload arrays when lazy."""
+        requested = [str(col) for col in columns]
+        row_indices = [int(idx) for idx in indices]
+        out: dict[int, dict[str, object]] = {}
+        if not requested or not row_indices:
+            return out
+
+        if not self.lazy_load:
+            if self.df is None:
+                return out
+            for idx in row_indices:
+                row = self.df.iloc[int(idx)]
+                out[int(idx)] = {
+                    col: row[col] if col in row.index and not self._is_missing(row[col]) else None
+                    for col in requested
+                }
+            return out
+
+        ordered = self.sort_indices_by_storage_order(row_indices)
+        cursor = 0
+        for group_pos, (path, row_group_index, row_count) in enumerate(self._row_group_refs):
+            group_start = 0 if group_pos == 0 else self._row_group_ends[group_pos - 1]
+            group_stop = int(group_start) + int(row_count)
+            while cursor < len(ordered) and int(ordered[cursor]) < group_start:
+                cursor += 1
+            if cursor >= len(ordered):
+                break
+
+            local_pairs: list[tuple[int, int]] = []
+            scan = cursor
+            while scan < len(ordered) and int(ordered[scan]) < group_stop:
+                global_idx = int(ordered[scan])
+                local_pairs.append((global_idx, global_idx - int(group_start)))
+                scan += 1
+            if not local_pairs:
+                continue
+
+            frame = self._read_lazy_row_group_columns(path, int(row_group_index), requested)
+            for global_idx, local_idx in local_pairs:
+                values: dict[str, object] = {}
+                for col in requested:
+                    if col in frame.columns:
+                        value = frame[col].iloc[int(local_idx)]
+                        values[col] = None if self._is_missing(value) else value
+                    else:
+                        values[col] = None
+                out[global_idx] = values
+            cursor = scan
+        return out
 
     def macro_distribution(self, indices: Iterable[int] | None = None) -> dict[str, int]:
         """Counts macro classes while respecting lazy loading."""
@@ -409,7 +466,12 @@ class ProcessSkeletonParquetDataset(Dataset):
             return np.arange(int(count), dtype=np.int64)
         if count <= 0:
             return np.zeros((target,), dtype=np.int64)
-        rng = np.random.default_rng(seed=abs(int(index)) % (2 ** 31))
+        seed = (
+            abs(int(index)) * 1000003
+            + abs(int(self.sdf_sample_epoch)) * 9176_123
+            + abs(int(self.sdf_sample_seed))
+        ) % (2 ** 32)
+        rng = np.random.default_rng(seed=seed)
         if count >= target:
             return rng.choice(count, size=target, replace=False).astype(np.int64)
         extra = rng.choice(count, size=target - count, replace=True).astype(np.int64)

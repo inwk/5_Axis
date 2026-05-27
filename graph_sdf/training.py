@@ -433,7 +433,11 @@ def _compute_octree_fill_fraction_loss(
     return loss
 
 
-def _sdf_query_state_input(batch: dict, device: torch.device) -> torch.Tensor | None:
+def _sdf_query_state_input(
+    batch: dict,
+    device: torch.device,
+    use_target_tsdf_input: bool = True,
+) -> torch.Tensor | None:
     """Builds [before_tsdf, target_tsdf, known] for SDF query decoder."""
     before = (
         batch["sdf_tsdf_before"].to(device).float().clamp(-1.0, 1.0)
@@ -442,7 +446,7 @@ def _sdf_query_state_input(batch: dict, device: torch.device) -> torch.Tensor | 
     )
     target = (
         batch["sdf_target_tsdf"].to(device).float().clamp(-1.0, 1.0)
-        if "sdf_target_tsdf" in batch
+        if bool(use_target_tsdf_input) and "sdf_target_tsdf" in batch
         else None
     )
     if before is None and target is None:
@@ -541,6 +545,7 @@ def _compute_transition_only_sdf_query_loss(
     tsdf_monotonicity_empty_margin: float = 0.2,
     affected_face_loss_weight: float = 1.0,
     affected_delta_loss_weight: float = 0.0,
+    use_target_tsdf_input: bool = True,
     state_embedding: torch.Tensor | None = None,
     return_components: bool = False,
 ) -> torch.Tensor:
@@ -558,7 +563,11 @@ def _compute_transition_only_sdf_query_loss(
         tool_choice_id=inputs["target_tool_choice"],
         action_face_id=inputs["target_action_face"].clamp_min(0),
         sdf_query_points=batch["sdf_query_points"].to(device),
-        sdf_query_state=_sdf_query_state_input(batch, device),
+        sdf_query_state=_sdf_query_state_input(
+            batch,
+            device,
+            use_target_tsdf_input=use_target_tsdf_input,
+        ),
         axis_visible=inputs["axis_visible"],
         node_process_state=inputs["node_process_state"],
         node_centrality=inputs["node_centrality"],
@@ -847,6 +856,7 @@ def transition_train_step(
     occupancy_loss_weight: float = 0.1,
     affected_face_loss_weight: float = 1.0,
     affected_delta_loss_weight: float = 0.0,
+    use_target_tsdf_input: bool = True,
     return_components: bool = False,
 ) -> float:
     """Runs one optimizer step for transition-only octree learning.
@@ -878,6 +888,7 @@ def transition_train_step(
             tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
             affected_face_loss_weight=affected_face_loss_weight,
             affected_delta_loss_weight=affected_delta_loss_weight,
+            use_target_tsdf_input=use_target_tsdf_input,
             return_components=return_components,
         )
     else:
@@ -993,6 +1004,7 @@ def transition_validation_step(
     occupancy_loss_weight: float = 0.1,
     affected_face_loss_weight: float = 1.0,
     affected_delta_loss_weight: float = 0.0,
+    use_target_tsdf_input: bool = True,
     return_components: bool = False,
 ) -> float:
     """Computes validation loss for transition-only octree learning."""
@@ -1013,6 +1025,7 @@ def transition_validation_step(
             tsdf_monotonicity_empty_margin=tsdf_monotonicity_empty_margin,
             affected_face_loss_weight=affected_face_loss_weight,
             affected_delta_loss_weight=affected_delta_loss_weight,
+            use_target_tsdf_input=use_target_tsdf_input,
             return_components=return_components,
         )
     else:
