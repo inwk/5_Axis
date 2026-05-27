@@ -28,7 +28,7 @@ from graph_sdf.training import transition_train_step, transition_validation_step
 PARQUET_DIR = r""
 # Use "**/*.parquet" to include run subdirectories under PARQUET_DIR.
 PARQUET_GLOB = "**/*.parquet"
-EXPLICIT_PARQUET_PATHS: list[str] = []
+EXPLICIT_PARQUET_PATHS: list[str] = [r"Y:\04_개별폴더\22. 통합과정 오인욱\sdf_dataset_out\_ALL_PARQUET_FILES\3dDataset3063_seed0_20260523_232918.parquet"]
 SPLIT_MANIFEST_PATH = os.getenv("PILOT_SPLIT_MANIFEST", r"")
 TRAIN_SPLIT_NAME = os.getenv("PILOT_TRAIN_SPLIT", "train")
 VAL_SPLIT_NAME = os.getenv("PILOT_VAL_SPLIT", "val")
@@ -36,23 +36,23 @@ VAL_SPLIT_NAME = os.getenv("PILOT_VAL_SPLIT", "val")
 VAL_RATIO = 0.2
 SEED = 0
 
-BATCH_SIZE = 8
+BATCH_SIZE = 1
 NUM_WORKERS = 2
-NUM_EPOCHS = 20
+NUM_EPOCHS = 150
 LEARNING_RATE = 1e-4
 PRINT_EVERY = 1
 TRAIN_LOG_EVERY_BATCHES = 50
 MAX_TRAIN_BATCHES_PER_EPOCH = 0  # 0 = use all train batches
-MAX_VAL_BATCHES = 64             # cap pilot validation cost/memory churn
+MAX_VAL_BATCHES = 0             # cap pilot validation cost/memory churn
 MAX_TRAIN_FILES = 32             # 0 = use all train files from the split
 MAX_VAL_FILES = 8                # 0 = use all val files from the split
 LAZY_PARQUET_LOADING = True      # keep RAM bounded by loading parquet row groups on demand
 PARQUET_ROW_GROUP_CACHE_SIZE = 16
 LOCALITY_SORT_LAZY_INDICES = True
 SPLIT_BY_PART = bool(int(os.getenv("SPLIT_BY_PART", "1")))
-SDF_RESAMPLE_EACH_EPOCH = bool(int(os.getenv("SDF_RESAMPLE_EACH_EPOCH", "1")))
-USE_TARGET_TSDF_INPUT = bool(int(os.getenv("USE_TARGET_TSDF_INPUT", "0")))
-OVERFIT_DEBUG_MODE = os.getenv("OVERFIT_DEBUG_MODE", "").strip().lower()  # "", "one_row", "one_part"
+SDF_RESAMPLE_EACH_EPOCH = False
+USE_TARGET_TSDF_INPUT = True
+OVERFIT_DEBUG_MODE = "one_part"
 OVERFIT_PART_NAME = os.getenv("OVERFIT_PART_NAME", "").strip()
 
 # Optional StateEncoder initialization from SSL pretraining.
@@ -63,7 +63,7 @@ FREEZE_STATE_ENCODER = False
 STATE_ENCODER_LR_MULTIPLIER = 1.0
 
 # For SDF-only transition learning, query points are randomly subsampled per row.
-SDF_QUERY_NODES = 8192
+SDF_QUERY_NODES = 32768
 OCTREE_QUERY_NODES = 4096
 OCTREE_POS_WEIGHT_FACTOR = 2.0
 OCTREE_DEPTH_WEIGHT_BASE = 2.0
@@ -73,15 +73,15 @@ OCTREE_FILL_FRACTION_WEIGHT = 0.5
 OCTREE_REMOVED_FRACTION_WEIGHT = 2.0
 TSDF_LOSS_WEIGHT = 1.0
 DELTA_TSDF_LOSS_WEIGHT = 0.5
-CHANGED_TSDF_LOSS_WEIGHT = 1.0
+CHANGED_TSDF_LOSS_WEIGHT = 2.0
 CHANGED_DELTA_TSDF_LOSS_WEIGHT = 1.0
 TSDF_CHANGE_EPS = 1e-3
 TSDF_MONOTONICITY_WEIGHT = 0.1
 TSDF_MONOTONICITY_EMPTY_MARGIN = 0.2
-AFFECTED_FACE_LOSS_WEIGHT = 1.0
-AFFECTED_FACE_DELTA_LOSS_WEIGHT = 0.0
+AFFECTED_FACE_LOSS_WEIGHT = 0.2
+AFFECTED_FACE_DELTA_LOSS_WEIGHT = 0.1
 
-SAVE_CHECKPOINTS = True
+SAVE_CHECKPOINTS = False
 CHECKPOINT_ROOT = r"C:\Users\inwoo\Desktop\5_Axis\checkpoints_transition"
 RUN_NAME = os.getenv("RUN_NAME", "")
 
@@ -597,6 +597,8 @@ def _evaluate_octree_metrics(model: GraphSdfPlanningModel, batch: dict, device: 
         octree_depths=batch["octree_depths"].to(device),
         octree_occ_before=_octree_before_for_decoder(batch, device),
         axis_visible=batch.get("axis_visible").to(device) if batch.get("axis_visible") is not None else None,
+        axis_dir=batch.get("axis_dir").to(device) if batch.get("axis_dir") is not None else None,
+        tool_radius_norm=batch.get("tool_radius_norm").to(device) if batch.get("tool_radius_norm") is not None else None,
         node_process_state=batch.get("node_process_state").to(device) if batch.get("node_process_state") is not None else None,
         node_centrality=batch.get("node_centrality").to(device) if batch.get("node_centrality") is not None else None,
         spatial_pos=batch.get("spatial_pos").to(device) if batch.get("spatial_pos") is not None else None,
@@ -729,6 +731,8 @@ def _evaluate_sdf_metrics(
         sdf_query_points=batch["sdf_query_points"].to(device),
         sdf_query_state=query_state,
         axis_visible=batch.get("axis_visible").to(device) if batch.get("axis_visible") is not None else None,
+        axis_dir=batch.get("axis_dir").to(device) if batch.get("axis_dir") is not None else None,
+        tool_radius_norm=batch.get("tool_radius_norm").to(device) if batch.get("tool_radius_norm") is not None else None,
         node_process_state=batch.get("node_process_state").to(device) if batch.get("node_process_state") is not None else None,
         node_centrality=batch.get("node_centrality").to(device) if batch.get("node_centrality") is not None else None,
         spatial_pos=batch.get("spatial_pos").to(device) if batch.get("spatial_pos") is not None else None,
@@ -783,6 +787,8 @@ def _evaluate_sdf_metrics(
             tool_choice_id=batch["tool_choice_id"].to(device),
             action_face_id=batch["action_face_id"].clamp_min(0).to(device),
             axis_visible=batch.get("axis_visible").to(device) if batch.get("axis_visible") is not None else None,
+            axis_dir=batch.get("axis_dir").to(device) if batch.get("axis_dir") is not None else None,
+            tool_radius_norm=batch.get("tool_radius_norm").to(device) if batch.get("tool_radius_norm") is not None else None,
             node_process_state=batch.get("node_process_state").to(device) if batch.get("node_process_state") is not None else None,
             node_centrality=batch.get("node_centrality").to(device) if batch.get("node_centrality") is not None else None,
             spatial_pos=batch.get("spatial_pos").to(device) if batch.get("spatial_pos") is not None else None,

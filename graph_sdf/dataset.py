@@ -13,7 +13,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from .schema import TOOL_CHOICE_TO_ID, tool_choice_key
+from .schema import TOOL_CHOICE_TO_ID, TOOL_LIBRARY, tool_choice_key
 
 
 class ProcessSkeletonParquetDataset(Dataset):
@@ -543,14 +543,16 @@ class ProcessSkeletonParquetDataset(Dataset):
             next_node_sdf = np.zeros((num_nodes,), dtype=np.float32)
 
         tool_choice_id = row["tool_choice_id"] if "tool_choice_id" in row.index else None
+        tool_diameter_value = row["tool_diameter"] if "tool_diameter" in row.index else None
         if tool_choice_id is None or (isinstance(tool_choice_id, float) and np.isnan(tool_choice_id)):
             tool_kind = row["tool_type_name"] if "tool_type_name" in row.index else None
-            tool_diameter = row["tool_diameter"] if "tool_diameter" in row.index else None
-            if tool_kind is not None and tool_diameter is not None:
-                key = tool_choice_key(str(tool_kind), float(tool_diameter))
+            if tool_kind is not None and tool_diameter_value is not None:
+                key = tool_choice_key(str(tool_kind), float(tool_diameter_value))
                 tool_choice_id = TOOL_CHOICE_TO_ID.get(key, -1)
             else:
                 tool_choice_id = -1
+        if self._is_missing(tool_diameter_value) and 0 <= int(tool_choice_id) < len(TOOL_LIBRARY):
+            tool_diameter_value = TOOL_LIBRARY[int(tool_choice_id)][1]
         tool_choice_valid = row["tool_choice_valid"] if "tool_choice_valid" in row.index else None
         if tool_choice_valid is None or (isinstance(tool_choice_valid, float) and np.isnan(tool_choice_valid)):
             tool_choice_valid = 1 if int(tool_choice_id) >= 0 else 0
@@ -591,6 +593,19 @@ class ProcessSkeletonParquetDataset(Dataset):
             "action_face_valid": torch.tensor(int(action_face_valid), dtype=torch.float32),
             "tool_choice_valid": torch.tensor(int(tool_choice_valid), dtype=torch.float32),
         }
+        tool_diameter_float = (
+            float(tool_diameter_value)
+            if not self._is_missing(tool_diameter_value)
+            else 0.0
+        )
+        batch["tool_diameter_norm"] = torch.tensor(tool_diameter_float / scale, dtype=torch.float32)
+        batch["tool_radius_norm"] = torch.tensor((0.5 * tool_diameter_float) / scale, dtype=torch.float32)
+        if "axis_dir" in row.index and not self._is_missing(row["axis_dir"]):
+            axis_dir = self._array(row["axis_dir"], np.float32).reshape(3)
+            axis_norm = float(np.linalg.norm(axis_dir))
+            if axis_norm > 1e-9:
+                axis_dir = axis_dir / axis_norm
+            batch["axis_dir"] = torch.from_numpy(axis_dir.astype(np.float32, copy=False))
         if next_point_sdf is not None:
             batch["next_point_sdf"] = torch.from_numpy(next_point_sdf)
 

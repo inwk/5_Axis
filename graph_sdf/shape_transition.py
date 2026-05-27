@@ -20,6 +20,11 @@ class ActionEmbedding(nn.Module):
 
         self.macro_embedding = nn.Embedding(config.macro_class_count, action_dim)
         self.tool_embedding = nn.Embedding(config.tool_choice_count, action_dim)
+        self.tool_geometry_projection = nn.Sequential(
+            nn.Linear(4, action_dim),
+            nn.GELU(),
+            nn.Linear(action_dim, action_dim),
+        )
         self.target_projection = nn.Sequential(
             nn.Linear(config.hidden_dim + 3 + 4 + config.node_process_feature_dim, config.hidden_dim),
             nn.GELU(),
@@ -31,7 +36,7 @@ class ActionEmbedding(nn.Module):
             nn.Linear(config.hidden_dim, action_dim),
         )
         self.fuse = nn.Sequential(
-            nn.Linear(action_dim * 4, config.hidden_dim),
+            nn.Linear(action_dim * 5, config.hidden_dim),
             nn.GELU(),
             nn.Dropout(config.action_dropout),
             nn.Linear(config.hidden_dim, config.hidden_dim),
@@ -59,6 +64,8 @@ class ActionEmbedding(nn.Module):
         tool_choice_id: torch.Tensor,
         action_face_id: torch.Tensor,
         axis_visible: Optional[torch.Tensor] = None,
+        axis_dir: Optional[torch.Tensor] = None,
+        tool_radius_norm: Optional[torch.Tensor] = None,
         node_process_state: Optional[torch.Tensor] = None,
         node_mask: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
@@ -90,6 +97,18 @@ class ActionEmbedding(nn.Module):
 
         macro_feature = self.macro_embedding(macro_class_id)
         tool_feature = self.tool_embedding(tool_choice_id)
+        if axis_dir is None:
+            axis_feature = target_normals
+        else:
+            axis_feature = axis_dir.to(node_embeddings.device).float().reshape(node_embeddings.shape[0], 3)
+        axis_feature = axis_feature / axis_feature.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        if tool_radius_norm is None:
+            tool_radius_feature = node_embeddings.new_zeros(node_embeddings.shape[0], 1)
+        else:
+            tool_radius_feature = tool_radius_norm.to(node_embeddings.device).float().reshape(node_embeddings.shape[0], -1)[:, :1]
+        tool_geometry_feature = self.tool_geometry_projection(
+            torch.cat([tool_radius_feature, axis_feature], dim=-1)
+        )
 
         valid_nodes = torch.ones_like(current_node_sdf, dtype=torch.bool)
         if node_mask is not None:
@@ -126,7 +145,7 @@ class ActionEmbedding(nn.Module):
             )
         )
         action_context = self.fuse(
-            torch.cat([macro_feature, tool_feature, target_feature, region_feature], dim=-1)
+            torch.cat([macro_feature, tool_feature, tool_geometry_feature, target_feature, region_feature], dim=-1)
         )
         return {
             "action_context": action_context,

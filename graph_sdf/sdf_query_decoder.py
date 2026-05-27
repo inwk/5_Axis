@@ -31,6 +31,12 @@ class SdfQueryDecoder(nn.Module):
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden),
         )
+        self.query_action_proj = nn.Sequential(
+            nn.Linear(5, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+        )
         self.decoder_blocks = nn.ModuleList([
             _OctreeDecoderBlock(
                 hidden_dim=hidden,
@@ -53,6 +59,7 @@ class SdfQueryDecoder(nn.Module):
         action_context: torch.Tensor,
         query_points: torch.Tensor,
         query_state: Optional[torch.Tensor] = None,
+        query_action_features: Optional[torch.Tensor] = None,
         node_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         dummy_scale = torch.zeros((*query_points.shape[:-1], 1), device=query_points.device, dtype=query_points.dtype)
@@ -64,6 +71,11 @@ class SdfQueryDecoder(nn.Module):
             if q.shape[-1] != 3:
                 raise ValueError(f"query_state must have last dim 3, got {tuple(q.shape)}")
             features = features + self.query_state_proj(q.to(features.device))
+        if query_action_features is not None:
+            q_action = query_action_features.float()
+            if q_action.shape[-1] != 5:
+                raise ValueError(f"query_action_features must have last dim 5, got {tuple(q_action.shape)}")
+            features = features + self.query_action_proj(q_action.to(features.device))
 
         for block in self.decoder_blocks:
             features = block(

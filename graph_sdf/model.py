@@ -104,6 +104,8 @@ class GraphSdfPlanningModel(nn.Module):
         tool_choice_id: torch.Tensor,
         action_face_id: torch.Tensor,
         axis_visible: Optional[torch.Tensor],
+        axis_dir: Optional[torch.Tensor],
+        tool_radius_norm: Optional[torch.Tensor],
         node_process_state: Optional[torch.Tensor],
         node_mask: Optional[torch.Tensor],
     ) -> dict[str, torch.Tensor]:
@@ -115,9 +117,48 @@ class GraphSdfPlanningModel(nn.Module):
             tool_choice_id=tool_choice_id,
             action_face_id=action_face_id,
             axis_visible=axis_visible,
+            axis_dir=axis_dir,
+            tool_radius_norm=tool_radius_norm,
             node_process_state=node_process_state,
             node_mask=node_mask,
         )
+
+    @staticmethod
+    def _gather_action_face_vectors(values: torch.Tensor, action_face_id: torch.Tensor) -> torch.Tensor:
+        """Gathers one per-face vector per batch item."""
+        gather_index = action_face_id[:, None, None].expand(-1, 1, values.shape[-1])
+        return torch.gather(values, 1, gather_index).squeeze(1)
+
+    def _build_sdf_query_action_features(
+        self,
+        state_points: torch.Tensor,
+        action_face_id: torch.Tensor,
+        query_points: torch.Tensor,
+        axis_dir: Optional[torch.Tensor],
+        tool_radius_norm: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Builds query-local cutter geometry features in normalized part units."""
+        action_centers = self._gather_action_face_vectors(state_points[..., 0:3].mean(dim=2), action_face_id)
+        action_normals = self._gather_action_face_vectors(state_points[..., 3:6].mean(dim=2), action_face_id)
+        if axis_dir is None:
+            axis = action_normals
+        else:
+            axis = axis_dir.to(state_points.device).float().reshape(state_points.shape[0], 3)
+        axis = F.normalize(axis, dim=-1, eps=1e-6)
+        action_normals = F.normalize(action_normals, dim=-1, eps=1e-6)
+
+        rel = query_points - action_centers[:, None, :]
+        along_axis = (rel * axis[:, None, :]).sum(dim=-1, keepdim=True)
+        radial_vec = rel - along_axis * axis[:, None, :]
+        radial_to_axis = radial_vec.norm(dim=-1, keepdim=True)
+        if tool_radius_norm is None:
+            radius = query_points.new_zeros(query_points.shape[0], 1)
+        else:
+            radius = tool_radius_norm.to(query_points.device).float().reshape(query_points.shape[0], -1)[:, :1]
+        radius = radius[:, None, :].expand(-1, query_points.shape[1], -1)
+        normal_axis_dot = (action_normals * axis).sum(dim=-1, keepdim=True)
+        normal_axis_dot = normal_axis_dot[:, None, :].expand(-1, query_points.shape[1], -1)
+        return torch.cat([along_axis, radial_to_axis, radial_to_axis - radius, radius, normal_axis_dot], dim=-1)
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -206,6 +247,8 @@ class GraphSdfPlanningModel(nn.Module):
         octree_depths:   torch.Tensor,   # [B, K]
         octree_occ_before: Optional[torch.Tensor] = None,  # [B, K]
         axis_visible:         Optional[torch.Tensor] = None,
+        axis_dir:             Optional[torch.Tensor] = None,
+        tool_radius_norm:     Optional[torch.Tensor] = None,
         node_process_state:   Optional[torch.Tensor] = None,
         node_centrality:      Optional[torch.Tensor] = None,
         spatial_pos:          Optional[torch.Tensor] = None,
@@ -244,6 +287,8 @@ class GraphSdfPlanningModel(nn.Module):
             tool_choice_id=tool_choice_id,
             action_face_id=action_face_id,
             axis_visible=axis_visible,
+            axis_dir=axis_dir,
+            tool_radius_norm=tool_radius_norm,
             node_process_state=node_process_state,
             node_mask=node_mask,
         )
@@ -273,6 +318,8 @@ class GraphSdfPlanningModel(nn.Module):
         sdf_query_points: torch.Tensor,
         sdf_query_state: Optional[torch.Tensor] = None,
         axis_visible: Optional[torch.Tensor] = None,
+        axis_dir: Optional[torch.Tensor] = None,
+        tool_radius_norm: Optional[torch.Tensor] = None,
         node_process_state: Optional[torch.Tensor] = None,
         node_centrality: Optional[torch.Tensor] = None,
         spatial_pos: Optional[torch.Tensor] = None,
@@ -303,14 +350,24 @@ class GraphSdfPlanningModel(nn.Module):
             tool_choice_id=tool_choice_id,
             action_face_id=action_face_id,
             axis_visible=axis_visible,
+            axis_dir=axis_dir,
+            tool_radius_norm=tool_radius_norm,
             node_process_state=node_process_state,
             node_mask=node_mask,
+        )
+        query_action_features = self._build_sdf_query_action_features(
+            state_points=state_points,
+            action_face_id=action_face_id,
+            query_points=sdf_query_points,
+            axis_dir=axis_dir,
+            tool_radius_norm=tool_radius_norm,
         )
         tsdf = self.sdf_query_decoder(
             node_embeddings=state_embedding,
             action_context=action_out["action_context"],
             query_points=sdf_query_points,
             query_state=sdf_query_state,
+            query_action_features=query_action_features,
             node_mask=node_mask,
         )
         return {
@@ -326,6 +383,8 @@ class GraphSdfPlanningModel(nn.Module):
         tool_choice_id: torch.Tensor,
         action_face_id: torch.Tensor,
         axis_visible: Optional[torch.Tensor] = None,
+        axis_dir: Optional[torch.Tensor] = None,
+        tool_radius_norm: Optional[torch.Tensor] = None,
         node_process_state: Optional[torch.Tensor] = None,
         node_centrality: Optional[torch.Tensor] = None,
         spatial_pos: Optional[torch.Tensor] = None,
@@ -354,6 +413,8 @@ class GraphSdfPlanningModel(nn.Module):
             tool_choice_id=tool_choice_id,
             action_face_id=action_face_id,
             axis_visible=axis_visible,
+            axis_dir=axis_dir,
+            tool_radius_norm=tool_radius_norm,
             node_process_state=node_process_state,
             node_mask=node_mask,
         )
@@ -374,6 +435,8 @@ class GraphSdfPlanningModel(nn.Module):
         tool_choice_id: torch.Tensor,
         action_face_id: torch.Tensor,
         axis_visible:   Optional[torch.Tensor] = None,
+        axis_dir:       Optional[torch.Tensor] = None,
+        tool_radius_norm: Optional[torch.Tensor] = None,
         node_process_state: Optional[torch.Tensor] = None,
         node_centrality:    Optional[torch.Tensor] = None,
         spatial_pos:        Optional[torch.Tensor] = None,
@@ -412,6 +475,8 @@ class GraphSdfPlanningModel(nn.Module):
             tool_choice_id=tool_choice_id,
             action_face_id=action_face_id,
             axis_visible=axis_visible,
+            axis_dir=axis_dir,
+            tool_radius_norm=tool_radius_norm,
             node_process_state=node_process_state,
             node_mask=node_mask,
         )
