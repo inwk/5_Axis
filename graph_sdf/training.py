@@ -442,7 +442,7 @@ def _sdf_query_state_input(
     device: torch.device,
     use_target_tsdf_input: bool = True,
 ) -> torch.Tensor | None:
-    """Builds [before_tsdf, target_tsdf, known] for SDF query decoder."""
+    """Builds [before_tsdf, target_tsdf, removable_prior, known]."""
     before = (
         batch["sdf_tsdf_before"].to(device).float().clamp(-1.0, 1.0)
         if "sdf_tsdf_before" in batch
@@ -458,9 +458,15 @@ def _sdf_query_state_input(
     ref = before if before is not None else target
     zeros = torch.zeros_like(ref)
     ones = torch.ones_like(ref)
+    removable = (
+        (target - before).clamp(-2.0, 2.0)
+        if before is not None and target is not None
+        else zeros
+    )
     return torch.stack([
         before if before is not None else zeros,
         target if target is not None else zeros,
+        removable,
         ones,
     ], dim=-1)
 

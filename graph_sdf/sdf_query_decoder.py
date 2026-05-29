@@ -26,7 +26,7 @@ class SdfQueryDecoder(nn.Module):
             nn.LayerNorm(hidden),
         )
         self.query_state_proj = nn.Sequential(
-            nn.Linear(3, hidden),
+            nn.Linear(4, hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden),
@@ -68,8 +68,8 @@ class SdfQueryDecoder(nn.Module):
 
         if query_state is not None:
             q = query_state.float()
-            if q.shape[-1] != 3:
-                raise ValueError(f"query_state must have last dim 3, got {tuple(q.shape)}")
+            if q.shape[-1] != 4:
+                raise ValueError(f"query_state must have last dim 4, got {tuple(q.shape)}")
             features = features + self.query_state_proj(q.to(features.device))
         if query_action_features is not None:
             q_action = query_action_features.float()

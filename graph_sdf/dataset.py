@@ -37,6 +37,8 @@ class ProcessSkeletonParquetDataset(Dataset):
         sdf_query_nodes: int | None = None,
         lazy_load: bool = False,
         parquet_cache_size: int | None = None,
+        sdf_changed_sample_fraction: float = 0.0,
+        sdf_changed_sample_eps: float = 1e-3,
     ) -> None:
         """Reads parquet files into a single dataframe index."""
         files = [str(Path(path)) for path in parquet_files]
@@ -52,6 +54,8 @@ class ProcessSkeletonParquetDataset(Dataset):
         self.sdf_query_nodes = sdf_query_nodes
         self.sdf_sample_epoch = 0
         self.sdf_sample_seed = int(os.getenv("SDF_SAMPLE_SEED", "0"))
+        self.sdf_changed_sample_fraction = min(max(float(sdf_changed_sample_fraction), 0.0), 1.0)
+        self.sdf_changed_sample_eps = float(sdf_changed_sample_eps)
         self._parquet_cache_size = max(
             1,
             int(parquet_cache_size if parquet_cache_size is not None else os.getenv("PARQUET_ROW_GROUP_CACHE_SIZE", "2")),
@@ -191,6 +195,12 @@ class ProcessSkeletonParquetDataset(Dataset):
     def set_sdf_sample_epoch(self, epoch: int) -> None:
         """Changes the deterministic SDF query subset used for each row."""
         self.sdf_sample_epoch = int(epoch)
+
+    def set_sdf_changed_sampling(self, fraction: float, eps: float | None = None) -> None:
+        """Configures changed-region oversampling for SDF query rows."""
+        self.sdf_changed_sample_fraction = min(max(float(fraction), 0.0), 1.0)
+        if eps is not None:
+            self.sdf_changed_sample_eps = float(eps)
 
     def row_metadata(self, indices: Iterable[int], columns: Iterable[str]) -> dict[int, dict[str, object]]:
         """Reads scalar row metadata columns without materializing payload arrays when lazy."""
@@ -456,7 +466,12 @@ class ProcessSkeletonParquetDataset(Dataset):
             rng.shuffle(indices)
         return centers[indices], depths[indices], labels[indices]
 
-    def _sdf_sample_indices(self, count: int, index: int) -> np.ndarray:
+    def _sdf_sample_indices(
+        self,
+        count: int,
+        index: int,
+        delta_values: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Returns aligned query-point sample indices for one row."""
         target = self.sdf_query_nodes
         if target is None:
@@ -472,6 +487,35 @@ class ProcessSkeletonParquetDataset(Dataset):
             + abs(int(self.sdf_sample_seed))
         ) % (2 ** 32)
         rng = np.random.default_rng(seed=seed)
+        changed_fraction = float(self.sdf_changed_sample_fraction)
+        if changed_fraction > 0.0 and delta_values is not None:
+            delta = np.asarray(delta_values, dtype=np.float32).reshape(-1)
+            usable = int(min(count, delta.shape[0]))
+            if usable > 0:
+                changed = np.flatnonzero(np.abs(delta[:usable]) > float(self.sdf_changed_sample_eps)).astype(np.int64)
+                if changed.size > 0:
+                    target_changed = int(np.ceil(float(target) * changed_fraction))
+                    target_changed = min(max(target_changed, 1), target)
+                    all_indices = np.arange(usable, dtype=np.int64)
+                    unchanged = all_indices[np.abs(delta[:usable]) <= float(self.sdf_changed_sample_eps)]
+                    changed_sample = rng.choice(
+                        changed,
+                        size=target_changed,
+                        replace=changed.size < target_changed,
+                    ).astype(np.int64)
+                    remaining = target - target_changed
+                    if remaining > 0:
+                        source = unchanged if unchanged.size > 0 else changed
+                        other_sample = rng.choice(
+                            source,
+                            size=remaining,
+                            replace=source.size < remaining,
+                        ).astype(np.int64)
+                        indices = np.concatenate([changed_sample, other_sample])
+                    else:
+                        indices = changed_sample
+                    rng.shuffle(indices)
+                    return indices.astype(np.int64)
         if count >= target:
             return rng.choice(count, size=target, replace=False).astype(np.int64)
         extra = rng.choice(count, size=target - count, replace=True).astype(np.int64)
@@ -793,7 +837,19 @@ class ProcessSkeletonParquetDataset(Dataset):
             sdf_after = self._array(sdf_after_raw, np.float32).reshape(-1)
             count = min(sdf_points.shape[0], sdf_after.shape[0])
             if count > 0:
-                sample_idx = self._sdf_sample_indices(count, int(index))
+                delta_for_sampling = None
+                delta_raw = row["sdf_delta_tsdf"] if "sdf_delta_tsdf" in row.index else None
+                if not self._is_missing(delta_raw):
+                    delta_values = self._array(delta_raw, np.float32).reshape(-1)
+                    d_count = min(count, delta_values.shape[0])
+                    if d_count > 0:
+                        delta_for_sampling = delta_values[:d_count]
+                elif "sdf_tsdf_before" in row.index and not self._is_missing(row["sdf_tsdf_before"]):
+                    before_values = self._array(row["sdf_tsdf_before"], np.float32).reshape(-1)
+                    b_count = min(count, before_values.shape[0])
+                    if b_count > 0:
+                        delta_for_sampling = sdf_after[:b_count] - before_values[:b_count]
+                sample_idx = self._sdf_sample_indices(count, int(index), delta_for_sampling)
                 batch["sdf_query_points"] = torch.from_numpy(sdf_points[:count][sample_idx].astype(np.float32, copy=False))
                 batch["sdf_tsdf_after"] = torch.from_numpy(sdf_after[:count][sample_idx].astype(np.float32, copy=False))
 

@@ -76,6 +76,8 @@ DELTA_TSDF_LOSS_WEIGHT = 0.5
 CHANGED_TSDF_LOSS_WEIGHT = 2.0
 CHANGED_DELTA_TSDF_LOSS_WEIGHT = 1.0
 TSDF_CHANGE_EPS = 1e-3
+SDF_CHANGED_SAMPLE_FRACTION = 0.5  # train-only changed-query oversampling target
+SDF_CHANGED_SAMPLE_EPS = TSDF_CHANGE_EPS
 TSDF_MONOTONICITY_WEIGHT = 0.1
 TSDF_MONOTONICITY_EMPTY_MARGIN = 0.2
 AFFECTED_FACE_LOSS_WEIGHT = 0.2
@@ -718,9 +720,15 @@ def _evaluate_sdf_metrics(
         ref = before if before is not None else target
         zeros = torch.zeros_like(ref)
         ones = torch.ones_like(ref)
+        removable = (
+            (target - before).clamp(-2.0, 2.0)
+            if before is not None and target is not None
+            else zeros
+        )
         query_state = torch.stack([
             before if before is not None else zeros,
             target if target is not None else zeros,
+            removable,
             ones,
         ], dim=-1)
     out = model.forward_sdf_query(
@@ -875,6 +883,8 @@ def main() -> None:
             train_files,
             octree_query_nodes=int(OCTREE_QUERY_NODES),
             sdf_query_nodes=int(SDF_QUERY_NODES),
+            sdf_changed_sample_fraction=float(SDF_CHANGED_SAMPLE_FRACTION),
+            sdf_changed_sample_eps=float(SDF_CHANGED_SAMPLE_EPS),
             lazy_load=LAZY_PARQUET_LOADING,
             parquet_cache_size=PARQUET_ROW_GROUP_CACHE_SIZE,
         )
@@ -882,6 +892,8 @@ def main() -> None:
             val_files,
             octree_query_nodes=int(OCTREE_QUERY_NODES),
             sdf_query_nodes=int(SDF_QUERY_NODES),
+            sdf_changed_sample_fraction=0.0,
+            sdf_changed_sample_eps=float(SDF_CHANGED_SAMPLE_EPS),
             lazy_load=LAZY_PARQUET_LOADING,
             parquet_cache_size=PARQUET_ROW_GROUP_CACHE_SIZE,
         )
@@ -895,7 +907,15 @@ def main() -> None:
                 OVERFIT_DEBUG_MODE,
                 OVERFIT_PART_NAME,
             )
-            val_base_dataset = train_base_dataset
+            val_base_dataset = ProcessSkeletonParquetDataset(
+                train_files,
+                octree_query_nodes=int(OCTREE_QUERY_NODES),
+                sdf_query_nodes=int(SDF_QUERY_NODES),
+                sdf_changed_sample_fraction=0.0,
+                sdf_changed_sample_eps=float(SDF_CHANGED_SAMPLE_EPS),
+                lazy_load=LAZY_PARQUET_LOADING,
+                parquet_cache_size=PARQUET_ROW_GROUP_CACHE_SIZE,
+            )
         train_indices = _locality_sort_indices(train_base_dataset, train_indices)
         val_indices = _locality_sort_indices(val_base_dataset, val_indices)
         train_dataset: Dataset = Subset(train_base_dataset, train_indices)
@@ -912,6 +932,8 @@ def main() -> None:
             parquet_files,
             octree_query_nodes=int(OCTREE_QUERY_NODES),
             sdf_query_nodes=int(SDF_QUERY_NODES),
+            sdf_changed_sample_fraction=0.0,
+            sdf_changed_sample_eps=float(SDF_CHANGED_SAMPLE_EPS),
             lazy_load=LAZY_PARQUET_LOADING,
             parquet_cache_size=PARQUET_ROW_GROUP_CACHE_SIZE,
         )
@@ -936,10 +958,28 @@ def main() -> None:
             split_description = "row_level"
         train_indices = _locality_sort_indices(base_dataset, train_indices)
         val_indices = _locality_sort_indices(base_dataset, val_indices)
-        train_dataset = Subset(base_dataset, train_indices)
-        val_dataset = Subset(base_dataset, val_indices)
-        macro_train_dataset = base_dataset
-        macro_val_dataset = base_dataset
+        train_base_dataset = ProcessSkeletonParquetDataset(
+            parquet_files,
+            octree_query_nodes=int(OCTREE_QUERY_NODES),
+            sdf_query_nodes=int(SDF_QUERY_NODES),
+            sdf_changed_sample_fraction=float(SDF_CHANGED_SAMPLE_FRACTION),
+            sdf_changed_sample_eps=float(SDF_CHANGED_SAMPLE_EPS),
+            lazy_load=LAZY_PARQUET_LOADING,
+            parquet_cache_size=PARQUET_ROW_GROUP_CACHE_SIZE,
+        )
+        val_base_dataset = ProcessSkeletonParquetDataset(
+            parquet_files,
+            octree_query_nodes=int(OCTREE_QUERY_NODES),
+            sdf_query_nodes=int(SDF_QUERY_NODES),
+            sdf_changed_sample_fraction=0.0,
+            sdf_changed_sample_eps=float(SDF_CHANGED_SAMPLE_EPS),
+            lazy_load=LAZY_PARQUET_LOADING,
+            parquet_cache_size=PARQUET_ROW_GROUP_CACHE_SIZE,
+        )
+        train_dataset = Subset(train_base_dataset, train_indices)
+        val_dataset = Subset(val_base_dataset, val_indices)
+        macro_train_dataset = train_base_dataset
+        macro_val_dataset = val_base_dataset
 
     train_loader = _make_dataloader(
         train_dataset,
@@ -1007,6 +1047,8 @@ def main() -> None:
                 "split_by_part": SPLIT_BY_PART,
                 "sdf_resample_each_epoch": SDF_RESAMPLE_EACH_EPOCH,
                 "use_target_tsdf_input": USE_TARGET_TSDF_INPUT,
+                "sdf_changed_sample_fraction": SDF_CHANGED_SAMPLE_FRACTION,
+                "sdf_changed_sample_eps": SDF_CHANGED_SAMPLE_EPS,
                 "overfit_debug_mode": OVERFIT_DEBUG_MODE,
                 "overfit_part_name": OVERFIT_PART_NAME,
                 "learning_rate": LEARNING_RATE,
@@ -1074,7 +1116,11 @@ def main() -> None:
         f"affected_delta_weight={AFFECTED_FACE_DELTA_LOSS_WEIGHT} "
         f"use_target_tsdf_input={USE_TARGET_TSDF_INPUT}"
     )
-    print(f"[SDF Sampling] resample_each_epoch={SDF_RESAMPLE_EACH_EPOCH}")
+    print(
+        f"[SDF Sampling] resample_each_epoch={SDF_RESAMPLE_EACH_EPOCH} "
+        f"train_changed_fraction={SDF_CHANGED_SAMPLE_FRACTION} "
+        f"changed_eps={SDF_CHANGED_SAMPLE_EPS}"
+    )
     print(f"[Train Macro Dist] { _macro_distribution(macro_train_dataset, train_indices) }")
     print(f"[Val Macro Dist] { _macro_distribution(macro_val_dataset, val_indices) }")
     if run_dir is not None:
