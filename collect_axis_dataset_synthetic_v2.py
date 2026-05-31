@@ -678,6 +678,75 @@ def _dilate_config_mask(config_mask: np.ndarray, offsets: np.ndarray) -> np.ndar
     return _dilate_config_mask_cpu(config_mask, offsets)
 
 
+def _axis_clearance_features(
+    solid: np.ndarray,
+    flat_indices: np.ndarray,
+    axis_dir: np.ndarray,
+    spacing: tuple[float, float, float],
+    scale: float,
+    tool_radius: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Returns approach-side stock depth and a simple blocked flag per grid index."""
+    indices = np.asarray(flat_indices, dtype=np.int64).reshape(-1)
+    if indices.size == 0:
+        return np.asarray([], dtype=np.float32), np.asarray([], dtype=np.float32)
+
+    dims = tuple(int(v) for v in solid.shape)
+    ijk = np.stack(np.unravel_index(indices, dims), axis=1).astype(np.float32)
+    inside = solid.reshape(-1)[indices].astype(bool, copy=False)
+    clearance = np.zeros((indices.shape[0],), dtype=np.float32)
+    if not bool(inside.any()):
+        return clearance, clearance
+
+    axis = _unit(axis_dir)
+    spacing_arr = np.asarray(spacing, dtype=np.float32).reshape(3)
+    index_dir = axis / np.maximum(spacing_arr, 1e-9)
+    max_component = float(np.max(np.abs(index_dir)))
+    if max_component <= 1e-9:
+        return clearance, clearance
+
+    step_index = (index_dir / max_component).astype(np.float32)
+    step_distance = float(np.linalg.norm(step_index * spacing_arr))
+    max_steps = int(os.getenv("SYNTHETIC_AXIS_CLEARANCE_MAX_STEPS", str(max(dims) * 2)))
+    max_steps = max(1, max_steps)
+
+    pos = ijk.copy()
+    active = inside.copy()
+    for step in range(1, max_steps + 1):
+        if not bool(active.any()):
+            break
+        pos[active] += step_index.reshape(1, 3)
+        rounded = np.rint(pos[active]).astype(np.int32)
+        in_bounds = (
+            (rounded[:, 0] >= 0)
+            & (rounded[:, 0] < dims[0])
+            & (rounded[:, 1] >= 0)
+            & (rounded[:, 1] < dims[1])
+            & (rounded[:, 2] >= 0)
+            & (rounded[:, 2] < dims[2])
+        )
+        active_indices = np.flatnonzero(active)
+        exited = active_indices[~in_bounds]
+        if exited.size:
+            clearance[exited] = float(step) * step_distance
+            active[exited] = False
+        if bool(in_bounds.any()):
+            bounded = rounded[in_bounds]
+            bounded_active_indices = active_indices[in_bounds]
+            empty = ~solid[bounded[:, 0], bounded[:, 1], bounded[:, 2]]
+            reached_empty = bounded_active_indices[empty]
+            if reached_empty.size:
+                clearance[reached_empty] = float(step) * step_distance
+                active[reached_empty] = False
+    if bool(active.any()):
+        clearance[active] = float(max_steps) * step_distance
+
+    scale = max(float(scale), 1e-6)
+    clearance_norm = (clearance / scale).astype(np.float32, copy=False)
+    blocked = (inside & (clearance > float(tool_radius))).astype(np.float32, copy=False)
+    return clearance_norm, blocked
+
+
 def _action_roi_mask(
     row_macro: str,
     face_id: int,
@@ -764,27 +833,26 @@ def _tool_configs() -> list[dict[str, float | str]]:
     flat_diameters = _parse_float_list("SYNTHETIC_FLAT_TOOL_DIAMETERS", "4,6,8,10,12,16,20")
     ball_diameters = _parse_float_list("SYNTHETIC_BALL_TOOL_DIAMETERS", "4,6,8")
     length_mults = _parse_int_list("SYNTHETIC_TOOL_LENGTH_MULTIPLIERS", "3,4,5")
-    holder_dia_mults = _parse_int_list("SYNTHETIC_HOLDER_DIAMETER_MULTIPLIERS", "5,6,7,8,9,10")
-    holder_len_mults = _parse_int_list("SYNTHETIC_HOLDER_LENGTH_MULTIPLIERS", "3,4,5")
+    holder_dia_mults = _parse_int_list("SYNTHETIC_HOLDER_DIAMETER_MULTIPLIERS", "3,4,5")
+    holder_length = float(os.getenv("SYNTHETIC_HOLDER_LENGTH_MM", "100.0"))
 
     configs: list[dict[str, float | str]] = []
     for kind, diameters in (("flat", flat_diameters), ("ball", ball_diameters)):
         for diameter in diameters:
             for tool_len_mult in length_mults:
                 for holder_dia_mult in holder_dia_mults:
-                    for holder_len_mult in holder_len_mults:
-                        configs.append({
-                            "tool_kind": kind,
-                            "tool_diameter": float(diameter),
-                            "tool_radius": float(diameter) * 0.5,
-                            "tool_length": float(diameter) * float(tool_len_mult),
-                            "holder_diameter": float(diameter) * float(holder_dia_mult),
-                            "holder_radius": float(diameter) * float(holder_dia_mult) * 0.5,
-                            "holder_length": float(diameter) * float(holder_len_mult),
-                            "tool_length_multiplier": float(tool_len_mult),
-                            "holder_diameter_multiplier": float(holder_dia_mult),
-                            "holder_length_multiplier": float(holder_len_mult),
-                        })
+                    configs.append({
+                        "tool_kind": kind,
+                        "tool_diameter": float(diameter),
+                        "tool_radius": float(diameter) * 0.5,
+                        "tool_length": float(diameter) * float(tool_len_mult),
+                        "holder_diameter": float(diameter) * float(holder_dia_mult),
+                        "holder_radius": float(diameter) * float(holder_dia_mult) * 0.5,
+                        "holder_length": holder_length,
+                        "tool_length_multiplier": float(tool_len_mult),
+                        "holder_diameter_multiplier": float(holder_dia_mult),
+                        "holder_length_multiplier": 0.0,
+                    })
     return configs
 
 
@@ -841,7 +909,7 @@ def _generate_rows(
     configs = _tool_configs()
     rng.shuffle(configs)
 
-    grid_resolution = _env_int("SYNTHETIC_GRID_RESOLUTION", 160)
+    grid_resolution = _env_int("SYNTHETIC_GRID_RESOLUTION", 256)
     grid_padding_ratio = float(os.getenv("SYNTHETIC_GRID_PADDING_RATIO", "0.10"))
     grid_padding_mm = float(os.getenv("SYNTHETIC_GRID_PADDING_MM", "5.0"))
     steps_per_rollout = max(1, _env_int("SYNTHETIC_STEPS_PER_ROLLOUT", 4))
@@ -869,7 +937,8 @@ def _generate_rows(
         },
         "tool_length_rule": "tool_length = diameter * integer_multiplier",
         "holder_diameter_rule": "holder_diameter = diameter * integer_multiplier",
-        "holder_length_rule": "holder_length = diameter * integer_multiplier",
+        "holder_length_rule": "holder_length = fixed_mm",
+        "holder_length_mm": float(os.getenv("SYNTHETIC_HOLDER_LENGTH_MM", "100.0")),
     }
     meta = _load_static_meta(static_dir)
     normalization = meta.get("normalization", {}) if isinstance(meta.get("normalization", {}), dict) else {}
@@ -942,7 +1011,10 @@ def _generate_rows(
     def _sample_transition_payload(
         before_tsdf: np.ndarray,
         after_tsdf: np.ndarray,
+        before_solid: np.ndarray,
         removed_mask: np.ndarray,
+        axis_dir: np.ndarray,
+        tool_radius: float,
     ) -> dict[str, np.ndarray]:
         before_flat = before_tsdf.reshape(-1)
         after_flat = after_tsdf.reshape(-1)
@@ -970,12 +1042,30 @@ def _generate_rows(
         after_occ = (after_flat[oct_idx] <= 0.0).astype(np.float32)
         target_occ = (target_flat[oct_idx] <= 0.0).astype(np.float32)
         removed_occ = removed_flat[oct_idx].astype(np.float32)
+        sdf_clearance, sdf_blocked = _axis_clearance_features(
+            before_solid,
+            sdf_idx,
+            axis_dir,
+            spacing,
+            float(scale),
+            float(tool_radius),
+        )
+        oct_clearance, oct_blocked = _axis_clearance_features(
+            before_solid,
+            oct_idx,
+            axis_dir,
+            spacing,
+            float(scale),
+            float(tool_radius),
+        )
         return {
             "sdf_query_points": grid_points_norm[sdf_idx].astype(np.float32, copy=False),
             "sdf_tsdf_before": before_flat[sdf_idx].astype(np.float32, copy=False),
             "sdf_tsdf_after": after_flat[sdf_idx].astype(np.float32, copy=False),
             "sdf_delta_tsdf": (after_flat[sdf_idx] - before_flat[sdf_idx]).astype(np.float32, copy=False),
             "sdf_target_tsdf": target_flat[sdf_idx].astype(np.float32, copy=False),
+            "sdf_axis_clearance_before": sdf_clearance,
+            "sdf_axis_blocked_before": sdf_blocked,
             "octree_centers": grid_points_norm[oct_idx].astype(np.float32, copy=False),
             "octree_depths": grid_depths[oct_idx].astype(np.int16, copy=False),
             "octree_occ_labels_before": before_occ,
@@ -987,6 +1077,8 @@ def _generate_rows(
             "octree_tsdf_after": after_flat[oct_idx].astype(np.float32, copy=False),
             "octree_delta_tsdf": (after_flat[oct_idx] - before_flat[oct_idx]).astype(np.float32, copy=False),
             "octree_target_tsdf": target_flat[oct_idx].astype(np.float32, copy=False),
+            "octree_axis_clearance_before": oct_clearance,
+            "octree_axis_blocked_before": oct_blocked,
             "octree_bbox_min": ((bbox_min - center_np) / float(scale)).astype(np.float32),
             "octree_bbox_max": ((bbox_max - center_np) / float(scale)).astype(np.float32),
         }
@@ -1007,7 +1099,8 @@ def _generate_rows(
             holder_radius=float(config["holder_radius"]),
             holder_length=float(config["holder_length"]),
         )
-        holder_forbidden = _shift_or_mask(target_solid, kernels["holder"])
+        holder_obstacle = current_solid if macro_name == "indexed_rough" else target_solid
+        holder_forbidden = _shift_or_mask(holder_obstacle, kernels["holder"])
         ideal_removal = current_solid & ~target_solid
         roi = _action_roi_mask(
             macro_name,
@@ -1070,7 +1163,14 @@ def _generate_rows(
             affected_mask = ((affected_delta > 1e-4) & valid_node_mask).astype(np.float32)
             finish_ready = ((rough_done > 0.5) & valid_node_mask).astype(np.float32)
             node_process_state = np.stack([rough_done, finish_ready], axis=1).astype(np.float32)
-            payload = _sample_transition_payload(before_tsdf, after_tsdf, removed_mask)
+            payload = _sample_transition_payload(
+                before_tsdf=before_tsdf,
+                after_tsdf=after_tsdf,
+                before_solid=current_solid,
+                removed_mask=removed_mask,
+                axis_dir=axis_dir,
+                tool_radius=float(config["tool_radius"]),
+            )
 
             tool_kind = str(config["tool_kind"])
             tool_choice_name = tool_choice_key(tool_kind, float(config["tool_diameter"]))

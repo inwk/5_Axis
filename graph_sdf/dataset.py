@@ -884,6 +884,8 @@ class ProcessSkeletonParquetDataset(Dataset):
                     ("sdf_tsdf_before", "sdf_tsdf_before"),
                     ("sdf_delta_tsdf", "sdf_delta_tsdf"),
                     ("sdf_target_tsdf", "sdf_target_tsdf"),
+                    ("sdf_axis_clearance_before", "sdf_axis_clearance_before"),
+                    ("sdf_axis_blocked_before", "sdf_axis_blocked_before"),
                 ):
                     sampled = _sample_sdf_value(row_key)
                     if sampled is not None:

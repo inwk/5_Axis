@@ -605,6 +605,8 @@ def _evaluate_octree_metrics(model: GraphSdfPlanningModel, batch: dict, device: 
         holder_diameter_norm=batch.get("holder_diameter_norm").to(device) if batch.get("holder_diameter_norm") is not None else None,
         holder_radius_norm=batch.get("holder_radius_norm").to(device) if batch.get("holder_radius_norm") is not None else None,
         holder_length_norm=batch.get("holder_length_norm").to(device) if batch.get("holder_length_norm") is not None else None,
+        sdf_axis_clearance_before=batch.get("sdf_axis_clearance_before").to(device) if batch.get("sdf_axis_clearance_before") is not None else None,
+        sdf_axis_blocked_before=batch.get("sdf_axis_blocked_before").to(device) if batch.get("sdf_axis_blocked_before") is not None else None,
         node_process_state=batch.get("node_process_state").to(device) if batch.get("node_process_state") is not None else None,
         node_centrality=batch.get("node_centrality").to(device) if batch.get("node_centrality") is not None else None,
         spatial_pos=batch.get("spatial_pos").to(device) if batch.get("spatial_pos") is not None else None,

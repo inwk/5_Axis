@@ -269,6 +269,8 @@ def _compute_octree_loss(
         holder_diameter_norm=inputs["holder_diameter_norm"],
         holder_radius_norm=inputs["holder_radius_norm"],
         holder_length_norm=inputs["holder_length_norm"],
+        sdf_axis_clearance_before=batch["sdf_axis_clearance_before"].to(device) if "sdf_axis_clearance_before" in batch else None,
+        sdf_axis_blocked_before=batch["sdf_axis_blocked_before"].to(device) if "sdf_axis_blocked_before" in batch else None,
         node_process_state=inputs["node_process_state"],
         node_centrality=inputs["node_centrality"],
         spatial_pos=inputs["spatial_pos"],

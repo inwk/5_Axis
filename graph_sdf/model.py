@@ -148,6 +148,8 @@ class GraphSdfPlanningModel(nn.Module):
         holder_diameter_norm: Optional[torch.Tensor],
         holder_radius_norm: Optional[torch.Tensor],
         holder_length_norm: Optional[torch.Tensor],
+        sdf_axis_clearance_before: Optional[torch.Tensor] = None,
+        sdf_axis_blocked_before: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Builds query-local cutter geometry features in normalized part units."""
         action_centers = self._gather_action_face_vectors(state_points[..., 0:3].mean(dim=2), action_face_id)
@@ -190,6 +192,14 @@ class GraphSdfPlanningModel(nn.Module):
         holder_length = holder_length[:, None, :].expand(-1, query_points.shape[1], -1)
         normal_axis_dot = (action_normals * axis).sum(dim=-1, keepdim=True)
         normal_axis_dot = normal_axis_dot[:, None, :].expand(-1, query_points.shape[1], -1)
+        if sdf_axis_clearance_before is None:
+            axis_clearance = query_points.new_zeros(query_points.shape[0], query_points.shape[1], 1)
+        else:
+            axis_clearance = sdf_axis_clearance_before.to(query_points.device).float().reshape(query_points.shape[0], query_points.shape[1], 1)
+        if sdf_axis_blocked_before is None:
+            axis_blocked = query_points.new_zeros(query_points.shape[0], query_points.shape[1], 1)
+        else:
+            axis_blocked = sdf_axis_blocked_before.to(query_points.device).float().reshape(query_points.shape[0], query_points.shape[1], 1)
         return torch.cat(
             [
                 along_axis,
@@ -201,9 +211,23 @@ class GraphSdfPlanningModel(nn.Module):
                 holder_radius,
                 holder_length,
                 normal_axis_dot,
+                axis_clearance,
+                axis_blocked,
             ],
             dim=-1,
         )
+
+    @staticmethod
+    def apply_rollout_tsdf_constraints(
+        pred_after: torch.Tensor,
+        before_tsdf: torch.Tensor,
+        target_tsdf: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Hard-clamps rollout TSDF so material cannot be added back."""
+        out = torch.maximum(pred_after, before_tsdf.to(pred_after.device).float())
+        if target_tsdf is not None:
+            out = torch.minimum(out, target_tsdf.to(pred_after.device).float())
+        return out
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -377,6 +401,11 @@ class GraphSdfPlanningModel(nn.Module):
         holder_diameter_norm: Optional[torch.Tensor] = None,
         holder_radius_norm: Optional[torch.Tensor] = None,
         holder_length_norm: Optional[torch.Tensor] = None,
+        sdf_axis_clearance_before: Optional[torch.Tensor] = None,
+        sdf_axis_blocked_before: Optional[torch.Tensor] = None,
+        rollout_before_tsdf: Optional[torch.Tensor] = None,
+        rollout_target_tsdf: Optional[torch.Tensor] = None,
+        apply_rollout_clamp: bool = False,
         node_process_state: Optional[torch.Tensor] = None,
         node_centrality: Optional[torch.Tensor] = None,
         spatial_pos: Optional[torch.Tensor] = None,
@@ -426,6 +455,8 @@ class GraphSdfPlanningModel(nn.Module):
             holder_diameter_norm=holder_diameter_norm,
             holder_radius_norm=holder_radius_norm,
             holder_length_norm=holder_length_norm,
+            sdf_axis_clearance_before=sdf_axis_clearance_before,
+            sdf_axis_blocked_before=sdf_axis_blocked_before,
         )
         tsdf = self.sdf_query_decoder(
             node_embeddings=state_embedding,
@@ -435,8 +466,16 @@ class GraphSdfPlanningModel(nn.Module):
             query_action_features=query_action_features,
             node_mask=node_mask,
         )
+        raw_tsdf = tsdf
+        if apply_rollout_clamp and rollout_before_tsdf is not None:
+            tsdf = self.apply_rollout_tsdf_constraints(
+                pred_after=tsdf,
+                before_tsdf=rollout_before_tsdf,
+                target_tsdf=rollout_target_tsdf,
+            )
         return {
             "sdf_tsdf": tsdf,
+            "sdf_tsdf_raw": raw_tsdf,
             "action_context": action_out["action_context"],
             "state_embedding": state_embedding,
         }

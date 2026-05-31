@@ -27,7 +27,7 @@ from collect_axis_dataset_synthetic_v2 import (
 # ---------------------------------------------------------------------------
 # User config: edit these directly in VS Code.
 # ---------------------------------------------------------------------------
-DIMS = (160, 160, 160)
+DIMS = (256, 256, 256)
 SPACING = (2.5, 2.5, 2.5)
 SEED = 0
 REPEATS = 5

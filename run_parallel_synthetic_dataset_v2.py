@@ -32,7 +32,7 @@ SYNTHETIC_DATASET_DIR = os.path.join(SHARED_BASE_DIR, "sdf_dataset_synthetic_v2"
 # "auto" uses CUDA for C-space/Minkowski boolean masks when available, otherwise CPU.
 SYNTHETIC_CSPACE_DEVICE = "auto"  # "auto", "cuda", or "cpu"
 SYNTHETIC_CSPACE_GPU_MAX_PAIRS = 4_000_000
-SYNTHETIC_GRID_RESOLUTION = 160
+SYNTHETIC_GRID_RESOLUTION = 256
 
 
 def _safe_name_component(text: str) -> str:
