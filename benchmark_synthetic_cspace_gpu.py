@@ -17,6 +17,7 @@ import numpy as np
 from collect_axis_dataset_synthetic_v2 import (
     _dilate_config_mask_cpu,
     _dilate_config_mask_gpu,
+    _holder_forbidden_mask,
     _make_kernel_offsets,
     _shift_or_mask_cpu,
     _shift_or_mask_gpu,
@@ -45,6 +46,8 @@ HOLDER_LENGTH_MM = 60.0
 
 # Lower this if CUDA memory is tight; raise it if GPU utilization is low.
 GPU_MAX_PAIRS = 4_000_000
+HOLDER_CSPACE_RESOLUTION = 64
+RUN_FULLRES_HOLDER = False
 
 
 def _time_call(fn: Callable[[], np.ndarray], repeats: int, warmup: int) -> tuple[float, np.ndarray]:
@@ -65,12 +68,13 @@ def _print_case(
     name: str,
     cpu_fn: Callable[[], np.ndarray],
     gpu_fn: Callable[[], np.ndarray] | None,
+    gpu_skip_reason: str = "CUDA is not available",
 ) -> None:
     cpu_time, cpu_out = _time_call(cpu_fn, REPEATS, WARMUP)
     print(f"[{name}] CPU avg={cpu_time:.6f}s true_ratio={float(cpu_out.mean()):.6f}")
 
     if gpu_fn is None:
-        print(f"[{name}] GPU skipped: CUDA is not available")
+        print(f"[{name}] GPU skipped: {gpu_skip_reason}")
         return
 
     gpu_time, gpu_out = _time_call(gpu_fn, REPEATS, WARMUP)
@@ -85,8 +89,33 @@ def _print_case(
         print(f"[{name}] mismatch_voxels={int(diff.sum())}")
 
 
+def _holder_forbidden_coarse(obstacle: np.ndarray, device: str) -> np.ndarray:
+    old_device = os.environ.get("SYNTHETIC_CSPACE_DEVICE")
+    os.environ["SYNTHETIC_CSPACE_DEVICE"] = device
+    try:
+        bbox_min = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+        bbox_max = (np.asarray(DIMS, dtype=np.float32) - 1.0) * np.asarray(SPACING, dtype=np.float32)
+        return _holder_forbidden_mask(
+            obstacle=obstacle,
+            axis_dir=np.asarray(AXIS_DIR, dtype=np.float32),
+            tool_kind=TOOL_KIND,
+            tool_radius=float(TOOL_RADIUS_MM),
+            tool_length=float(TOOL_LENGTH_MM),
+            holder_radius=float(HOLDER_RADIUS_MM),
+            holder_length=float(HOLDER_LENGTH_MM),
+            bbox_min=bbox_min,
+            bbox_max=bbox_max,
+        )
+    finally:
+        if old_device is None:
+            os.environ.pop("SYNTHETIC_CSPACE_DEVICE", None)
+        else:
+            os.environ["SYNTHETIC_CSPACE_DEVICE"] = old_device
+
+
 def main() -> None:
     os.environ["SYNTHETIC_CSPACE_GPU_MAX_PAIRS"] = str(int(GPU_MAX_PAIRS))
+    os.environ["SYNTHETIC_HOLDER_CSPACE_RESOLUTION"] = str(int(HOLDER_CSPACE_RESOLUTION))
 
     rng = np.random.default_rng(SEED)
     obstacle = rng.random(DIMS) < float(OBSTACLE_FRACTION)
@@ -107,13 +136,23 @@ def main() -> None:
         "[Kernel] "
         f"cutter_offsets={int(kernels['cutter'].shape[0])} "
         f"holder_offsets={int(kernels['holder'].shape[0])} "
-        f"gpu_max_pairs={int(GPU_MAX_PAIRS)}"
+        f"gpu_max_pairs={int(GPU_MAX_PAIRS)} "
+        f"holder_cspace_resolution={int(HOLDER_CSPACE_RESOLUTION)}"
     )
 
+    if RUN_FULLRES_HOLDER:
+        _print_case(
+            "holder_forbidden_fullres_shift",
+            lambda: _shift_or_mask_cpu(obstacle, kernels["holder"]),
+            (lambda: _shift_or_mask_gpu(obstacle, kernels["holder"])) if cuda else None,
+        )
+    else:
+        print("[holder_forbidden_fullres_shift] skipped: set RUN_FULLRES_HOLDER=True to benchmark exact full-res holder C-space")
     _print_case(
-        "holder_forbidden_shift",
-        lambda: _shift_or_mask_cpu(obstacle, kernels["holder"]),
-        (lambda: _shift_or_mask_gpu(obstacle, kernels["holder"])) if cuda else None,
+        "holder_forbidden_coarse64",
+        lambda: _holder_forbidden_coarse(obstacle, "cpu"),
+        None,
+        gpu_skip_reason="policy=CPU fixed; cutter full-res remains GPU-auto",
     )
     _print_case(
         "cutter_swept_dilation",

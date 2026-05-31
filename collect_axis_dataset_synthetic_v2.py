@@ -678,6 +678,108 @@ def _dilate_config_mask(config_mask: np.ndarray, offsets: np.ndarray) -> np.ndar
     return _dilate_config_mask_cpu(config_mask, offsets)
 
 
+def _scaled_dims(dims: tuple[int, int, int], max_resolution: int) -> tuple[int, int, int]:
+    max_dim = max(int(v) for v in dims)
+    target = max(1, int(max_resolution))
+    if max_dim <= target:
+        return tuple(int(v) for v in dims)
+    scale = float(target) / float(max_dim)
+    return tuple(max(4, int(round(float(v) * scale))) for v in dims)
+
+
+def _resample_mask_nearest(mask: np.ndarray, out_dims: tuple[int, int, int]) -> np.ndarray:
+    in_dims = tuple(int(v) for v in mask.shape)
+    out_dims = tuple(int(v) for v in out_dims)
+    if in_dims == out_dims:
+        return mask.astype(bool, copy=True)
+    axes = [
+        np.rint(np.linspace(0, in_dims[axis] - 1, out_dims[axis])).astype(np.int64)
+        for axis in range(3)
+    ]
+    return mask[np.ix_(axes[0], axes[1], axes[2])].astype(bool, copy=False)
+
+
+def _downsample_mask_any(mask: np.ndarray, out_dims: tuple[int, int, int]) -> np.ndarray:
+    in_dims = tuple(int(v) for v in mask.shape)
+    out_dims = tuple(int(v) for v in out_dims)
+    if in_dims == out_dims:
+        return mask.astype(bool, copy=True)
+    if all(in_dims[axis] % out_dims[axis] == 0 for axis in range(3)):
+        factors = tuple(in_dims[axis] // out_dims[axis] for axis in range(3))
+        return mask.reshape(
+            out_dims[0], factors[0],
+            out_dims[1], factors[1],
+            out_dims[2], factors[2],
+        ).any(axis=(1, 3, 5))
+
+    x_edges = np.linspace(0, in_dims[0], out_dims[0] + 1).astype(np.int32)
+    y_edges = np.linspace(0, in_dims[1], out_dims[1] + 1).astype(np.int32)
+    z_edges = np.linspace(0, in_dims[2], out_dims[2] + 1).astype(np.int32)
+    out = np.zeros(out_dims, dtype=bool)
+    for ix in range(out_dims[0]):
+        xs = slice(int(x_edges[ix]), max(int(x_edges[ix + 1]), int(x_edges[ix]) + 1))
+        for iy in range(out_dims[1]):
+            ys = slice(int(y_edges[iy]), max(int(y_edges[iy + 1]), int(y_edges[iy]) + 1))
+            for iz in range(out_dims[2]):
+                zs = slice(int(z_edges[iz]), max(int(z_edges[iz + 1]), int(z_edges[iz]) + 1))
+                out[ix, iy, iz] = bool(mask[xs, ys, zs].any())
+    return out
+
+
+def _spacing_for_dims(
+    bbox_min: np.ndarray,
+    bbox_max: np.ndarray,
+    dims: tuple[int, int, int],
+) -> tuple[float, float, float]:
+    extent = np.maximum(np.asarray(bbox_max, dtype=np.float32) - np.asarray(bbox_min, dtype=np.float32), 1e-6)
+    return (
+        float(extent[0] / max(int(dims[0]) - 1, 1)),
+        float(extent[1] / max(int(dims[1]) - 1, 1)),
+        float(extent[2] / max(int(dims[2]) - 1, 1)),
+    )
+
+
+def _holder_forbidden_mask(
+    obstacle: np.ndarray,
+    axis_dir: np.ndarray,
+    tool_kind: str,
+    tool_radius: float,
+    tool_length: float,
+    holder_radius: float,
+    holder_length: float,
+    bbox_min: np.ndarray,
+    bbox_max: np.ndarray,
+) -> np.ndarray:
+    coarse_resolution = _env_int("SYNTHETIC_HOLDER_CSPACE_RESOLUTION", 64)
+    full_dims = tuple(int(v) for v in obstacle.shape)
+    coarse_dims = _scaled_dims(full_dims, coarse_resolution)
+    if coarse_dims == full_dims:
+        kernels = _make_kernel_offsets(
+            axis_dir=axis_dir,
+            spacing=_spacing_for_dims(bbox_min, bbox_max, full_dims),
+            tool_kind=tool_kind,
+            tool_radius=tool_radius,
+            tool_length=tool_length,
+            holder_radius=holder_radius,
+            holder_length=holder_length,
+        )
+        return _shift_or_mask(obstacle, kernels["holder"])
+
+    coarse_obstacle = _downsample_mask_any(obstacle, coarse_dims)
+    coarse_spacing = _spacing_for_dims(bbox_min, bbox_max, coarse_dims)
+    coarse_kernels = _make_kernel_offsets(
+        axis_dir=axis_dir,
+        spacing=coarse_spacing,
+        tool_kind=tool_kind,
+        tool_radius=tool_radius,
+        tool_length=tool_length,
+        holder_radius=holder_radius,
+        holder_length=holder_length,
+    )
+    coarse_forbidden = _shift_or_mask_cpu(coarse_obstacle, coarse_kernels["holder"])
+    return _resample_mask_nearest(coarse_forbidden, full_dims)
+
+
 def _axis_clearance_features(
     solid: np.ndarray,
     flat_indices: np.ndarray,
@@ -1100,7 +1202,17 @@ def _generate_rows(
             holder_length=float(config["holder_length"]),
         )
         holder_obstacle = current_solid if macro_name == "indexed_rough" else target_solid
-        holder_forbidden = _shift_or_mask(holder_obstacle, kernels["holder"])
+        holder_forbidden = _holder_forbidden_mask(
+            obstacle=holder_obstacle,
+            axis_dir=axis_dir,
+            tool_kind=str(config["tool_kind"]),
+            tool_radius=float(config["tool_radius"]),
+            tool_length=float(config["tool_length"]),
+            holder_radius=float(config["holder_radius"]),
+            holder_length=float(config["holder_length"]),
+            bbox_min=bbox_min,
+            bbox_max=bbox_max,
+        )
         ideal_removal = current_solid & ~target_solid
         roi = _action_roi_mask(
             macro_name,

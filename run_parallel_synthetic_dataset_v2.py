@@ -33,6 +33,7 @@ SYNTHETIC_DATASET_DIR = os.path.join(SHARED_BASE_DIR, "sdf_dataset_synthetic_v2"
 SYNTHETIC_CSPACE_DEVICE = "auto"  # "auto", "cuda", or "cpu"
 SYNTHETIC_CSPACE_GPU_MAX_PAIRS = 4_000_000
 SYNTHETIC_GRID_RESOLUTION = 256
+SYNTHETIC_HOLDER_CSPACE_RESOLUTION = 64
 
 
 def _safe_name_component(text: str) -> str:
@@ -132,6 +133,7 @@ def process_static_dir_safe(task: tuple[str, str, str, bool]) -> None:
     env["SYNTHETIC_CSPACE_DEVICE"] = str(SYNTHETIC_CSPACE_DEVICE)
     env["SYNTHETIC_CSPACE_GPU_MAX_PAIRS"] = str(int(SYNTHETIC_CSPACE_GPU_MAX_PAIRS))
     env["SYNTHETIC_GRID_RESOLUTION"] = str(int(SYNTHETIC_GRID_RESOLUTION))
+    env["SYNTHETIC_HOLDER_CSPACE_RESOLUTION"] = str(int(SYNTHETIC_HOLDER_CSPACE_RESOLUTION))
 
     try:
         print(f"[Start] synthetic {part_name} (PID: {os.getpid()} pc={pc_slug or '-'})")
