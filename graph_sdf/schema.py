@@ -19,8 +19,6 @@ TOOL_LIBRARY = (
     ("ball", 8.0),
     ("ball", 6.0),
     ("ball", 4.0),
-    ("flat", 18.0),
-    ("flat", 14.0),
 )
 
 

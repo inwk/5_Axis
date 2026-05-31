@@ -28,6 +28,12 @@ SHARED_BASE_DIR = r"Y:\04_개별폴더\22. 통합과정 오인욱"
 STATIC_EMBEDDING_DIR = os.path.join(SHARED_BASE_DIR, "sdf_static_embeddings")
 SYNTHETIC_DATASET_DIR = os.path.join(SHARED_BASE_DIR, "sdf_dataset_synthetic_v2")
 
+# Synthetic generation controls.
+# "auto" uses CUDA for C-space/Minkowski boolean masks when available, otherwise CPU.
+SYNTHETIC_CSPACE_DEVICE = "auto"  # "auto", "cuda", or "cpu"
+SYNTHETIC_CSPACE_GPU_MAX_PAIRS = 4_000_000
+SYNTHETIC_GRID_RESOLUTION = 160
+
 
 def _safe_name_component(text: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(text)).strip("._-")
@@ -123,6 +129,9 @@ def process_static_dir_safe(task: tuple[str, str, str, bool]) -> None:
     env = os.environ.copy()
     if pc_slug:
         env["PC_NAME"] = pc_slug
+    env["SYNTHETIC_CSPACE_DEVICE"] = str(SYNTHETIC_CSPACE_DEVICE)
+    env["SYNTHETIC_CSPACE_GPU_MAX_PAIRS"] = str(int(SYNTHETIC_CSPACE_GPU_MAX_PAIRS))
+    env["SYNTHETIC_GRID_RESOLUTION"] = str(int(SYNTHETIC_GRID_RESOLUTION))
 
     try:
         print(f"[Start] synthetic {part_name} (PID: {os.getpid()} pc={pc_slug or '-'})")

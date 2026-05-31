@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import glob
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -35,9 +36,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
-
-from graph_sdf.schema import MACRO_CLASS_TO_ID, TOOL_CHOICE_TO_ID, tool_choice_key
 
 
 STATIC_FILES = (
@@ -56,6 +54,20 @@ STATIC_FILES = (
 
 DEFAULT_OUTPUT_BASENAME = "process_skeleton_dataset.parquet"
 GRID_DEPTH_VALUE = 6
+_GPU_CSPACE_FALLBACK_WARNED = False
+
+
+def _load_schema_symbols() -> tuple[dict[str, int], dict[str, int], Any]:
+    schema_path = Path(__file__).resolve().parent / "graph_sdf" / "schema.py"
+    spec = importlib.util.spec_from_file_location("_graph_sdf_schema_for_synthetic_v2", schema_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load schema module: {schema_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.MACRO_CLASS_TO_ID, module.TOOL_CHOICE_TO_ID, module.tool_choice_key
+
+
+MACRO_CLASS_TO_ID, TOOL_CHOICE_TO_ID, tool_choice_key = _load_schema_symbols()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -543,7 +555,7 @@ def _make_kernel_offsets(
     }
 
 
-def _shift_or_mask(solid: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+def _shift_or_mask_cpu(solid: np.ndarray, offsets: np.ndarray) -> np.ndarray:
     out = np.zeros_like(solid, dtype=bool)
     nx, ny, nz = solid.shape
     for ox, oy, oz in offsets.astype(np.int32):
@@ -559,7 +571,7 @@ def _shift_or_mask(solid: np.ndarray, offsets: np.ndarray) -> np.ndarray:
     return out
 
 
-def _dilate_config_mask(config_mask: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+def _dilate_config_mask_cpu(config_mask: np.ndarray, offsets: np.ndarray) -> np.ndarray:
     out = np.zeros_like(config_mask, dtype=bool)
     nx, ny, nz = config_mask.shape
     for ox, oy, oz in offsets.astype(np.int32):
@@ -573,6 +585,97 @@ def _dilate_config_mask(config_mask: np.ndarray, offsets: np.ndarray) -> np.ndar
         dst_z0, dst_z1 = src_z0 + int(oz), src_z1 + int(oz)
         out[dst_x0:dst_x1, dst_y0:dst_y1, dst_z0:dst_z1] |= config_mask[src_x0:src_x1, src_y0:src_y1, src_z0:src_z1]
     return out
+
+
+def _torch_cuda_available() -> bool:
+    try:
+        import torch
+    except Exception:
+        return False
+    return bool(torch.cuda.is_available())
+
+
+def _use_gpu_cspace() -> bool:
+    mode = os.getenv("SYNTHETIC_CSPACE_DEVICE", "auto").strip().lower()
+    if mode in {"0", "false", "no", "cpu"}:
+        return False
+    if mode not in {"auto", "cuda", "gpu"}:
+        raise ValueError("SYNTHETIC_CSPACE_DEVICE must be 'auto', 'cpu', or 'cuda'.")
+    return _torch_cuda_available()
+
+
+def _scatter_offsets_gpu(mask: np.ndarray, offsets: np.ndarray, *, add_offsets: bool) -> np.ndarray:
+    """GPU sparse OR over offsets.
+
+    add_offsets=True computes out[p + offset] |= mask[p].
+    add_offsets=False computes out[p - offset] |= mask[p].
+    """
+    import torch
+
+    active = np.argwhere(mask)
+    if active.size == 0 or offsets.size == 0:
+        return np.zeros_like(mask, dtype=bool)
+
+    device = torch.device("cuda")
+    active_t = torch.as_tensor(active.astype(np.int32, copy=False), device=device)
+    offsets_t = torch.as_tensor(offsets.astype(np.int32, copy=False), device=device)
+    nx, ny, nz = (int(v) for v in mask.shape)
+    out = torch.zeros(nx * ny * nz, dtype=torch.bool, device=device)
+
+    max_pairs = max(1, _env_int("SYNTHETIC_CSPACE_GPU_MAX_PAIRS", 4_000_000))
+    chunk = max(1, max_pairs // max(int(active_t.shape[0]), 1))
+    for start in range(0, int(offsets_t.shape[0]), chunk):
+        off = offsets_t[start:start + chunk]
+        points = active_t[:, None, :] + off[None, :, :] if add_offsets else active_t[:, None, :] - off[None, :, :]
+        valid = (
+            (points[..., 0] >= 0)
+            & (points[..., 0] < nx)
+            & (points[..., 1] >= 0)
+            & (points[..., 1] < ny)
+            & (points[..., 2] >= 0)
+            & (points[..., 2] < nz)
+        )
+        if bool(valid.any().item()):
+            valid_points = points[valid].to(torch.int64)
+            linear = valid_points[:, 0] * (ny * nz) + valid_points[:, 1] * nz + valid_points[:, 2]
+            out[linear] = True
+
+    torch.cuda.synchronize()
+    return out.reshape(mask.shape).cpu().numpy().astype(bool, copy=False)
+
+
+def _warn_gpu_cspace_fallback(exc: Exception) -> None:
+    global _GPU_CSPACE_FALLBACK_WARNED
+    if _GPU_CSPACE_FALLBACK_WARNED:
+        return
+    _GPU_CSPACE_FALLBACK_WARNED = True
+    print(f"[Synthetic C-space] GPU path failed; falling back to CPU. reason={exc}", flush=True)
+
+
+def _shift_or_mask_gpu(solid: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+    return _scatter_offsets_gpu(solid, offsets, add_offsets=False)
+
+
+def _dilate_config_mask_gpu(config_mask: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+    return _scatter_offsets_gpu(config_mask, offsets, add_offsets=True)
+
+
+def _shift_or_mask(solid: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+    if _use_gpu_cspace():
+        try:
+            return _shift_or_mask_gpu(solid, offsets)
+        except Exception as exc:
+            _warn_gpu_cspace_fallback(exc)
+    return _shift_or_mask_cpu(solid, offsets)
+
+
+def _dilate_config_mask(config_mask: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+    if _use_gpu_cspace():
+        try:
+            return _dilate_config_mask_gpu(config_mask, offsets)
+        except Exception as exc:
+            _warn_gpu_cspace_fallback(exc)
+    return _dilate_config_mask_cpu(config_mask, offsets)
 
 
 def _action_roi_mask(
@@ -642,7 +745,7 @@ def _axis_for_macro(macro_name: str, face_id: int, normals: np.ndarray, rng: ran
         return normal
     if macro_name == "flank_finish":
         return _perp_axis(normal)
-    axis_library = [
+    base_axes = [
         np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
         np.asarray([-1.0, 0.0, 0.0], dtype=np.float32),
         np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
@@ -650,11 +753,15 @@ def _axis_for_macro(macro_name: str, face_id: int, normals: np.ndarray, rng: ran
         np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
         np.asarray([0.0, 0.0, -1.0], dtype=np.float32),
     ]
+    if macro_name == "indexed_rough":
+        axis_library = base_axes + [normal, -normal]
+    else:
+        axis_library = base_axes
     return axis_library[rng.randrange(len(axis_library))]
 
 
 def _tool_configs() -> list[dict[str, float | str]]:
-    flat_diameters = _parse_float_list("SYNTHETIC_FLAT_TOOL_DIAMETERS", "4,6,8,10,12,14,16,18,20")
+    flat_diameters = _parse_float_list("SYNTHETIC_FLAT_TOOL_DIAMETERS", "4,6,8,10,12,16,20")
     ball_diameters = _parse_float_list("SYNTHETIC_BALL_TOOL_DIAMETERS", "4,6,8")
     length_mults = _parse_int_list("SYNTHETIC_TOOL_LENGTH_MULTIPLIERS", "3,4,5")
     holder_dia_mults = _parse_int_list("SYNTHETIC_HOLDER_DIAMETER_MULTIPLIERS", "5,6,7,8,9,10")
@@ -702,6 +809,8 @@ def _serialize(value: Any) -> Any:
 
 
 def _write_rows_to_parquet(rows: list[dict[str, Any]], path: Path) -> None:
+    import pandas as pd
+
     path.parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame([{key: _serialize(value) for key, value in row.items()} for row in rows])
     df.to_parquet(path, index=False)
@@ -732,7 +841,7 @@ def _generate_rows(
     configs = _tool_configs()
     rng.shuffle(configs)
 
-    grid_resolution = _env_int("SYNTHETIC_GRID_RESOLUTION", 72)
+    grid_resolution = _env_int("SYNTHETIC_GRID_RESOLUTION", 160)
     grid_padding_ratio = float(os.getenv("SYNTHETIC_GRID_PADDING_RATIO", "0.10"))
     grid_padding_mm = float(os.getenv("SYNTHETIC_GRID_PADDING_MM", "5.0"))
     steps_per_rollout = max(1, _env_int("SYNTHETIC_STEPS_PER_ROLLOUT", 4))
@@ -755,7 +864,7 @@ def _generate_rows(
         "octree_query_count": int(octree_query_count),
         "tsdf_truncation": float(tsdf_truncation),
         "tool_diameters": {
-            "flat": _parse_float_list("SYNTHETIC_FLAT_TOOL_DIAMETERS", "4,6,8,10,12,14,16,18,20"),
+            "flat": _parse_float_list("SYNTHETIC_FLAT_TOOL_DIAMETERS", "4,6,8,10,12,16,20"),
             "ball": _parse_float_list("SYNTHETIC_BALL_TOOL_DIAMETERS", "4,6,8"),
         },
         "tool_length_rule": "tool_length = diameter * integer_multiplier",
@@ -1039,7 +1148,7 @@ def collect_synthetic_episode(prt_path: str, out_root: str, seed: int, pc_name: 
             "and a complete static feature directory."
         )
 
-    max_rows = max(1, _env_int("SYNTHETIC_SCENARIOS_PER_PART", 256))
+    max_rows = max(1, _env_int("SYNTHETIC_SCENARIOS_PER_PART", 512))
     rows = _generate_rows(
         prt_path=prt_path,
         out_dir=out_dir,

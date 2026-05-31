@@ -642,8 +642,24 @@ class ProcessSkeletonParquetDataset(Dataset):
             if not self._is_missing(tool_diameter_value)
             else 0.0
         )
+        tool_length_value = row["tool_length"] if "tool_length" in row.index else 0.0
+        holder_diameter_value = row["holder_diameter"] if "holder_diameter" in row.index else 0.0
+        holder_radius_value = row["holder_radius"] if "holder_radius" in row.index else None
+        holder_length_value = row["holder_length"] if "holder_length" in row.index else 0.0
+        tool_length_float = 0.0 if self._is_missing(tool_length_value) else float(tool_length_value)
+        holder_diameter_float = 0.0 if self._is_missing(holder_diameter_value) else float(holder_diameter_value)
+        holder_radius_float = (
+            0.5 * holder_diameter_float
+            if self._is_missing(holder_radius_value)
+            else float(holder_radius_value)
+        )
+        holder_length_float = 0.0 if self._is_missing(holder_length_value) else float(holder_length_value)
         batch["tool_diameter_norm"] = torch.tensor(tool_diameter_float / scale, dtype=torch.float32)
         batch["tool_radius_norm"] = torch.tensor((0.5 * tool_diameter_float) / scale, dtype=torch.float32)
+        batch["tool_length_norm"] = torch.tensor(tool_length_float / scale, dtype=torch.float32)
+        batch["holder_diameter_norm"] = torch.tensor(holder_diameter_float / scale, dtype=torch.float32)
+        batch["holder_radius_norm"] = torch.tensor(holder_radius_float / scale, dtype=torch.float32)
+        batch["holder_length_norm"] = torch.tensor(holder_length_float / scale, dtype=torch.float32)
         if "axis_dir" in row.index and not self._is_missing(row["axis_dir"]):
             axis_dir = self._array(row["axis_dir"], np.float32).reshape(3)
             axis_norm = float(np.linalg.norm(axis_dir))

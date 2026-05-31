@@ -21,7 +21,7 @@ class ActionEmbedding(nn.Module):
         self.macro_embedding = nn.Embedding(config.macro_class_count, action_dim)
         self.tool_embedding = nn.Embedding(config.tool_choice_count, action_dim)
         self.tool_geometry_projection = nn.Sequential(
-            nn.Linear(4, action_dim),
+            nn.Linear(8, action_dim),
             nn.GELU(),
             nn.Linear(action_dim, action_dim),
         )
@@ -66,6 +66,10 @@ class ActionEmbedding(nn.Module):
         axis_visible: Optional[torch.Tensor] = None,
         axis_dir: Optional[torch.Tensor] = None,
         tool_radius_norm: Optional[torch.Tensor] = None,
+        tool_length_norm: Optional[torch.Tensor] = None,
+        holder_diameter_norm: Optional[torch.Tensor] = None,
+        holder_radius_norm: Optional[torch.Tensor] = None,
+        holder_length_norm: Optional[torch.Tensor] = None,
         node_process_state: Optional[torch.Tensor] = None,
         node_mask: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
@@ -106,8 +110,34 @@ class ActionEmbedding(nn.Module):
             tool_radius_feature = node_embeddings.new_zeros(node_embeddings.shape[0], 1)
         else:
             tool_radius_feature = tool_radius_norm.to(node_embeddings.device).float().reshape(node_embeddings.shape[0], -1)[:, :1]
+        if tool_length_norm is None:
+            tool_length_feature = node_embeddings.new_zeros(node_embeddings.shape[0], 1)
+        else:
+            tool_length_feature = tool_length_norm.to(node_embeddings.device).float().reshape(node_embeddings.shape[0], -1)[:, :1]
+        if holder_diameter_norm is None:
+            holder_diameter_feature = node_embeddings.new_zeros(node_embeddings.shape[0], 1)
+        else:
+            holder_diameter_feature = holder_diameter_norm.to(node_embeddings.device).float().reshape(node_embeddings.shape[0], -1)[:, :1]
+        if holder_radius_norm is None:
+            holder_radius_feature = node_embeddings.new_zeros(node_embeddings.shape[0], 1)
+        else:
+            holder_radius_feature = holder_radius_norm.to(node_embeddings.device).float().reshape(node_embeddings.shape[0], -1)[:, :1]
+        if holder_length_norm is None:
+            holder_length_feature = node_embeddings.new_zeros(node_embeddings.shape[0], 1)
+        else:
+            holder_length_feature = holder_length_norm.to(node_embeddings.device).float().reshape(node_embeddings.shape[0], -1)[:, :1]
         tool_geometry_feature = self.tool_geometry_projection(
-            torch.cat([tool_radius_feature, axis_feature], dim=-1)
+            torch.cat(
+                [
+                    tool_radius_feature,
+                    tool_length_feature,
+                    holder_diameter_feature,
+                    holder_radius_feature,
+                    holder_length_feature,
+                    axis_feature,
+                ],
+                dim=-1,
+            )
         )
 
         valid_nodes = torch.ones_like(current_node_sdf, dtype=torch.bool)

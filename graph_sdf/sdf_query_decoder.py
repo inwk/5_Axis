@@ -32,7 +32,7 @@ class SdfQueryDecoder(nn.Module):
             nn.LayerNorm(hidden),
         )
         self.query_action_proj = nn.Sequential(
-            nn.Linear(5, hidden),
+            nn.Linear(9, hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden),
@@ -73,8 +73,8 @@ class SdfQueryDecoder(nn.Module):
             features = features + self.query_state_proj(q.to(features.device))
         if query_action_features is not None:
             q_action = query_action_features.float()
-            if q_action.shape[-1] != 5:
-                raise ValueError(f"query_action_features must have last dim 5, got {tuple(q_action.shape)}")
+            if q_action.shape[-1] != 9:
+                raise ValueError(f"query_action_features must have last dim 9, got {tuple(q_action.shape)}")
             features = features + self.query_action_proj(q_action.to(features.device))
 
         for block in self.decoder_blocks:

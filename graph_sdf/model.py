@@ -106,6 +106,10 @@ class GraphSdfPlanningModel(nn.Module):
         axis_visible: Optional[torch.Tensor],
         axis_dir: Optional[torch.Tensor],
         tool_radius_norm: Optional[torch.Tensor],
+        tool_length_norm: Optional[torch.Tensor],
+        holder_diameter_norm: Optional[torch.Tensor],
+        holder_radius_norm: Optional[torch.Tensor],
+        holder_length_norm: Optional[torch.Tensor],
         node_process_state: Optional[torch.Tensor],
         node_mask: Optional[torch.Tensor],
     ) -> dict[str, torch.Tensor]:
@@ -119,6 +123,10 @@ class GraphSdfPlanningModel(nn.Module):
             axis_visible=axis_visible,
             axis_dir=axis_dir,
             tool_radius_norm=tool_radius_norm,
+            tool_length_norm=tool_length_norm,
+            holder_diameter_norm=holder_diameter_norm,
+            holder_radius_norm=holder_radius_norm,
+            holder_length_norm=holder_length_norm,
             node_process_state=node_process_state,
             node_mask=node_mask,
         )
@@ -136,6 +144,10 @@ class GraphSdfPlanningModel(nn.Module):
         query_points: torch.Tensor,
         axis_dir: Optional[torch.Tensor],
         tool_radius_norm: Optional[torch.Tensor],
+        tool_length_norm: Optional[torch.Tensor],
+        holder_diameter_norm: Optional[torch.Tensor],
+        holder_radius_norm: Optional[torch.Tensor],
+        holder_length_norm: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Builds query-local cutter geometry features in normalized part units."""
         action_centers = self._gather_action_face_vectors(state_points[..., 0:3].mean(dim=2), action_face_id)
@@ -155,10 +167,43 @@ class GraphSdfPlanningModel(nn.Module):
             radius = query_points.new_zeros(query_points.shape[0], 1)
         else:
             radius = tool_radius_norm.to(query_points.device).float().reshape(query_points.shape[0], -1)[:, :1]
+        if tool_length_norm is None:
+            tool_length = query_points.new_zeros(query_points.shape[0], 1)
+        else:
+            tool_length = tool_length_norm.to(query_points.device).float().reshape(query_points.shape[0], -1)[:, :1]
+        if holder_diameter_norm is None:
+            holder_diameter = query_points.new_zeros(query_points.shape[0], 1)
+        else:
+            holder_diameter = holder_diameter_norm.to(query_points.device).float().reshape(query_points.shape[0], -1)[:, :1]
+        if holder_radius_norm is None:
+            holder_radius = query_points.new_zeros(query_points.shape[0], 1)
+        else:
+            holder_radius = holder_radius_norm.to(query_points.device).float().reshape(query_points.shape[0], -1)[:, :1]
+        if holder_length_norm is None:
+            holder_length = query_points.new_zeros(query_points.shape[0], 1)
+        else:
+            holder_length = holder_length_norm.to(query_points.device).float().reshape(query_points.shape[0], -1)[:, :1]
         radius = radius[:, None, :].expand(-1, query_points.shape[1], -1)
+        tool_length = tool_length[:, None, :].expand(-1, query_points.shape[1], -1)
+        holder_diameter = holder_diameter[:, None, :].expand(-1, query_points.shape[1], -1)
+        holder_radius = holder_radius[:, None, :].expand(-1, query_points.shape[1], -1)
+        holder_length = holder_length[:, None, :].expand(-1, query_points.shape[1], -1)
         normal_axis_dot = (action_normals * axis).sum(dim=-1, keepdim=True)
         normal_axis_dot = normal_axis_dot[:, None, :].expand(-1, query_points.shape[1], -1)
-        return torch.cat([along_axis, radial_to_axis, radial_to_axis - radius, radius, normal_axis_dot], dim=-1)
+        return torch.cat(
+            [
+                along_axis,
+                radial_to_axis,
+                radial_to_axis - radius,
+                radius,
+                tool_length,
+                holder_diameter,
+                holder_radius,
+                holder_length,
+                normal_axis_dot,
+            ],
+            dim=-1,
+        )
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -249,6 +294,10 @@ class GraphSdfPlanningModel(nn.Module):
         axis_visible:         Optional[torch.Tensor] = None,
         axis_dir:             Optional[torch.Tensor] = None,
         tool_radius_norm:     Optional[torch.Tensor] = None,
+        tool_length_norm:     Optional[torch.Tensor] = None,
+        holder_diameter_norm: Optional[torch.Tensor] = None,
+        holder_radius_norm:   Optional[torch.Tensor] = None,
+        holder_length_norm:   Optional[torch.Tensor] = None,
         node_process_state:   Optional[torch.Tensor] = None,
         node_centrality:      Optional[torch.Tensor] = None,
         spatial_pos:          Optional[torch.Tensor] = None,
@@ -289,6 +338,10 @@ class GraphSdfPlanningModel(nn.Module):
             axis_visible=axis_visible,
             axis_dir=axis_dir,
             tool_radius_norm=tool_radius_norm,
+            tool_length_norm=tool_length_norm,
+            holder_diameter_norm=holder_diameter_norm,
+            holder_radius_norm=holder_radius_norm,
+            holder_length_norm=holder_length_norm,
             node_process_state=node_process_state,
             node_mask=node_mask,
         )
@@ -320,6 +373,10 @@ class GraphSdfPlanningModel(nn.Module):
         axis_visible: Optional[torch.Tensor] = None,
         axis_dir: Optional[torch.Tensor] = None,
         tool_radius_norm: Optional[torch.Tensor] = None,
+        tool_length_norm: Optional[torch.Tensor] = None,
+        holder_diameter_norm: Optional[torch.Tensor] = None,
+        holder_radius_norm: Optional[torch.Tensor] = None,
+        holder_length_norm: Optional[torch.Tensor] = None,
         node_process_state: Optional[torch.Tensor] = None,
         node_centrality: Optional[torch.Tensor] = None,
         spatial_pos: Optional[torch.Tensor] = None,
@@ -352,6 +409,10 @@ class GraphSdfPlanningModel(nn.Module):
             axis_visible=axis_visible,
             axis_dir=axis_dir,
             tool_radius_norm=tool_radius_norm,
+            tool_length_norm=tool_length_norm,
+            holder_diameter_norm=holder_diameter_norm,
+            holder_radius_norm=holder_radius_norm,
+            holder_length_norm=holder_length_norm,
             node_process_state=node_process_state,
             node_mask=node_mask,
         )
@@ -361,6 +422,10 @@ class GraphSdfPlanningModel(nn.Module):
             query_points=sdf_query_points,
             axis_dir=axis_dir,
             tool_radius_norm=tool_radius_norm,
+            tool_length_norm=tool_length_norm,
+            holder_diameter_norm=holder_diameter_norm,
+            holder_radius_norm=holder_radius_norm,
+            holder_length_norm=holder_length_norm,
         )
         tsdf = self.sdf_query_decoder(
             node_embeddings=state_embedding,
@@ -385,6 +450,10 @@ class GraphSdfPlanningModel(nn.Module):
         axis_visible: Optional[torch.Tensor] = None,
         axis_dir: Optional[torch.Tensor] = None,
         tool_radius_norm: Optional[torch.Tensor] = None,
+        tool_length_norm: Optional[torch.Tensor] = None,
+        holder_diameter_norm: Optional[torch.Tensor] = None,
+        holder_radius_norm: Optional[torch.Tensor] = None,
+        holder_length_norm: Optional[torch.Tensor] = None,
         node_process_state: Optional[torch.Tensor] = None,
         node_centrality: Optional[torch.Tensor] = None,
         spatial_pos: Optional[torch.Tensor] = None,
@@ -415,6 +484,10 @@ class GraphSdfPlanningModel(nn.Module):
             axis_visible=axis_visible,
             axis_dir=axis_dir,
             tool_radius_norm=tool_radius_norm,
+            tool_length_norm=tool_length_norm,
+            holder_diameter_norm=holder_diameter_norm,
+            holder_radius_norm=holder_radius_norm,
+            holder_length_norm=holder_length_norm,
             node_process_state=node_process_state,
             node_mask=node_mask,
         )
@@ -437,6 +510,10 @@ class GraphSdfPlanningModel(nn.Module):
         axis_visible:   Optional[torch.Tensor] = None,
         axis_dir:       Optional[torch.Tensor] = None,
         tool_radius_norm: Optional[torch.Tensor] = None,
+        tool_length_norm: Optional[torch.Tensor] = None,
+        holder_diameter_norm: Optional[torch.Tensor] = None,
+        holder_radius_norm: Optional[torch.Tensor] = None,
+        holder_length_norm: Optional[torch.Tensor] = None,
         node_process_state: Optional[torch.Tensor] = None,
         node_centrality:    Optional[torch.Tensor] = None,
         spatial_pos:        Optional[torch.Tensor] = None,
@@ -477,6 +554,10 @@ class GraphSdfPlanningModel(nn.Module):
             axis_visible=axis_visible,
             axis_dir=axis_dir,
             tool_radius_norm=tool_radius_norm,
+            tool_length_norm=tool_length_norm,
+            holder_diameter_norm=holder_diameter_norm,
+            holder_radius_norm=holder_radius_norm,
+            holder_length_norm=holder_length_norm,
             node_process_state=node_process_state,
             node_mask=node_mask,
         )

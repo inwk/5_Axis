@@ -77,7 +77,7 @@ def generate_from_static_dir(
             "dataset_dir": str(out_dir),
         }
 
-    max_rows = max(1, int(os.getenv("SYNTHETIC_SCENARIOS_PER_PART", "256")))
+    max_rows = max(1, int(os.getenv("SYNTHETIC_SCENARIOS_PER_PART", "512")))
     rows = _generate_rows(
         prt_path=prt_path,
         out_dir=out_dir,
