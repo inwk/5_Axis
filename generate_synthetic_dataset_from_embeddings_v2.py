@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -52,10 +53,13 @@ def generate_from_static_dir(
     pc_name: str = "",
     force: bool = False,
 ) -> dict:
+    total_start = time.time()
+    print(f"[Worker Timing] start static_dir={static_dir}", flush=True)
     static_path = Path(static_dir).expanduser().resolve()
     manifest = _load_static_manifest(static_path)
     if manifest.get("status") != "completed":
         raise ValueError(f"Static manifest is not completed: {static_path}")
+    print(f"[Worker Timing] load_manifest={time.time() - total_start:.2f}s part={manifest.get('part_name') or static_path.name}", flush=True)
 
     part_name = str(manifest.get("part_name") or static_path.name)
     prt_path = str(manifest.get("prt_file_path") or f"{part_name}.prt")
@@ -70,6 +74,7 @@ def generate_from_static_dir(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if not force and _is_completed_dataset_dir(out_dir, part_name, seed):
+        print(f"[Worker Timing] skipped_existing total={time.time() - total_start:.2f}s part={part_name}", flush=True)
         return {
             "status": "skipped_existing",
             "part_name": part_name,
@@ -77,7 +82,9 @@ def generate_from_static_dir(
             "dataset_dir": str(out_dir),
         }
 
-    max_rows = max(1, int(os.getenv("SYNTHETIC_SCENARIOS_PER_PART", "512")))
+    max_rows = max(1, int(os.getenv("SYNTHETIC_SCENARIOS_PER_PART", "200")))
+    rows_start = time.time()
+    print(f"[Worker Timing] generate_rows_start part={part_name} max_rows={max_rows}", flush=True)
     rows = _generate_rows(
         prt_path=prt_path,
         out_dir=out_dir,
@@ -85,13 +92,17 @@ def generate_from_static_dir(
         seed=seed,
         max_rows=max_rows,
     )
+    print(f"[Worker Timing] generate_rows_done part={part_name} rows={len(rows)} elapsed={time.time() - rows_start:.2f}s total={time.time() - total_start:.2f}s", flush=True)
     if not rows:
         raise ValueError(f"No synthetic rows generated for {static_path}")
 
     parquet_path = out_dir / f"{part_name}_seed{int(seed)}_process_skeleton_dataset.parquet"
     chosen_path = out_dir / f"{part_name}_seed{int(seed)}_process_skeleton_dataset_chosen_only.parquet"
+    write_start = time.time()
+    print(f"[Worker Timing] write_parquet_start part={part_name}", flush=True)
     _write_rows_to_parquet(rows, parquet_path)
     _write_rows_to_parquet(rows, chosen_path)
+    print(f"[Worker Timing] write_parquet_done part={part_name} elapsed={time.time() - write_start:.2f}s total={time.time() - total_start:.2f}s", flush=True)
 
     global_dir = out_root / "_ALL_PARQUET_FILES"
     global_dir.mkdir(parents=True, exist_ok=True)
@@ -100,8 +111,10 @@ def generate_from_static_dir(
         global_stem = f"{global_stem}_{pc_slug}"
     global_parquet = global_dir / f"{global_stem}.parquet"
     global_chosen = global_dir / f"{global_stem}_chosen_only.parquet"
+    copy_start = time.time()
     shutil.copy2(parquet_path, global_parquet)
     shutil.copy2(chosen_path, global_chosen)
+    print(f"[Worker Timing] copy_global_done part={part_name} elapsed={time.time() - copy_start:.2f}s total={time.time() - total_start:.2f}s", flush=True)
 
     episode_record = {
         "part_name": part_name,
@@ -126,6 +139,7 @@ def generate_from_static_dir(
         json.dumps(episode_record, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    print(f"[Worker Timing] complete part={part_name} total={time.time() - total_start:.2f}s", flush=True)
     return episode_record
 
 

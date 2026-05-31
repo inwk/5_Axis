@@ -31,6 +31,7 @@ import math
 import os
 import random
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -994,7 +995,15 @@ def _generate_rows(
     seed: int,
     max_rows: int,
 ) -> list[dict[str, Any]]:
+    total_start = time.time()
+
+    def _log_stage(name: str, stage_start: float) -> float:
+        now = time.time()
+        print(f"[Synthetic Timing] {part_name} {name}: {now - stage_start:.2f}s total={now - total_start:.2f}s", flush=True)
+        return now
+
     part_name = _part_name_from_prt(prt_path)
+    stage_start = time.time()
     valid_faces, normals = _load_valid_faces(static_dir)
     max_action_faces = _env_int("SYNTHETIC_MAX_ACTION_FACES", 0)
     part_hash = int(hashlib.sha1(part_name.encode("utf-8")).hexdigest()[:8], 16)
@@ -1007,11 +1016,12 @@ def _generate_rows(
         face_ids = face_ids[:max_action_faces]
     if not face_ids:
         raise ValueError(f"No action faces available for {static_dir}")
+    stage_start = _log_stage("load_static_face_metadata", stage_start)
 
     configs = _tool_configs()
     rng.shuffle(configs)
 
-    grid_resolution = _env_int("SYNTHETIC_GRID_RESOLUTION", 256)
+    grid_resolution = _env_int("SYNTHETIC_GRID_RESOLUTION", 160)
     grid_padding_ratio = float(os.getenv("SYNTHETIC_GRID_PADDING_RATIO", "0.10"))
     grid_padding_mm = float(os.getenv("SYNTHETIC_GRID_PADDING_MM", "5.0"))
     steps_per_rollout = max(1, _env_int("SYNTHETIC_STEPS_PER_ROLLOUT", 4))
@@ -1064,13 +1074,20 @@ def _generate_rows(
     }
 
     mesh = _load_target_mesh(static_dir)
+    stage_start = _log_stage("load_target_mesh", stage_start)
     grid_points, dims, bbox_min, bbox_max, spacing = _grid_from_mesh(
         mesh,
         resolution=grid_resolution,
         padding_ratio=grid_padding_ratio,
         padding_mm=grid_padding_mm,
     )
+    print(
+        f"[Synthetic Grid] {part_name} dims={dims} points={int(grid_points.shape[0])} spacing={spacing}",
+        flush=True,
+    )
+    stage_start = _log_stage("build_grid", stage_start)
     target_sdf = _mesh_signed_distance_negative_inside(mesh, grid_points)
+    stage_start = _log_stage("target_mesh_sdf", stage_start)
     target_tsdf = _tsdf_from_sdf(target_sdf, tsdf_truncation).reshape(dims)
     target_solid = target_tsdf <= 0.0
 
@@ -1083,6 +1100,7 @@ def _generate_rows(
     stock_solid[:, :, -1] = False
     stock_solid |= target_solid
     stock_tsdf = _tsdf_from_solid(stock_solid, spacing, tsdf_truncation)
+    stage_start = _log_stage("initial_stock_tsdf", stage_start)
 
     face_pc_norm = np.load(static_dir / "embed_face_pc.npy").astype(np.float32).reshape(512, 100, 3)
     face_pc_raw = face_pc_norm * float(scale) + center_np.reshape(1, 1, 3)
@@ -1096,6 +1114,7 @@ def _generate_rows(
     ball_configs = [config for config in configs if str(config["tool_kind"]) == "ball"]
     if not flat_configs or not ball_configs:
         raise ValueError("Synthetic tool config requires at least one flat and one ball tool.")
+    stage_start = _log_stage("load_static_arrays", stage_start)
 
     def _face_point_sdf_raw(tsdf_grid: np.ndarray) -> np.ndarray:
         sampled = _sample_grid_values(
@@ -1236,6 +1255,8 @@ def _generate_rows(
     candidate_index = 0
     rollout_index = 0
     finish_macros = ("indexed_finish", "point_finish", "flank_finish")
+    generation_start = time.time()
+    last_progress = generation_start
     while len(rows) < max_rows:
         scenario_id = f"synth_rollout_{rollout_index:05d}"
         current_solid = stock_solid.copy()
@@ -1333,6 +1354,14 @@ def _generate_rows(
             row.update(payload)
             rows.append(row)
             candidate_index += 1
+            if len(rows) == 1 or len(rows) % 25 == 0 or len(rows) >= max_rows:
+                now = time.time()
+                print(
+                    f"[Synthetic Progress] {part_name} rows={len(rows)}/{max_rows} "
+                    f"last_interval={now - last_progress:.2f}s generation={now - generation_start:.2f}s total={now - total_start:.2f}s",
+                    flush=True,
+                )
+                last_progress = now
 
             current_solid = next_solid
             current_tsdf = after_tsdf
@@ -1340,6 +1369,7 @@ def _generate_rows(
                 rough_done[valid_node_mask] = 1.0
         rollout_index += 1
 
+    _log_stage("generate_rows_complete", generation_start)
     return rows
 
 
@@ -1360,7 +1390,7 @@ def collect_synthetic_episode(prt_path: str, out_root: str, seed: int, pc_name: 
             "and a complete static feature directory."
         )
 
-    max_rows = max(1, _env_int("SYNTHETIC_SCENARIOS_PER_PART", 512))
+    max_rows = max(1, _env_int("SYNTHETIC_SCENARIOS_PER_PART", 200))
     rows = _generate_rows(
         prt_path=prt_path,
         out_dir=out_dir,

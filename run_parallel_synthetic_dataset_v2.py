@@ -32,8 +32,9 @@ SYNTHETIC_DATASET_DIR = os.path.join(SHARED_BASE_DIR, "sdf_dataset_synthetic_v2"
 # "auto" uses CUDA for C-space/Minkowski boolean masks when available, otherwise CPU.
 SYNTHETIC_CSPACE_DEVICE = "auto"  # "auto", "cuda", or "cpu"
 SYNTHETIC_CSPACE_GPU_MAX_PAIRS = 4_000_000
-SYNTHETIC_GRID_RESOLUTION = 256
+SYNTHETIC_GRID_RESOLUTION = 160
 SYNTHETIC_HOLDER_CSPACE_RESOLUTION = 64
+SYNTHETIC_SCENARIOS_PER_PART = 200
 
 
 def _safe_name_component(text: str) -> str:
@@ -90,6 +91,7 @@ def _resolve_static_dirs(root: Path) -> list[Path]:
 
 
 def process_static_dir_safe(task: tuple[str, str, str, bool]) -> None:
+    task_start = time.time()
     static_dir_raw, output_root, pc_name, force = task
     static_dir = Path(static_dir_raw).expanduser().resolve()
     part_name = _part_name_from_static(static_dir)
@@ -98,6 +100,7 @@ def process_static_dir_safe(task: tuple[str, str, str, bool]) -> None:
     output_root_path.mkdir(parents=True, exist_ok=True)
 
     if not force and _already_processed(part_name, str(output_root_path), CURRENT_SEED, pc_slug):
+        print(f"[Skip] synthetic {part_name} already processed check={time.time() - task_start:.2f}s", flush=True)
         return
 
     lock_file = output_root_path / f"{part_name}.processing"
@@ -105,6 +108,7 @@ def process_static_dir_safe(task: tuple[str, str, str, bool]) -> None:
         fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL)
         os.close(fd)
     except (FileExistsError, OSError):
+        print(f"[Skip] synthetic {part_name} lock exists check={time.time() - task_start:.2f}s", flush=True)
         return
 
     start_time = time.time()
@@ -134,15 +138,18 @@ def process_static_dir_safe(task: tuple[str, str, str, bool]) -> None:
     env["SYNTHETIC_CSPACE_GPU_MAX_PAIRS"] = str(int(SYNTHETIC_CSPACE_GPU_MAX_PAIRS))
     env["SYNTHETIC_GRID_RESOLUTION"] = str(int(SYNTHETIC_GRID_RESOLUTION))
     env["SYNTHETIC_HOLDER_CSPACE_RESOLUTION"] = str(int(SYNTHETIC_HOLDER_CSPACE_RESOLUTION))
+    env["SYNTHETIC_SCENARIOS_PER_PART"] = str(int(SYNTHETIC_SCENARIOS_PER_PART))
 
     try:
-        print(f"[Start] synthetic {part_name} (PID: {os.getpid()} pc={pc_slug or '-'})")
+        print(f"[Start] synthetic {part_name} (PID: {os.getpid()} pc={pc_slug or '-'}) prep={start_time - task_start:.2f}s log={log_path}", flush=True)
         with open(log_path, "w", encoding="utf-8") as log_f:
+            launch_start = time.time()
             result = subprocess.run(cmd, check=False, stdout=log_f, stderr=log_f, env=env)
+        run_elapsed = time.time() - launch_start
         if result.returncode != 0:
-            print(f"[Error] synthetic {part_name} failed (rc={result.returncode}), see {log_path}")
+            print(f"[Error] synthetic {part_name} failed (rc={result.returncode}) run={run_elapsed:.1f}s total={time.time() - task_start:.1f}s, see {log_path}", flush=True)
         else:
-            print(f"[Done] synthetic {part_name} finished in {time.time() - start_time:.1f}s")
+            print(f"[Done] synthetic {part_name} run={run_elapsed:.1f}s total={time.time() - task_start:.1f}s log={log_path}", flush=True)
     except Exception as exc:
         print(f"[Error] synthetic {part_name}: {exc!r}")
     finally:
@@ -153,6 +160,7 @@ def process_static_dir_safe(task: tuple[str, str, str, bool]) -> None:
 
 
 def main() -> None:
+    total_start = time.time()
     static_root = Path(STATIC_EMBEDDING_DIR).expanduser().resolve()
     output_root = Path(SYNTHETIC_DATASET_DIR).expanduser().resolve()
     if not static_root.exists():
@@ -160,7 +168,9 @@ def main() -> None:
         return
     output_root.mkdir(parents=True, exist_ok=True)
 
+    scan_start = time.time()
     static_dirs = _resolve_static_dirs(static_root)
+    print(f"[Timing] resolve_static_dirs={time.time() - scan_start:.2f}s", flush=True)
     random.shuffle(static_dirs)
     tasks = [(str(path), str(output_root), PC_NAME, bool(FORCE)) for path in static_dirs]
 
@@ -169,11 +179,20 @@ def main() -> None:
     print(f"Static embedding root: {static_root}")
     print(f"Synthetic dataset root: {output_root}")
     print(f"Found {len(static_dirs)} completed static dirs. Starting with {CORES} cores.")
+    print(
+        f"[Config] grid={SYNTHETIC_GRID_RESOLUTION} holder_cspace={SYNTHETIC_HOLDER_CSPACE_RESOLUTION} "
+        f"rows_per_prt={SYNTHETIC_SCENARIOS_PER_PART} "
+        f"cspace_device={SYNTHETIC_CSPACE_DEVICE} gpu_pairs={SYNTHETIC_CSPACE_GPU_MAX_PAIRS}",
+        flush=True,
+    )
 
+    pool_start = time.time()
+    print(f"[Timing] pool_start_begin elapsed={pool_start - total_start:.2f}s", flush=True)
     with multiprocessing.Pool(processes=max(1, int(CORES)), maxtasksperchild=1) as pool:
+        print(f"[Timing] pool_created={time.time() - pool_start:.2f}s", flush=True)
         for _ in pool.imap_unordered(process_static_dir_safe, tasks, chunksize=1):
             pass
-    print("All synthetic dataset tasks processed or skipped.")
+    print(f"All synthetic dataset tasks processed or skipped. total={time.time() - total_start:.1f}s", flush=True)
 
 
 if __name__ == "__main__":
