@@ -484,6 +484,53 @@ def _mesh_signed_distance_negative_inside(mesh, points: np.ndarray, chunk: int |
     return out
 
 
+def _target_solid_from_mesh_voxelized(
+    mesh,
+    bbox_min: np.ndarray,
+    spacing: tuple[float, float, float],
+    dims: tuple[int, int, int],
+) -> np.ndarray:
+    """Voxelizes the target mesh directly, then maps occupied voxels to the training grid."""
+    pitch = float(max(min(spacing), 1e-6))
+    if isinstance(mesh, dict):
+        try:
+            import trimesh
+            mesh = trimesh.Trimesh(
+                vertices=np.asarray(mesh["vertices"], dtype=np.float64),
+                faces=np.asarray(mesh["faces"], dtype=np.int64),
+                process=False,
+            )
+            voxels = mesh.voxelized(pitch)
+            try:
+                voxels = voxels.fill()
+            except Exception:
+                pass
+            voxel_points = np.asarray(voxels.points, dtype=np.float32).reshape(-1, 3)
+        except Exception:
+            poly = mesh.get("polydata")
+            if poly is None:
+                raise
+            voxels = poly.voxelize(spacing=pitch)
+            voxel_points = np.asarray(voxels.cell_centers().points, dtype=np.float32).reshape(-1, 3)
+    else:
+        voxels = mesh.voxelized(pitch)
+        try:
+            voxels = voxels.fill()
+        except Exception:
+            pass
+        voxel_points = np.asarray(voxels.points, dtype=np.float32).reshape(-1, 3)
+    if voxel_points.size == 0:
+        raise ValueError("Target mesh voxelization produced no occupied voxels.")
+
+    solid = np.zeros(dims, dtype=bool)
+    spacing_arr = np.asarray(spacing, dtype=np.float32).reshape(1, 3)
+    grid_idx = np.floor((voxel_points - bbox_min.reshape(1, 3)) / spacing_arr + 0.5).astype(np.int32)
+    max_idx = np.asarray(dims, dtype=np.int32).reshape(1, 3) - 1
+    grid_idx = np.minimum(np.maximum(grid_idx, 0), max_idx)
+    solid[grid_idx[:, 0], grid_idx[:, 1], grid_idx[:, 2]] = True
+    return solid
+
+
 def _tsdf_from_sdf(sdf: np.ndarray, truncation: float) -> np.ndarray:
     tau = max(float(truncation), 1e-6)
     return np.clip(np.asarray(sdf, dtype=np.float32) / tau, -1.0, 1.0).astype(np.float32)
@@ -511,6 +558,35 @@ def _grid_nearest_indices(points: np.ndarray, bbox_min: np.ndarray, spacing: tup
 def _sample_grid_values(values: np.ndarray, points: np.ndarray, bbox_min: np.ndarray, spacing: tuple[float, float, float], dims: tuple[int, int, int]) -> np.ndarray:
     idx = _grid_nearest_indices(points, bbox_min, spacing, dims)
     return values[idx[:, 0], idx[:, 1], idx[:, 2]].astype(np.float32, copy=False)
+
+
+def _sample_grid_values_trilinear(values: np.ndarray, points: np.ndarray, bbox_min: np.ndarray, spacing: tuple[float, float, float], dims: tuple[int, int, int]) -> np.ndarray:
+    spacing_arr = np.asarray(spacing, dtype=np.float32).reshape(1, 3)
+    coord = (points.astype(np.float32) - bbox_min.reshape(1, 3)) / np.maximum(spacing_arr, 1e-9)
+    max_coord = np.asarray(dims, dtype=np.float32).reshape(1, 3) - 1.0
+    coord = np.minimum(np.maximum(coord, 0.0), max_coord)
+    lo = np.floor(coord).astype(np.int32)
+    hi = np.minimum(lo + 1, np.asarray(dims, dtype=np.int32).reshape(1, 3) - 1)
+    frac = (coord - lo.astype(np.float32)).astype(np.float32)
+
+    x0, y0, z0 = lo[:, 0], lo[:, 1], lo[:, 2]
+    x1, y1, z1 = hi[:, 0], hi[:, 1], hi[:, 2]
+    fx, fy, fz = frac[:, 0], frac[:, 1], frac[:, 2]
+    v000 = values[x0, y0, z0]
+    v100 = values[x1, y0, z0]
+    v010 = values[x0, y1, z0]
+    v110 = values[x1, y1, z0]
+    v001 = values[x0, y0, z1]
+    v101 = values[x1, y0, z1]
+    v011 = values[x0, y1, z1]
+    v111 = values[x1, y1, z1]
+    v00 = v000 * (1.0 - fx) + v100 * fx
+    v10 = v010 * (1.0 - fx) + v110 * fx
+    v01 = v001 * (1.0 - fx) + v101 * fx
+    v11 = v011 * (1.0 - fx) + v111 * fx
+    v0 = v00 * (1.0 - fy) + v10 * fy
+    v1 = v01 * (1.0 - fy) + v11 * fy
+    return (v0 * (1.0 - fz) + v1 * fz).astype(np.float32, copy=False)
 
 
 def _radius_limit_at_s(tool_kind: str, s: np.ndarray, radius: float, tool_length: float) -> np.ndarray:
@@ -1029,9 +1105,14 @@ def _generate_rows(
     grid_resolution = _env_int("SYNTHETIC_GRID_RESOLUTION", 160)
     grid_padding_ratio = float(os.getenv("SYNTHETIC_GRID_PADDING_RATIO", "0.10"))
     grid_padding_mm = float(os.getenv("SYNTHETIC_GRID_PADDING_MM", "5.0"))
-    steps_per_rollout = max(1, _env_int("SYNTHETIC_STEPS_PER_ROLLOUT", 4))
-    rough_steps = max(1, _env_int("SYNTHETIC_ROUGH_STEPS", _env_int("EARLY_ROUGH_ONLY_STEPS", 2)))
+    finish_local_fine_sdf = _env_bool("SYNTHETIC_FINISH_LOCAL_FINE_SDF", True)
+    finish_local_grid_resolution = max(16, _env_int("SYNTHETIC_FINISH_LOCAL_GRID_RESOLUTION", 160))
+    finish_local_padding_mm = float(os.getenv("SYNTHETIC_FINISH_LOCAL_PADDING_MM", "5.0"))
+    steps_per_rollout = max(1, _env_int("SYNTHETIC_STEPS_PER_ROLLOUT", 6))
+    rough_steps = max(1, _env_int("SYNTHETIC_ROUGH_STEPS", _env_int("EARLY_ROUGH_ONLY_STEPS", 4)))
     rough_steps = min(rough_steps, steps_per_rollout)
+    finish_face_search_limit = max(1, _env_int("SYNTHETIC_FINISH_FACE_SEARCH_LIMIT", 24))
+    finish_face_min_candidates = max(1, _env_int("SYNTHETIC_FINISH_FACE_MIN_CANDIDATES", 64))
     sdf_query_count = max(256, _env_int("SYNTHETIC_SDF_QUERY_COUNT", _env_int("SDF_QUERY_COUNT", 32768)))
     octree_query_count = max(256, _env_int("SYNTHETIC_OCTREE_QUERY_NODES", 4096))
     tsdf_truncation = float(os.getenv("SYNTHETIC_TSDF_TRUNCATION", os.getenv("SDF_QUERY_TRUNCATION", "5.0")))
@@ -1043,8 +1124,13 @@ def _generate_rows(
         "static_feature_source": "nx_prt_static_extraction_or_reused_static_dir",
         "synthetic_generator": "dense_grid_minkowski_cspace_v2",
         "grid_resolution": int(grid_resolution),
+        "finish_local_fine_sdf": bool(finish_local_fine_sdf),
+        "finish_local_grid_resolution": int(finish_local_grid_resolution),
+        "finish_local_padding_mm": float(finish_local_padding_mm),
         "steps_per_rollout": int(steps_per_rollout),
         "rough_steps": int(rough_steps),
+        "finish_face_search_limit": int(finish_face_search_limit),
+        "finish_face_min_candidates": int(finish_face_min_candidates),
         "sdf_query_count": int(sdf_query_count),
         "octree_query_count": int(octree_query_count),
         "tsdf_truncation": float(tsdf_truncation),
@@ -1091,10 +1177,10 @@ def _generate_rows(
         flush=True,
     )
     stage_start = _log_stage("build_grid", stage_start)
-    target_sdf = _mesh_signed_distance_negative_inside(mesh, grid_points)
-    stage_start = _log_stage("target_mesh_sdf", stage_start)
-    target_tsdf = _tsdf_from_sdf(target_sdf, tsdf_truncation).reshape(dims)
-    target_solid = target_tsdf <= 0.0
+    target_solid = _target_solid_from_mesh_voxelized(mesh, bbox_min, spacing, dims)
+    stage_start = _log_stage("target_mesh_voxelize", stage_start)
+    target_tsdf = _tsdf_from_solid(target_solid, spacing, tsdf_truncation)
+    stage_start = _log_stage("target_voxel_tsdf", stage_start)
 
     stock_solid = np.ones(dims, dtype=bool)
     stock_solid[0, :, :] = False
@@ -1134,6 +1220,123 @@ def _generate_rows(
     def _node_mean_sdf(point_sdf_raw: np.ndarray) -> np.ndarray:
         return point_sdf_raw.reshape(512, 100).mean(axis=1, dtype=np.float32)
 
+    def _local_bbox_for_face(face_id: int, tool_radius: float) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int], tuple[float, float, float]]:
+        points = face_pc_raw[int(face_id)].reshape(-1, 3)
+        points = points[np.any(np.abs(points) > 1e-12, axis=1)]
+        if points.size == 0:
+            local_min = bbox_min.copy()
+            local_max = bbox_max.copy()
+        else:
+            pad = max(float(finish_local_padding_mm), float(tool_radius) * 3.0, float(max(spacing)) * 3.0)
+            local_min = np.maximum(points.min(axis=0).astype(np.float32) - pad, bbox_min)
+            local_max = np.minimum(points.max(axis=0).astype(np.float32) + pad, bbox_max)
+            if bool(np.any((local_max - local_min) <= 1e-6)):
+                local_min = np.maximum(points.mean(axis=0).astype(np.float32) - pad, bbox_min)
+                local_max = np.minimum(points.mean(axis=0).astype(np.float32) + pad, bbox_max)
+        extent = np.maximum(local_max - local_min, 1e-6)
+        max_extent = float(extent.max())
+        dims_np = np.maximum(np.round(extent / max_extent * float(finish_local_grid_resolution)).astype(np.int32), 8)
+        local_dims = (int(dims_np[0]), int(dims_np[1]), int(dims_np[2]))
+        local_spacing = (
+            float(extent[0] / max(local_dims[0] - 1, 1)),
+            float(extent[1] / max(local_dims[1] - 1, 1)),
+            float(extent[2] / max(local_dims[2] - 1, 1)),
+        )
+        return local_min.astype(np.float32), local_max.astype(np.float32), local_dims, local_spacing
+
+    def _grid_slices_for_bbox(local_min: np.ndarray, local_max: np.ndarray) -> tuple[slice, slice, slice]:
+        spacing_arr = np.asarray(spacing, dtype=np.float32)
+        lo = np.floor((local_min.astype(np.float32) - bbox_min) / spacing_arr).astype(np.int32)
+        hi = np.ceil((local_max.astype(np.float32) - bbox_min) / spacing_arr).astype(np.int32) + 1
+        lo = np.maximum(lo, 0)
+        hi = np.minimum(hi, np.asarray(dims, dtype=np.int32))
+        hi = np.maximum(hi, lo + 1)
+        return slice(int(lo[0]), int(hi[0])), slice(int(lo[1]), int(hi[1])), slice(int(lo[2]), int(hi[2]))
+
+    def _sample_local_grid_points(local_min: np.ndarray, local_max: np.ndarray, local_dims: tuple[int, int, int], count: int) -> np.ndarray:
+        sample_count = max(int(count), 1)
+        ijk = np.column_stack([
+            np_rng.integers(0, max(int(local_dims[0]), 1), size=sample_count, endpoint=False),
+            np_rng.integers(0, max(int(local_dims[1]), 1), size=sample_count, endpoint=False),
+            np_rng.integers(0, max(int(local_dims[2]), 1), size=sample_count, endpoint=False),
+        ]).astype(np.float32)
+        denom = np.maximum(np.asarray(local_dims, dtype=np.float32).reshape(1, 3) - 1.0, 1.0)
+        return (local_min.reshape(1, 3) + (ijk / denom) * (local_max - local_min).reshape(1, 3)).astype(np.float32)
+
+    def _finish_local_sdf_payload(
+        before_tsdf: np.ndarray,
+        after_tsdf: np.ndarray,
+        before_solid: np.ndarray,
+        holder_forbidden: np.ndarray,
+        face_id: int,
+        axis_dir: np.ndarray,
+        tool_radius: float,
+    ) -> dict[str, np.ndarray | str]:
+        local_start = time.time()
+        local_min, local_max, local_dims, local_spacing = _local_bbox_for_face(face_id, tool_radius)
+        candidate_count = min(max(int(sdf_query_count) * 2, int(sdf_query_count)), 131_072)
+        candidate_points = _sample_local_grid_points(local_min, local_max, local_dims, candidate_count)
+        before_values = _sample_grid_values_trilinear(before_tsdf, candidate_points, bbox_min, spacing, dims)
+        after_values = _sample_grid_values_trilinear(after_tsdf, candidate_points, bbox_min, spacing, dims)
+        target_sdf = _mesh_signed_distance_negative_inside(mesh, candidate_points)
+        target_values = _tsdf_from_sdf(target_sdf, tsdf_truncation)
+
+        global_idx = _grid_nearest_indices(candidate_points, bbox_min, spacing, dims)
+        holder_blocked = holder_forbidden[global_idx[:, 0], global_idx[:, 1], global_idx[:, 2]]
+        before_inside = before_values <= 0.0
+        target_inside = target_values <= 0.0
+        local_removed = before_inside & ~target_inside & ~holder_blocked
+        local_after_values = after_values.copy()
+        if bool(local_removed.any()):
+            local_after_values[local_removed] = np.maximum(local_after_values[local_removed], target_values[local_removed])
+
+        priority = (np.abs(local_after_values - before_values) > 1e-4) | local_removed
+        keep = _select_indices(
+            np_rng,
+            candidate_points.shape[0],
+            int(sdf_query_count),
+            priority_mask=priority,
+            priority_fraction=0.70,
+        )
+        selected_points = candidate_points[keep]
+        selected_global_idx = global_idx[keep]
+        selected_flat_idx = np.ravel_multi_index(
+            (
+                selected_global_idx[:, 0],
+                selected_global_idx[:, 1],
+                selected_global_idx[:, 2],
+            ),
+            dims,
+        ).astype(np.int64)
+        sdf_clearance, sdf_blocked = _axis_clearance_features(
+            before_solid,
+            selected_flat_idx,
+            axis_dir,
+            spacing,
+            float(scale),
+            float(tool_radius),
+        )
+        print(
+            f"[Synthetic Local Fine SDF] {part_name} face={int(face_id)} "
+            f"dims={local_dims} candidates={candidate_points.shape[0]} selected={keep.shape[0]} "
+            f"priority={int(priority.sum())} elapsed={time.time() - local_start:.2f}s",
+            flush=True,
+        )
+        return {
+            "sdf_query_source": "local_fine_roi",
+            "sdf_query_points": ((selected_points - center_np.reshape(1, 3)) / float(scale)).astype(np.float32),
+            "sdf_tsdf_before": before_values[keep].astype(np.float32, copy=False),
+            "sdf_tsdf_after": local_after_values[keep].astype(np.float32, copy=False),
+            "sdf_delta_tsdf": (local_after_values[keep] - before_values[keep]).astype(np.float32, copy=False),
+            "sdf_target_tsdf": target_values[keep].astype(np.float32, copy=False),
+            "sdf_axis_clearance_before": sdf_clearance,
+            "sdf_axis_blocked_before": sdf_blocked,
+            "sdf_local_bbox_min": ((local_min - center_np) / float(scale)).astype(np.float32),
+            "sdf_local_bbox_max": ((local_max - center_np) / float(scale)).astype(np.float32),
+            "sdf_local_grid_dims": np.asarray(local_dims, dtype=np.int16),
+            "sdf_local_grid_spacing": np.asarray(local_spacing, dtype=np.float32),
+        }
+
     def _sample_transition_payload(
         before_tsdf: np.ndarray,
         after_tsdf: np.ndarray,
@@ -1141,6 +1344,9 @@ def _generate_rows(
         removed_mask: np.ndarray,
         axis_dir: np.ndarray,
         tool_radius: float,
+        macro_name: str,
+        face_id: int,
+        holder_forbidden: np.ndarray,
     ) -> dict[str, np.ndarray]:
         before_flat = before_tsdf.reshape(-1)
         after_flat = after_tsdf.reshape(-1)
@@ -1184,7 +1390,8 @@ def _generate_rows(
             float(scale),
             float(tool_radius),
         )
-        return {
+        payload: dict[str, Any] = {
+            "sdf_query_source": "global_coarse",
             "sdf_query_points": grid_points_norm[sdf_idx].astype(np.float32, copy=False),
             "sdf_tsdf_before": before_flat[sdf_idx].astype(np.float32, copy=False),
             "sdf_tsdf_after": after_flat[sdf_idx].astype(np.float32, copy=False),
@@ -1208,6 +1415,17 @@ def _generate_rows(
             "octree_bbox_min": ((bbox_min - center_np) / float(scale)).astype(np.float32),
             "octree_bbox_max": ((bbox_max - center_np) / float(scale)).astype(np.float32),
         }
+        if bool(finish_local_fine_sdf) and macro_name != "indexed_rough":
+            payload.update(_finish_local_sdf_payload(
+                before_tsdf=before_tsdf,
+                after_tsdf=after_tsdf,
+                before_solid=before_solid,
+                holder_forbidden=holder_forbidden,
+                face_id=int(face_id),
+                axis_dir=axis_dir,
+                tool_radius=float(tool_radius),
+            ))
+        return payload
 
     def _apply_synthetic_operation(
         current_solid: np.ndarray,
@@ -1216,6 +1434,9 @@ def _generate_rows(
         config: dict[str, float | str],
         axis_dir: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        op_start = time.time()
+        op_stage = op_start
+        op_prefix = f"[Synthetic Op Timing] {part_name} macro={macro_name} face={int(face_id)}"
         kernels = _make_kernel_offsets(
             axis_dir=axis_dir,
             spacing=spacing,
@@ -1225,6 +1446,16 @@ def _generate_rows(
             holder_radius=float(config["holder_radius"]),
             holder_length=float(config["holder_length"]),
         )
+        now = time.time()
+        print(
+            f"{op_prefix} make_kernels={now - op_stage:.2f}s "
+            f"cutter_offsets={int(kernels['cutter'].shape[0])} "
+            f"holder_offsets={int(kernels['holder'].shape[0])} "
+            f"tool={config['tool_kind']} dia={float(config['tool_diameter']):.3f} "
+            f"tool_len={float(config['tool_length']):.3f} holder_dia={float(config['holder_diameter']):.3f}",
+            flush=True,
+        )
+        op_stage = now
         holder_obstacle = current_solid if macro_name == "indexed_rough" else target_solid
         holder_forbidden = _holder_forbidden_mask(
             obstacle=holder_obstacle,
@@ -1237,7 +1468,22 @@ def _generate_rows(
             bbox_min=bbox_min,
             bbox_max=bbox_max,
         )
+        now = time.time()
+        print(
+            f"{op_prefix} holder_forbidden={now - op_stage:.2f}s "
+            f"obstacle_ratio={float(holder_obstacle.mean()):.4f} "
+            f"forbidden_ratio={float(holder_forbidden.mean()):.4f}",
+            flush=True,
+        )
+        op_stage = now
         ideal_removal = current_solid & ~target_solid
+        now = time.time()
+        print(
+            f"{op_prefix} ideal_removal={now - op_stage:.2f}s "
+            f"ideal_count={int(ideal_removal.sum())}",
+            flush=True,
+        )
+        op_stage = now
         roi = _action_roi_mask(
             macro_name,
             int(face_id),
@@ -1249,12 +1495,122 @@ def _generate_rows(
             float(config["tool_radius"]),
             spacing,
         )
+        now = time.time()
+        print(
+            f"{op_prefix} roi_mask={now - op_stage:.2f}s "
+            f"roi_count={int(roi.sum())}",
+            flush=True,
+        )
+        op_stage = now
         config_candidates = ideal_removal & roi & ~holder_forbidden
-        swept_volume = _dilate_config_mask(config_candidates, kernels["cutter"])
-        removed = ideal_removal & roi & swept_volume
+        candidate_count = int(config_candidates.sum())
+        now = time.time()
+        print(
+            f"{op_prefix} config_candidates={now - op_stage:.2f}s "
+            f"candidate_count={candidate_count}",
+            flush=True,
+        )
+        op_stage = now
+        if macro_name == "indexed_rough":
+            removed = config_candidates
+            now = time.time()
+            print(
+                f"{op_prefix} cutter_swept=0.00s skipped_for_rough=True "
+                f"swept_count=skipped",
+                flush=True,
+            )
+            op_stage = now
+        else:
+            swept_volume = _dilate_config_mask(config_candidates, kernels["cutter"])
+            now = time.time()
+            print(
+                f"{op_prefix} cutter_swept={now - op_stage:.2f}s "
+                f"swept_count={int(swept_volume.sum())}",
+                flush=True,
+            )
+            op_stage = now
+            removed = ideal_removal & roi & swept_volume
         next_solid = current_solid & ~removed
         next_solid |= target_solid
+        now = time.time()
+        print(
+            f"{op_prefix} combine={now - op_stage:.2f}s "
+            f"removed_count={int(removed.sum())} total={now - op_start:.2f}s",
+            flush=True,
+        )
         return next_solid, removed, holder_forbidden
+
+    def _finish_face_score(
+        current_solid: np.ndarray,
+        macro_name: str,
+        face_id: int,
+        config: dict[str, float | str],
+        axis_dir: np.ndarray,
+    ) -> tuple[int, int]:
+        local_min, local_max, _, _ = _local_bbox_for_face(int(face_id), float(config["tool_radius"]))
+        xs, ys, zs = _grid_slices_for_bbox(local_min, local_max)
+        ideal_roi = current_solid[xs, ys, zs] & ~target_solid[xs, ys, zs]
+        ideal_count = int(ideal_roi.sum())
+        if ideal_count <= 0:
+            return 0, 0
+        holder_forbidden = _holder_forbidden_mask(
+            obstacle=target_solid,
+            axis_dir=axis_dir,
+            tool_kind=str(config["tool_kind"]),
+            tool_radius=float(config["tool_radius"]),
+            tool_length=float(config["tool_length"]),
+            holder_radius=float(config["holder_radius"]),
+            holder_length=float(config["holder_length"]),
+            bbox_min=bbox_min,
+            bbox_max=bbox_max,
+        )
+        candidate_count = int((ideal_roi & ~holder_forbidden[xs, ys, zs]).sum())
+        return candidate_count, ideal_count
+
+    def _select_action_face(
+        current_solid: np.ndarray,
+        macro_name: str,
+        config: dict[str, float | str],
+        rough_done: np.ndarray,
+        default_index: int,
+    ) -> tuple[int, np.ndarray]:
+        default_face = int(face_ids[int(default_index) % len(face_ids)])
+        if macro_name == "indexed_rough":
+            return default_face, _axis_for_macro(macro_name, default_face, normals, rng)
+
+        rough_faces = [int(face_id) for face_id in face_ids if float(rough_done[int(face_id)]) > 0.5]
+        remaining_faces = [int(face_id) for face_id in face_ids if int(face_id) not in set(rough_faces)]
+        search_faces = rough_faces + remaining_faces
+        if not search_faces:
+            return default_face, _axis_for_macro(macro_name, default_face, normals, rng)
+
+        best_face = default_face
+        best_axis = _axis_for_macro(macro_name, default_face, normals, rng)
+        best_candidates = -1
+        best_ideal = 0
+        search_count = min(int(finish_face_search_limit), len(search_faces))
+        start = int(default_index) % len(search_faces)
+        for offset in range(search_count):
+            face_id = int(search_faces[(start + offset) % len(search_faces)])
+            axis_dir = _axis_for_macro(macro_name, face_id, normals, rng)
+            candidate_count, ideal_count = _finish_face_score(current_solid, macro_name, face_id, config, axis_dir)
+            if candidate_count > best_candidates or (candidate_count == best_candidates and ideal_count > best_ideal):
+                best_face = face_id
+                best_axis = axis_dir
+                best_candidates = candidate_count
+                best_ideal = ideal_count
+            if candidate_count >= int(finish_face_min_candidates):
+                break
+
+        source = "rough_done_first" if rough_faces else "all_faces"
+        fallback = best_candidates <= 0
+        print(
+            f"[Synthetic Face Select] {part_name} macro={macro_name} default_face={default_face} "
+            f"selected_face={best_face} candidates={max(best_candidates, 0)} ideal_roi={best_ideal} "
+            f"searched={search_count} source={source} fallback={fallback}",
+            flush=True,
+        )
+        return best_face, best_axis
 
     rows: list[dict[str, Any]] = []
     candidate_index = 0
@@ -1280,12 +1636,28 @@ def _generate_rows(
                 config_pool = flat_configs if macro_name == "flank_finish" else ball_configs
                 config = config_pool[rng.randrange(len(config_pool))]
 
-            face_id = int(face_ids[(rollout_index * steps_per_rollout + step) % len(face_ids)])
+            default_face_index = int((rollout_index * steps_per_rollout + step) % len(face_ids))
+            face_id, axis_dir = _select_action_face(
+                current_solid=current_solid,
+                macro_name=macro_name,
+                config=config,
+                rough_done=rough_done,
+                default_index=default_face_index,
+            )
             macro_id = int(MACRO_CLASS_TO_ID[macro_name])
-            axis_dir = _axis_for_macro(macro_name, face_id, normals, rng)
+            row_start = time.time()
+            row_stage = row_start
+            print(
+                f"[Synthetic Row Start] {part_name} row={len(rows) + 1}/{max_rows} "
+                f"rollout={rollout_index} step={step} macro={macro_name}",
+                flush=True,
+            )
             before_tsdf = current_tsdf
             before_point_sdf_raw = _face_point_sdf_raw(before_tsdf)
             before_node_sdf_raw = _node_mean_sdf(before_point_sdf_raw)
+            now = time.time()
+            print(f"[Synthetic Row Timing] {part_name} row={len(rows) + 1} before_face_sdf={now - row_stage:.2f}s", flush=True)
+            row_stage = now
 
             next_solid, removed_mask, holder_forbidden = _apply_synthetic_operation(
                 current_solid=current_solid,
@@ -1294,13 +1666,22 @@ def _generate_rows(
                 config=config,
                 axis_dir=axis_dir,
             )
+            now = time.time()
+            print(f"[Synthetic Row Timing] {part_name} row={len(rows) + 1} apply_operation={now - row_stage:.2f}s", flush=True)
+            row_stage = now
             after_tsdf = _tsdf_from_solid(next_solid, spacing, tsdf_truncation)
+            now = time.time()
+            print(f"[Synthetic Row Timing] {part_name} row={len(rows) + 1} after_tsdf={now - row_stage:.2f}s", flush=True)
+            row_stage = now
             after_point_sdf_raw = _face_point_sdf_raw(after_tsdf)
             after_node_sdf_raw = _node_mean_sdf(after_point_sdf_raw)
             affected_delta = np.maximum(after_node_sdf_raw - before_node_sdf_raw, 0.0).astype(np.float32)
             affected_mask = ((affected_delta > 1e-4) & valid_node_mask).astype(np.float32)
             finish_ready = ((rough_done > 0.5) & valid_node_mask).astype(np.float32)
             node_process_state = np.stack([rough_done, finish_ready], axis=1).astype(np.float32)
+            now = time.time()
+            print(f"[Synthetic Row Timing] {part_name} row={len(rows) + 1} after_face_sdf_and_affected={now - row_stage:.2f}s", flush=True)
+            row_stage = now
             payload = _sample_transition_payload(
                 before_tsdf=before_tsdf,
                 after_tsdf=after_tsdf,
@@ -1308,7 +1689,13 @@ def _generate_rows(
                 removed_mask=removed_mask,
                 axis_dir=axis_dir,
                 tool_radius=float(config["tool_radius"]),
+                macro_name=macro_name,
+                face_id=int(face_id),
+                holder_forbidden=holder_forbidden,
             )
+            now = time.time()
+            print(f"[Synthetic Row Timing] {part_name} row={len(rows) + 1} payload_sampling={now - row_stage:.2f}s", flush=True)
+            row_stage = now
 
             tool_kind = str(config["tool_kind"])
             tool_choice_name = tool_choice_key(tool_kind, float(config["tool_diameter"]))
@@ -1357,21 +1744,25 @@ def _generate_rows(
                 "affected_face_mask_512": affected_mask,
             })
             row.update(payload)
+            now = time.time()
+            print(f"[Synthetic Row Timing] {part_name} row={len(rows) + 1} row_assembly={now - row_stage:.2f}s", flush=True)
             rows.append(row)
             candidate_index += 1
-            if len(rows) == 1 or len(rows) % 25 == 0 or len(rows) >= max_rows:
-                now = time.time()
-                print(
-                    f"[Synthetic Progress] {part_name} rows={len(rows)}/{max_rows} "
-                    f"last_interval={now - last_progress:.2f}s generation={now - generation_start:.2f}s total={now - total_start:.2f}s",
-                    flush=True,
-                )
-                last_progress = now
+            now = time.time()
+            print(
+                f"[Synthetic Row] {part_name} row={len(rows)}/{max_rows} "
+                f"rollout={rollout_index} step={step} macro={macro_name} "
+                f"removed={int(removed_mask.sum())} holder_forbidden={float(holder_forbidden.mean()):.4f} "
+                f"row_elapsed={now - row_start:.2f}s since_last={now - last_progress:.2f}s "
+                f"generation={now - generation_start:.2f}s total={now - total_start:.2f}s",
+                flush=True,
+            )
+            last_progress = now
 
             current_solid = next_solid
             current_tsdf = after_tsdf
             if macro_name == "indexed_rough":
-                rough_done[valid_node_mask] = 1.0
+                rough_done[int(face_id)] = 1.0
         rollout_index += 1
 
     _log_stage("generate_rows_complete", generation_start)

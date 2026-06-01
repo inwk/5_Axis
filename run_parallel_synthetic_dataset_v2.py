@@ -33,8 +33,13 @@ SYNTHETIC_DATASET_DIR = os.path.join(SHARED_BASE_DIR, "sdf_dataset_synthetic_v2"
 SYNTHETIC_CSPACE_DEVICE = "auto"  # "auto", "cuda", or "cpu"
 SYNTHETIC_CSPACE_GPU_MAX_PAIRS = 4_000_000
 SYNTHETIC_GRID_RESOLUTION = 160
+SYNTHETIC_FINISH_LOCAL_FINE_SDF = True
+SYNTHETIC_FINISH_LOCAL_GRID_RESOLUTION = 160
+SYNTHETIC_FINISH_LOCAL_PADDING_MM = 5.0
 SYNTHETIC_HOLDER_CSPACE_RESOLUTION = 64
 SYNTHETIC_SCENARIOS_PER_PART = 100
+SYNTHETIC_STEPS_PER_ROLLOUT = 6
+SYNTHETIC_ROUGH_STEPS = 4
 
 
 def _safe_name_component(text: str) -> str:
@@ -141,8 +146,13 @@ def process_static_dir_safe(task: tuple[str, str, str, bool]) -> None:
     env["SYNTHETIC_CSPACE_DEVICE"] = str(SYNTHETIC_CSPACE_DEVICE)
     env["SYNTHETIC_CSPACE_GPU_MAX_PAIRS"] = str(int(SYNTHETIC_CSPACE_GPU_MAX_PAIRS))
     env["SYNTHETIC_GRID_RESOLUTION"] = str(int(SYNTHETIC_GRID_RESOLUTION))
+    env["SYNTHETIC_FINISH_LOCAL_FINE_SDF"] = "1" if bool(SYNTHETIC_FINISH_LOCAL_FINE_SDF) else "0"
+    env["SYNTHETIC_FINISH_LOCAL_GRID_RESOLUTION"] = str(int(SYNTHETIC_FINISH_LOCAL_GRID_RESOLUTION))
+    env["SYNTHETIC_FINISH_LOCAL_PADDING_MM"] = str(float(SYNTHETIC_FINISH_LOCAL_PADDING_MM))
     env["SYNTHETIC_HOLDER_CSPACE_RESOLUTION"] = str(int(SYNTHETIC_HOLDER_CSPACE_RESOLUTION))
     env["SYNTHETIC_SCENARIOS_PER_PART"] = str(int(SYNTHETIC_SCENARIOS_PER_PART))
+    env["SYNTHETIC_STEPS_PER_ROLLOUT"] = str(int(SYNTHETIC_STEPS_PER_ROLLOUT))
+    env["SYNTHETIC_ROUGH_STEPS"] = str(int(SYNTHETIC_ROUGH_STEPS))
 
     try:
         print(f"[Start] synthetic {part_name} (PID: {os.getpid()} pc={pc_slug or '-'}) prep={start_time - task_start:.2f}s log={log_path}", flush=True)
@@ -185,7 +195,9 @@ def main() -> None:
     print(f"Found {len(static_dirs)} static dirs. Completed status is checked inside workers. Starting with {CORES} cores.")
     print(
         f"[Config] grid={SYNTHETIC_GRID_RESOLUTION} holder_cspace={SYNTHETIC_HOLDER_CSPACE_RESOLUTION} "
+        f"finish_local={SYNTHETIC_FINISH_LOCAL_FINE_SDF} local_grid={SYNTHETIC_FINISH_LOCAL_GRID_RESOLUTION} "
         f"rows_per_prt={SYNTHETIC_SCENARIOS_PER_PART} "
+        f"steps_per_rollout={SYNTHETIC_STEPS_PER_ROLLOUT} rough_steps={SYNTHETIC_ROUGH_STEPS} "
         f"cspace_device={SYNTHETIC_CSPACE_DEVICE} gpu_pairs={SYNTHETIC_CSPACE_GPU_MAX_PAIRS}",
         flush=True,
     )
