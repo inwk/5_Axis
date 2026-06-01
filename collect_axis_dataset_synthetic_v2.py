@@ -610,6 +610,7 @@ def _make_kernel_offsets(
     tool_length: float,
     holder_radius: float,
     holder_length: float,
+    max_abs_steps: tuple[int, int, int] | None = None,
 ) -> dict[str, np.ndarray]:
     axis = _unit(axis_dir)
     spacing_arr = np.asarray(spacing, dtype=np.float32).reshape(3)
@@ -617,23 +618,36 @@ def _make_kernel_offsets(
     max_radius = max(float(tool_radius), float(holder_radius), 1e-6)
     half_extent = np.abs(axis) * total_length + max_radius + spacing_arr * 1.5
     max_steps = np.ceil(half_extent / np.maximum(spacing_arr, 1e-9)).astype(np.int32)
+    if max_abs_steps is not None:
+        max_steps = np.minimum(max_steps, np.maximum(np.asarray(max_abs_steps, dtype=np.int32), 0))
     xs = np.arange(-int(max_steps[0]), int(max_steps[0]) + 1, dtype=np.int32)
     ys = np.arange(-int(max_steps[1]), int(max_steps[1]) + 1, dtype=np.int32)
     zs = np.arange(-int(max_steps[2]), int(max_steps[2]) + 1, dtype=np.int32)
-    offsets = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1).reshape(-1, 3)
-    phys = offsets.astype(np.float32) * spacing_arr.reshape(1, 3)
-    s = (phys @ axis.reshape(3, 1)).reshape(-1)
-    radial_vec = phys - s.reshape(-1, 1) * axis.reshape(1, 3)
-    radial = np.linalg.norm(radial_vec, axis=1)
     pad = 0.5 * float(spacing_arr.max())
-    cutter_radius_limit = _radius_limit_at_s(tool_kind, s, float(tool_radius), float(tool_length))
-    cutter_mask = cutter_radius_limit >= 0.0
-    cutter_mask &= radial <= (cutter_radius_limit + pad)
-    holder_mask = (s >= float(tool_length)) & (s <= float(tool_length) + float(holder_length))
-    holder_mask &= radial <= (float(holder_radius) + pad)
+    cutter_chunks: list[np.ndarray] = []
+    holder_chunks: list[np.ndarray] = []
+    x_chunk = max(1, _env_int("SYNTHETIC_KERNEL_X_CHUNK", 8))
+    for start in range(0, xs.size, x_chunk):
+        x_block = xs[start:start + x_chunk]
+        offsets = np.stack(np.meshgrid(x_block, ys, zs, indexing="ij"), axis=-1).reshape(-1, 3)
+        phys = offsets.astype(np.float32) * spacing_arr.reshape(1, 3)
+        s = (phys @ axis.reshape(3, 1)).reshape(-1)
+        radial_vec = phys - s.reshape(-1, 1) * axis.reshape(1, 3)
+        radial = np.linalg.norm(radial_vec, axis=1)
+        cutter_radius_limit = _radius_limit_at_s(tool_kind, s, float(tool_radius), float(tool_length))
+        cutter_mask = cutter_radius_limit >= 0.0
+        cutter_mask &= radial <= (cutter_radius_limit + pad)
+        holder_mask = (s >= float(tool_length)) & (s <= float(tool_length) + float(holder_length))
+        holder_mask &= radial <= (float(holder_radius) + pad)
+        if bool(cutter_mask.any()):
+            cutter_chunks.append(offsets[cutter_mask].astype(np.int32, copy=False))
+        if bool(holder_mask.any()):
+            holder_chunks.append(offsets[holder_mask].astype(np.int32, copy=False))
+    cutter = np.vstack(cutter_chunks) if cutter_chunks else np.empty((0, 3), dtype=np.int32)
+    holder = np.vstack(holder_chunks) if holder_chunks else np.empty((0, 3), dtype=np.int32)
     return {
-        "cutter": np.unique(offsets[cutter_mask], axis=0).astype(np.int32),
-        "holder": np.unique(offsets[holder_mask], axis=0).astype(np.int32),
+        "cutter": np.unique(cutter, axis=0).astype(np.int32, copy=False),
+        "holder": np.unique(holder, axis=0).astype(np.int32, copy=False),
     }
 
 
@@ -844,6 +858,7 @@ def _holder_forbidden_mask(
             tool_length=tool_length,
             holder_radius=holder_radius,
             holder_length=holder_length,
+            max_abs_steps=tuple(max(int(v) - 1, 0) for v in full_dims),
         )
         return _shift_or_mask(obstacle, kernels["holder"])
 
@@ -857,6 +872,7 @@ def _holder_forbidden_mask(
         tool_length=tool_length,
         holder_radius=holder_radius,
         holder_length=holder_length,
+        max_abs_steps=tuple(max(int(v) - 1, 0) for v in coarse_dims),
     )
     coarse_forbidden = _shift_or_mask_cpu(coarse_obstacle, coarse_kernels["holder"])
     return _resample_mask_nearest(coarse_forbidden, full_dims)
@@ -1437,25 +1453,11 @@ def _generate_rows(
         op_start = time.time()
         op_stage = op_start
         op_prefix = f"[Synthetic Op Timing] {part_name} macro={macro_name} face={int(face_id)}"
-        kernels = _make_kernel_offsets(
-            axis_dir=axis_dir,
-            spacing=spacing,
-            tool_kind=str(config["tool_kind"]),
-            tool_radius=float(config["tool_radius"]),
-            tool_length=float(config["tool_length"]),
-            holder_radius=float(config["holder_radius"]),
-            holder_length=float(config["holder_length"]),
-        )
-        now = time.time()
         print(
-            f"{op_prefix} make_kernels={now - op_stage:.2f}s "
-            f"cutter_offsets={int(kernels['cutter'].shape[0])} "
-            f"holder_offsets={int(kernels['holder'].shape[0])} "
-            f"tool={config['tool_kind']} dia={float(config['tool_diameter']):.3f} "
+            f"{op_prefix} tool={config['tool_kind']} dia={float(config['tool_diameter']):.3f} "
             f"tool_len={float(config['tool_length']):.3f} holder_dia={float(config['holder_diameter']):.3f}",
             flush=True,
         )
-        op_stage = now
         holder_obstacle = current_solid if macro_name == "indexed_rough" else target_solid
         holder_forbidden = _holder_forbidden_mask(
             obstacle=holder_obstacle,
@@ -1521,6 +1523,23 @@ def _generate_rows(
             )
             op_stage = now
         else:
+            kernels = _make_kernel_offsets(
+                axis_dir=axis_dir,
+                spacing=spacing,
+                tool_kind=str(config["tool_kind"]),
+                tool_radius=float(config["tool_radius"]),
+                tool_length=float(config["tool_length"]),
+                holder_radius=float(config["holder_radius"]),
+                holder_length=float(config["holder_length"]),
+                max_abs_steps=tuple(max(int(v) - 1, 0) for v in dims),
+            )
+            now = time.time()
+            print(
+                f"{op_prefix} make_cutter_kernel={now - op_stage:.2f}s "
+                f"cutter_offsets={int(kernels['cutter'].shape[0])}",
+                flush=True,
+            )
+            op_stage = now
             swept_volume = _dilate_config_mask(config_candidates, kernels["cutter"])
             now = time.time()
             print(

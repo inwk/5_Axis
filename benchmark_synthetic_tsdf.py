@@ -367,6 +367,7 @@ def _operation_masks(
             tool_length=float(config["tool_length"]),
             holder_radius=float(config["holder_radius"]),
             holder_length=float(config["holder_length"]),
+            max_abs_steps=tuple(max(int(v) - 1, 0) for v in dims),
         )
         swept_volume = _dilate_config_mask(config_candidates, kernels["cutter"])
         removed = ideal_removal & roi & swept_volume
