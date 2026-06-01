@@ -34,7 +34,7 @@ SYNTHETIC_CSPACE_DEVICE = "auto"  # "auto", "cuda", or "cpu"
 SYNTHETIC_CSPACE_GPU_MAX_PAIRS = 4_000_000
 SYNTHETIC_GRID_RESOLUTION = 160
 SYNTHETIC_HOLDER_CSPACE_RESOLUTION = 64
-SYNTHETIC_SCENARIOS_PER_PART = 200
+SYNTHETIC_SCENARIOS_PER_PART = 100
 
 
 def _safe_name_component(text: str) -> str:
@@ -87,14 +87,18 @@ def _already_processed(part_name: str, output_root: str, seed: int, pc_name: str
 
 def _resolve_static_dirs(root: Path) -> list[Path]:
     candidates = [Path(path).resolve() for path in glob.glob(str(root / "*")) if Path(path).is_dir()]
-    return [path for path in candidates if _is_completed_static_dir(path)]
+    return candidates
 
 
 def process_static_dir_safe(task: tuple[str, str, str, bool]) -> None:
     task_start = time.time()
     static_dir_raw, output_root, pc_name, force = task
     static_dir = Path(static_dir_raw).expanduser().resolve()
-    part_name = _part_name_from_static(static_dir)
+    manifest = _load_static_manifest(static_dir)
+    if not manifest or manifest.get("status") != "completed":
+        print(f"[Skip] synthetic {static_dir.name} incomplete_static check={time.time() - task_start:.2f}s", flush=True)
+        return
+    part_name = str(manifest.get("part_name") or static_dir.name)
     pc_slug = _safe_name_component(pc_name)
     output_root_path = Path(output_root).expanduser().resolve()
     output_root_path.mkdir(parents=True, exist_ok=True)
@@ -178,7 +182,7 @@ def main() -> None:
     print(f"Worker Script: {Path(WORKER_SCRIPT).resolve()}")
     print(f"Static embedding root: {static_root}")
     print(f"Synthetic dataset root: {output_root}")
-    print(f"Found {len(static_dirs)} completed static dirs. Starting with {CORES} cores.")
+    print(f"Found {len(static_dirs)} static dirs. Completed status is checked inside workers. Starting with {CORES} cores.")
     print(
         f"[Config] grid={SYNTHETIC_GRID_RESOLUTION} holder_cspace={SYNTHETIC_HOLDER_CSPACE_RESOLUTION} "
         f"rows_per_prt={SYNTHETIC_SCENARIOS_PER_PART} "

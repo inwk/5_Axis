@@ -436,7 +436,9 @@ def _grid_from_mesh(mesh, resolution: int, padding_ratio: float, padding_mm: flo
     return points.astype(np.float32), dims, bbox_min.astype(np.float32), bbox_max.astype(np.float32), spacing
 
 
-def _mesh_signed_distance_negative_inside(mesh, points: np.ndarray, chunk: int = 200_000) -> np.ndarray:
+def _mesh_signed_distance_negative_inside(mesh, points: np.ndarray, chunk: int | None = None) -> np.ndarray:
+    distance_chunk = max(1, int(chunk or _env_int("SYNTHETIC_MESH_SDF_DISTANCE_CHUNK", 100_000)))
+    contains_chunk = max(1, _env_int("SYNTHETIC_MESH_CONTAINS_CHUNK", 10_000))
     if isinstance(mesh, dict):
         try:
             import pyvista as pv
@@ -447,8 +449,8 @@ def _mesh_signed_distance_negative_inside(mesh, points: np.ndarray, chunk: int =
         tree = cKDTree(vertices)
         poly = mesh["polydata"]
         out = np.empty((points.shape[0],), dtype=np.float32)
-        for start in range(0, points.shape[0], max(1, int(chunk))):
-            stop = min(start + max(1, int(chunk)), points.shape[0])
+        for start in range(0, points.shape[0], distance_chunk):
+            stop = min(start + distance_chunk, points.shape[0])
             pts = points[start:stop].astype(np.float32, copy=False)
             dist, _ = tree.query(pts, k=1, workers=-1)
             cloud = pv.PolyData(pts)
@@ -463,8 +465,8 @@ def _mesh_signed_distance_negative_inside(mesh, points: np.ndarray, chunk: int =
         prox = mesh.nearest
     except Exception:
         prox = None
-    for start in range(0, points.shape[0], max(1, int(chunk))):
-        stop = min(start + max(1, int(chunk)), points.shape[0])
+    for start in range(0, points.shape[0], distance_chunk):
+        stop = min(start + distance_chunk, points.shape[0])
         pts = points[start:stop].astype(np.float64, copy=False)
         try:
             raw_signed = np.asarray(mesh.nearest.signed_distance(pts), dtype=np.float64)
@@ -474,7 +476,10 @@ def _mesh_signed_distance_negative_inside(mesh, points: np.ndarray, chunk: int =
                 raise
             closest, dist, _ = prox.on_surface(pts)
             dist = np.asarray(dist, dtype=np.float64)
-        inside = np.asarray(mesh.contains(pts), dtype=bool)
+        inside = np.empty((pts.shape[0],), dtype=bool)
+        for inner_start in range(0, pts.shape[0], contains_chunk):
+            inner_stop = min(inner_start + contains_chunk, pts.shape[0])
+            inside[inner_start:inner_stop] = np.asarray(mesh.contains(pts[inner_start:inner_stop]), dtype=bool)
         out[start:stop] = np.where(inside, -dist, dist).astype(np.float32)
     return out
 
@@ -1390,7 +1395,7 @@ def collect_synthetic_episode(prt_path: str, out_root: str, seed: int, pc_name: 
             "and a complete static feature directory."
         )
 
-    max_rows = max(1, _env_int("SYNTHETIC_SCENARIOS_PER_PART", 200))
+    max_rows = max(1, _env_int("SYNTHETIC_SCENARIOS_PER_PART", 100))
     rows = _generate_rows(
         prt_path=prt_path,
         out_dir=out_dir,
@@ -1402,18 +1407,14 @@ def collect_synthetic_episode(prt_path: str, out_root: str, seed: int, pc_name: 
         raise ValueError(f"No synthetic rows generated for {prt_path}")
 
     parquet_path = out_dir / f"{part_name}_seed{int(seed)}_{DEFAULT_OUTPUT_BASENAME}"
-    chosen_path = out_dir / f"{part_name}_seed{int(seed)}_process_skeleton_dataset_chosen_only.parquet"
     _write_rows_to_parquet(rows, parquet_path)
-    _write_rows_to_parquet(rows, chosen_path)
 
     pc_slug = _safe_filename(pc_name)
     parquet_run_name = _strip_pc_suffix(out_dir.name, pc_slug)
     global_dir = Path(out_root).expanduser().resolve() / "_ALL_PARQUET_FILES"
     global_dir.mkdir(parents=True, exist_ok=True)
     global_parquet = global_dir / f"{parquet_run_name}.parquet"
-    global_chosen = global_dir / f"{parquet_run_name}_chosen_only.parquet"
     shutil.copy2(parquet_path, global_parquet)
-    shutil.copy2(chosen_path, global_chosen)
 
     episode_record = {
         "part_name": part_name,
@@ -1427,9 +1428,7 @@ def collect_synthetic_episode(prt_path: str, out_root: str, seed: int, pc_name: 
         "termination": {"reason": "synthetic_scenario_generation_complete"},
         "outputs": {
             "parquet_path": str(parquet_path),
-            "chosen_parquet_path": str(chosen_path),
             "global_parquet_path": str(global_parquet),
-            "global_chosen_parquet_path": str(global_chosen),
         },
     }
     (out_dir / "episode_record.json").write_text(

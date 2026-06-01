@@ -82,7 +82,7 @@ def generate_from_static_dir(
             "dataset_dir": str(out_dir),
         }
 
-    max_rows = max(1, int(os.getenv("SYNTHETIC_SCENARIOS_PER_PART", "200")))
+    max_rows = max(1, int(os.getenv("SYNTHETIC_SCENARIOS_PER_PART", "100")))
     rows_start = time.time()
     print(f"[Worker Timing] generate_rows_start part={part_name} max_rows={max_rows}", flush=True)
     rows = _generate_rows(
@@ -97,11 +97,9 @@ def generate_from_static_dir(
         raise ValueError(f"No synthetic rows generated for {static_path}")
 
     parquet_path = out_dir / f"{part_name}_seed{int(seed)}_process_skeleton_dataset.parquet"
-    chosen_path = out_dir / f"{part_name}_seed{int(seed)}_process_skeleton_dataset_chosen_only.parquet"
     write_start = time.time()
     print(f"[Worker Timing] write_parquet_start part={part_name}", flush=True)
     _write_rows_to_parquet(rows, parquet_path)
-    _write_rows_to_parquet(rows, chosen_path)
     print(f"[Worker Timing] write_parquet_done part={part_name} elapsed={time.time() - write_start:.2f}s total={time.time() - total_start:.2f}s", flush=True)
 
     global_dir = out_root / "_ALL_PARQUET_FILES"
@@ -110,10 +108,8 @@ def generate_from_static_dir(
     if pc_slug:
         global_stem = f"{global_stem}_{pc_slug}"
     global_parquet = global_dir / f"{global_stem}.parquet"
-    global_chosen = global_dir / f"{global_stem}_chosen_only.parquet"
     copy_start = time.time()
     shutil.copy2(parquet_path, global_parquet)
-    shutil.copy2(chosen_path, global_chosen)
     print(f"[Worker Timing] copy_global_done part={part_name} elapsed={time.time() - copy_start:.2f}s total={time.time() - total_start:.2f}s", flush=True)
 
     episode_record = {
@@ -130,9 +126,7 @@ def generate_from_static_dir(
         "termination": {"reason": "synthetic_scenario_generation_complete"},
         "outputs": {
             "parquet_path": str(parquet_path),
-            "chosen_parquet_path": str(chosen_path),
             "global_parquet_path": str(global_parquet),
-            "global_chosen_parquet_path": str(global_chosen),
         },
     }
     (out_dir / "episode_record.json").write_text(
