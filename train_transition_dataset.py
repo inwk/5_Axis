@@ -25,10 +25,15 @@ from graph_sdf.training import transition_train_step, transition_validation_step
 # ---------------------------------------------------------------------------
 # User config: edit these directly in VSCode.
 # ---------------------------------------------------------------------------
-PARQUET_DIR = r""
+PARQUET_DIR = os.getenv("PARQUET_DIR", r"")
+PARQUET_LIST_PATH = os.getenv("PARQUET_LIST_PATH", r"")
 # Use "**/*.parquet" to include run subdirectories under PARQUET_DIR.
-PARQUET_GLOB = "**/*.parquet"
-EXPLICIT_PARQUET_PATHS: list[str] = [r"Y:\04_개별폴더\22. 통합과정 오인욱\sdf_dataset_out\_ALL_PARQUET_FILES\3dDataset3063_seed0_20260523_232918.parquet"]
+PARQUET_GLOB = os.getenv("PARQUET_GLOB", "**/*.parquet")
+EXPLICIT_PARQUET_PATHS = [
+    p.strip()
+    for p in os.getenv("EXPLICIT_PARQUET_PATHS", "").split(os.pathsep)
+    if p.strip()
+]
 SPLIT_MANIFEST_PATH = os.getenv("PILOT_SPLIT_MANIFEST", r"")
 TRAIN_SPLIT_NAME = os.getenv("PILOT_TRAIN_SPLIT", "train")
 VAL_SPLIT_NAME = os.getenv("PILOT_VAL_SPLIT", "val")
@@ -52,7 +57,7 @@ LOCALITY_SORT_LAZY_INDICES = True
 SPLIT_BY_PART = bool(int(os.getenv("SPLIT_BY_PART", "1")))
 SDF_RESAMPLE_EACH_EPOCH = False
 USE_TARGET_TSDF_INPUT = True
-OVERFIT_DEBUG_MODE = "one_part"
+OVERFIT_DEBUG_MODE = os.getenv("OVERFIT_DEBUG_MODE", "").strip()
 OVERFIT_PART_NAME = os.getenv("OVERFIT_PART_NAME", "").strip()
 
 # Optional StateEncoder initialization from SSL pretraining.
@@ -86,6 +91,8 @@ AFFECTED_FACE_DELTA_LOSS_WEIGHT = 0.1
 SAVE_CHECKPOINTS = False
 CHECKPOINT_ROOT = r"C:\Users\inwoo\Desktop\5_Axis\checkpoints_transition"
 RUN_NAME = os.getenv("RUN_NAME", "")
+RESUME_CHECKPOINT = os.getenv("RESUME_CHECKPOINT", "").strip()
+RESUME_OPTIMIZER = bool(int(os.getenv("RESUME_OPTIMIZER", "1")))
 
 
 def _cuda_memory_text() -> str:
@@ -172,10 +179,20 @@ def _resolve_parquet_files() -> list[str]:
     files: list[Path] = []
     if EXPLICIT_PARQUET_PATHS:
         files.extend(Path(p).expanduser().resolve() for p in EXPLICIT_PARQUET_PATHS if str(p).strip())
+    elif PARQUET_LIST_PATH:
+        list_path = Path(PARQUET_LIST_PATH).expanduser().resolve()
+        if not list_path.exists():
+            raise FileNotFoundError(f"PARQUET_LIST_PATH not found: {list_path}")
+        entries = [
+            line.strip()
+            for line in list_path.read_text(encoding="utf-8-sig").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        files.extend(Path(p).expanduser().resolve() for p in entries)
     elif PARQUET_DIR:
         files.extend(sorted(Path(PARQUET_DIR).expanduser().resolve().glob(PARQUET_GLOB)))
     else:
-        raise ValueError("Set either EXPLICIT_PARQUET_PATHS or PARQUET_DIR at the top of train_transition_dataset.py")
+        raise ValueError("Set EXPLICIT_PARQUET_PATHS, PARQUET_LIST_PATH, or PARQUET_DIR.")
 
     unique_files = []
     seen = set()
@@ -873,6 +890,57 @@ def _save_checkpoint(
     )
 
 
+def _load_transition_checkpoint(
+    checkpoint_path: str,
+    model: GraphSdfPlanningModel,
+    optimizer: torch.optim.Optimizer | None,
+    *,
+    load_optimizer: bool = True,
+) -> dict[str, object]:
+    path = Path(checkpoint_path).expanduser().resolve()
+
+    if not path.is_file():
+        raise FileNotFoundError(f"RESUME_CHECKPOINT not found: {path}")
+
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location="cpu")
+
+    if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+        raise ValueError(f"Unsupported transition checkpoint format: {path}")
+
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+
+    optimizer_loaded = False
+    if load_optimizer and optimizer is not None and "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        optimizer_loaded = True
+
+    return {
+        "checkpoint_path": str(path),
+        "epoch": int(checkpoint.get("epoch", 0)),
+        "train_loss": float(checkpoint.get("train_loss", float("nan"))),
+        "val_loss": float(checkpoint.get("val_loss", float("nan"))),
+        "optimizer_loaded": optimizer_loaded,
+    }
+
+
+def _read_checkpoint_val_loss(checkpoint_path: Path) -> float | None:
+    if not checkpoint_path.is_file():
+        return None
+
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+    if not isinstance(checkpoint, dict) or "val_loss" not in checkpoint:
+        return None
+
+    return float(checkpoint["val_loss"])
+
+
 def _limited_batches(loader, max_batches: int):
     for batch_idx, batch in enumerate(loader, start=1):
         if max_batches > 0 and batch_idx > max_batches:
@@ -1036,12 +1104,34 @@ def main() -> None:
         freeze_state_encoder=FREEZE_STATE_ENCODER,
     )
 
+    resume_info: dict[str, object] | None = None
+    start_epoch = 1
+    best_val_loss = float("inf")
+    if RESUME_CHECKPOINT:
+        resume_info = _load_transition_checkpoint(
+            RESUME_CHECKPOINT,
+            model,
+            optimizer,
+            load_optimizer=bool(RESUME_OPTIMIZER),
+        )
+        start_epoch = int(resume_info["epoch"]) + 1
+        best_val_loss = float(resume_info["val_loss"])
+
     run_dir = _make_run_dir()
+    existing_best_val_loss: float | None = None
+    if run_dir is not None and resume_info is not None:
+        existing_best_val_loss = _read_checkpoint_val_loss(run_dir / "best.pt")
+        if existing_best_val_loss is not None:
+            best_val_loss = min(best_val_loss, existing_best_val_loss)
     if run_dir is not None:
         _save_json(
             run_dir / "run_config.json",
             {
                 "parquet_files": parquet_files,
+                "parquet_list_path": PARQUET_LIST_PATH,
+                "static_feature_root": os.getenv("STATIC_FEATURE_ROOT", ""),
+                "static_feature_roots": os.getenv("STATIC_FEATURE_ROOTS", ""),
+                "graph_sdf_static_feature_roots": os.getenv("GRAPH_SDF_STATIC_FEATURE_ROOTS", ""),
                 "split_manifest_path": SPLIT_MANIFEST_PATH,
                 "train_split_name": TRAIN_SPLIT_NAME,
                 "val_split_name": VAL_SPLIT_NAME,
@@ -1086,6 +1176,10 @@ def main() -> None:
                 "pretrained_encoder_checkpoint": PRETRAINED_ENCODER_CHECKPOINT,
                 "pretrained_encoder_strict": PRETRAINED_ENCODER_STRICT,
                 "pretrained_encoder_info": pretrained_encoder_info,
+                "resume_checkpoint": RESUME_CHECKPOINT,
+                "resume_optimizer": RESUME_OPTIMIZER,
+                "resume_info": resume_info,
+                "existing_best_val_loss": existing_best_val_loss,
                 "freeze_state_encoder": FREEZE_STATE_ENCODER,
                 "state_encoder_lr_multiplier": STATE_ENCODER_LR_MULTIPLIER,
                 "model_config": asdict(model_cfg),
@@ -1139,11 +1233,27 @@ def main() -> None:
     print(f"[Val Macro Dist] { _macro_distribution(macro_val_dataset, val_indices) }")
     if run_dir is not None:
         print(f"[Checkpoint Dir] {run_dir}")
+    if resume_info is not None:
+        print(
+            "[Resume] "
+            f"loaded={resume_info['checkpoint_path']} "
+            f"epoch={resume_info['epoch']} "
+            f"train_loss={resume_info['train_loss']:.6f} "
+            f"val_loss={resume_info['val_loss']:.6f} "
+            f"optimizer_loaded={resume_info['optimizer_loaded']} "
+            f"start_epoch={start_epoch}"
+        )
     print(f"[Memory] {_cuda_memory_text()}")
 
-    best_val_loss = float("inf")
+    if start_epoch > NUM_EPOCHS:
+        print(
+            f"[Resume] start_epoch={start_epoch} is greater than NUM_EPOCHS={NUM_EPOCHS}; "
+            "nothing to train.",
+            flush=True,
+        )
+        return
 
-    for epoch in range(1, NUM_EPOCHS + 1):
+    for epoch in range(start_epoch, NUM_EPOCHS + 1):
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         _set_dataset_sdf_sample_epoch(train_dataset, epoch if SDF_RESAMPLE_EACH_EPOCH else 0)

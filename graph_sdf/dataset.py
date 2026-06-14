@@ -78,6 +78,22 @@ class ProcessSkeletonParquetDataset(Dataset):
         """Infers candidate sdf_dataset_out roots from the parquet file locations."""
         roots: list[Path] = []
         seen: set[str] = set()
+
+        env_roots = os.getenv("GRAPH_SDF_STATIC_FEATURE_ROOTS", "").strip()
+        if not env_roots:
+            env_roots = os.getenv("STATIC_FEATURE_ROOTS", "").strip()
+        if not env_roots:
+            env_roots = os.getenv("STATIC_FEATURE_ROOT", "").strip()
+        for item in env_roots.split(os.pathsep):
+            if not item.strip():
+                continue
+            candidate = Path(item.strip()).expanduser()
+            key = str(candidate).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            roots.append(candidate)
+
         for file_path in files:
             path = Path(file_path).expanduser()
             parent = path.parent
