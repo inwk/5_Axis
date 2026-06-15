@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import time
 from datetime import datetime
@@ -24,6 +25,8 @@ from collect_axis_dataset_synthetic_v2 import (
     _safe_filename,
     _write_rows_to_parquet,
 )
+
+_OUTPUT_NAME_RE = re.compile(r"^(?P<part>.+)_seed(?P<seed>\d+)(?:_(?P<suffix>.*))?$")
 
 
 def _load_static_manifest(static_dir: Path) -> dict:
@@ -46,6 +49,16 @@ def _is_completed_dataset_dir(path: Path, part_name: str, seed: int) -> bool:
     return isinstance(termination, dict) and bool(termination.get("reason"))
 
 
+def _parse_output_part_seed(name: str) -> tuple[str, int] | None:
+    stem = Path(name).stem
+    if stem.endswith("_chosen_only"):
+        return None
+    match = _OUTPUT_NAME_RE.match(stem)
+    if not match:
+        return None
+    return str(match.group("part")), int(match.group("seed"))
+
+
 def _find_existing_dataset_for_part_seed(out_root: Path, part_name: str, seed: int) -> Path | None:
     """Finds any completed output for this part+seed, independent of PC suffix."""
     stem = f"{part_name}_seed{int(seed)}"
@@ -56,7 +69,8 @@ def _find_existing_dataset_for_part_seed(out_root: Path, part_name: str, seed: i
     global_dir = out_root / "_ALL_PARQUET_FILES"
     if global_dir.exists():
         for candidate in sorted(global_dir.glob(f"{stem}*.parquet")):
-            if candidate.is_file() and candidate.stat().st_size > 0:
+            key = _parse_output_part_seed(candidate.name)
+            if key == (part_name, int(seed)) and candidate.is_file() and candidate.stat().st_size > 0:
                 return candidate
     return None
 
