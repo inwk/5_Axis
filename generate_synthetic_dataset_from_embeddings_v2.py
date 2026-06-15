@@ -46,6 +46,21 @@ def _is_completed_dataset_dir(path: Path, part_name: str, seed: int) -> bool:
     return isinstance(termination, dict) and bool(termination.get("reason"))
 
 
+def _find_existing_dataset_for_part_seed(out_root: Path, part_name: str, seed: int) -> Path | None:
+    """Finds any completed output for this part+seed, independent of PC suffix."""
+    stem = f"{part_name}_seed{int(seed)}"
+    for candidate in sorted(out_root.glob(f"{stem}*")):
+        if candidate.is_dir() and _is_completed_dataset_dir(candidate, part_name, seed):
+            return candidate
+
+    global_dir = out_root / "_ALL_PARQUET_FILES"
+    if global_dir.exists():
+        for candidate in sorted(global_dir.glob(f"{stem}*.parquet")):
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate
+    return None
+
+
 def generate_from_static_dir(
     static_dir: str,
     output_root: str,
@@ -69,18 +84,23 @@ def generate_from_static_dir(
     out_dir = out_root / f"{part_name}_seed{int(seed)}"
     if pc_slug:
         out_dir = out_root / f"{part_name}_seed{int(seed)}_{pc_slug}"
+    if not force:
+        existing = _find_existing_dataset_for_part_seed(out_root, part_name, seed)
+        if existing is not None:
+            print(
+                f"[Worker Timing] skipped_existing_any_pc total={time.time() - total_start:.2f}s "
+                f"part={part_name} existing={existing}",
+                flush=True,
+            )
+            return {
+                "status": "skipped_existing",
+                "part_name": part_name,
+                "static_feature_dir": str(static_path),
+                "dataset_dir": str(existing),
+            }
     if force and out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    if not force and _is_completed_dataset_dir(out_dir, part_name, seed):
-        print(f"[Worker Timing] skipped_existing total={time.time() - total_start:.2f}s part={part_name}", flush=True)
-        return {
-            "status": "skipped_existing",
-            "part_name": part_name,
-            "static_feature_dir": str(static_path),
-            "dataset_dir": str(out_dir),
-        }
 
     max_rows = max(1, int(os.getenv("SYNTHETIC_SCENARIOS_PER_PART", "100")))
     rows_start = time.time()

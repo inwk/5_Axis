@@ -76,8 +76,7 @@ def _dataset_dir(part_name: str, output_root: str, seed: int, pc_name: str = "")
     return Path(output_root).expanduser().resolve() / stem
 
 
-def _already_processed(part_name: str, output_root: str, seed: int, pc_name: str = "") -> bool:
-    out_dir = _dataset_dir(part_name, output_root, seed, pc_name)
+def _is_completed_dataset_dir(out_dir: Path, part_name: str, seed: int) -> bool:
     episode_path = out_dir / "episode_record.json"
     parquet_path = out_dir / f"{part_name}_seed{int(seed)}_process_skeleton_dataset.parquet"
     if not episode_path.exists() or not parquet_path.exists():
@@ -88,6 +87,22 @@ def _already_processed(part_name: str, output_root: str, seed: int, pc_name: str
         return False
     termination = episode.get("termination", {})
     return isinstance(termination, dict) and bool(termination.get("reason"))
+
+
+def _already_processed(part_name: str, output_root: str, seed: int, pc_name: str = "") -> bool:
+    del pc_name
+    out_root = Path(output_root).expanduser().resolve()
+    stem = f"{part_name}_seed{int(seed)}"
+    for out_dir in sorted(out_root.glob(f"{stem}*")):
+        if out_dir.is_dir() and _is_completed_dataset_dir(out_dir, part_name, seed):
+            return True
+
+    global_dir = out_root / "_ALL_PARQUET_FILES"
+    if global_dir.exists():
+        for parquet_path in sorted(global_dir.glob(f"{stem}*.parquet")):
+            if parquet_path.is_file() and parquet_path.stat().st_size > 0:
+                return True
+    return False
 
 
 def _resolve_static_dirs(root: Path) -> list[Path]:
