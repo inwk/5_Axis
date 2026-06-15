@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,8 @@ EXPLICIT_PARQUET_PATHS = [
 SPLIT_MANIFEST_PATH = os.getenv("PILOT_SPLIT_MANIFEST", r"")
 TRAIN_SPLIT_NAME = os.getenv("PILOT_TRAIN_SPLIT", "train")
 VAL_SPLIT_NAME = os.getenv("PILOT_VAL_SPLIT", "val")
+SKIP_MISSING_PARQUET_FILES = bool(int(os.getenv("SKIP_MISSING_PARQUET_FILES", "1")))
+REMAP_MISSING_PARQUET_FILES = bool(int(os.getenv("REMAP_MISSING_PARQUET_FILES", "1")))
 
 VAL_RATIO = 0.2
 SEED = 0
@@ -93,6 +96,8 @@ CHECKPOINT_ROOT = r"C:\Users\inwoo\Desktop\5_Axis\checkpoints_transition"
 RUN_NAME = os.getenv("RUN_NAME", "")
 RESUME_CHECKPOINT = os.getenv("RESUME_CHECKPOINT", "").strip()
 RESUME_OPTIMIZER = bool(int(os.getenv("RESUME_OPTIMIZER", "1")))
+
+_PARQUET_NAME_RE = re.compile(r"^(?P<part>.+)_seed(?P<seed>\d+)(?:_(?P<suffix>.*))?$")
 
 
 def _cuda_memory_text() -> str:
@@ -175,6 +180,84 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _parse_parquet_part_seed(path: Path) -> tuple[str, int] | None:
+    stem = path.stem
+    if stem.endswith("_chosen_only"):
+        return None
+    match = _PARQUET_NAME_RE.match(stem)
+    if not match:
+        return None
+    return str(match.group("part")), int(match.group("seed"))
+
+
+def _find_same_part_seed_parquet(path: Path) -> Path | None:
+    key = _parse_parquet_part_seed(path)
+    if key is None:
+        return None
+    parent = path.parent
+    if not parent.exists():
+        return None
+
+    part, seed = key
+    matches = []
+    for candidate in parent.glob(f"{part}_seed{seed}*.parquet"):
+        if _parse_parquet_part_seed(candidate) != key:
+            continue
+        if not candidate.is_file():
+            continue
+        try:
+            stat = candidate.stat()
+        except OSError:
+            continue
+        size = stat.st_size
+        if size <= 0:
+            continue
+        matches.append((size, stat.st_mtime, candidate.name, candidate))
+    if not matches:
+        return None
+    return max(matches)[3]
+
+
+def _dedupe_and_filter_parquet_files(files: list[Path], source: str) -> list[str]:
+    unique_files: list[str] = []
+    seen = set()
+    missing_count = 0
+    remapped_count = 0
+    for path in files:
+        effective_path = path
+        if not path.exists():
+            replacement = _find_same_part_seed_parquet(path) if REMAP_MISSING_PARQUET_FILES else None
+            if replacement is not None:
+                effective_path = replacement
+                remapped_count += 1
+            elif not SKIP_MISSING_PARQUET_FILES:
+                raise FileNotFoundError(f"Parquet file not found: {path}")
+            else:
+                missing_count += 1
+                continue
+        key = str(effective_path).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_files.append(str(effective_path))
+
+    if remapped_count:
+        print(
+            f"[Parquet Warning] remapped_missing_files={remapped_count} source={source} "
+            f"set REMAP_MISSING_PARQUET_FILES=0 to disable",
+            flush=True,
+        )
+    if missing_count:
+        print(
+            f"[Parquet Warning] skipped_missing_files={missing_count} source={source} "
+            f"set SKIP_MISSING_PARQUET_FILES=0 to fail instead",
+            flush=True,
+        )
+    if not unique_files:
+        raise ValueError(f"No parquet files available after filtering missing files from {source}.")
+    return unique_files
+
+
 def _resolve_parquet_files() -> list[str]:
     files: list[Path] = []
     if EXPLICIT_PARQUET_PATHS:
@@ -194,20 +277,7 @@ def _resolve_parquet_files() -> list[str]:
     else:
         raise ValueError("Set EXPLICIT_PARQUET_PATHS, PARQUET_LIST_PATH, or PARQUET_DIR.")
 
-    unique_files = []
-    seen = set()
-    for path in files:
-        key = str(path).lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        if not path.exists():
-            raise FileNotFoundError(f"Parquet file not found: {path}")
-        unique_files.append(str(path))
-
-    if not unique_files:
-        raise ValueError("No parquet files matched the configured paths.")
-    return unique_files
+    return _dedupe_and_filter_parquet_files(files, "configured paths")
 
 
 def _load_manifest_files(manifest_path: str, split_name: str) -> list[str]:
@@ -218,13 +288,10 @@ def _load_manifest_files(manifest_path: str, split_name: str) -> list[str]:
     splits = payload.get("splits", {})
     if split_name not in splits:
         raise KeyError(f"Split {split_name!r} not found in manifest: {path}")
-    files = [str(Path(p).expanduser().resolve()) for p in splits[split_name]]
+    files = [Path(p).expanduser().resolve() for p in splits[split_name]]
     if not files:
         raise ValueError(f"Manifest split {split_name!r} has no parquet files: {path}")
-    for file_path in files:
-        if not Path(file_path).exists():
-            raise FileNotFoundError(f"Parquet file from manifest not found: {file_path}")
-    return files
+    return _dedupe_and_filter_parquet_files(files, f"manifest:{split_name}")
 
 
 def _cap_files(files: list[str], max_files: int) -> list[str]:

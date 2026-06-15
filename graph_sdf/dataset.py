@@ -44,6 +44,28 @@ class ProcessSkeletonParquetDataset(Dataset):
         files = [str(Path(path)) for path in parquet_files]
         if not files:
             raise ValueError("At least one parquet file is required")
+        self._skip_missing_parquet_files = os.getenv("SKIP_MISSING_PARQUET_FILES", "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if self._skip_missing_parquet_files:
+            existing_files: list[str] = []
+            missing_count = 0
+            for path in files:
+                if Path(path).exists():
+                    existing_files.append(path)
+                else:
+                    missing_count += 1
+            if missing_count:
+                print(
+                    f"[Dataset Warning] skipped_missing_parquet_files={missing_count} during dataset init",
+                    flush=True,
+                )
+            files = existing_files
+            if not files:
+                raise ValueError("No parquet files remain after filtering missing files")
 
         self.parquet_files = files
         self._static_feature_roots = self._infer_static_feature_roots(files)
@@ -70,7 +92,20 @@ class ProcessSkeletonParquetDataset(Dataset):
             self.df = None
             self._init_lazy_index(files)
         else:
-            frames = [pd.read_parquet(path) for path in files]
+            frames = []
+            skipped = 0
+            for path in files:
+                try:
+                    frames.append(pd.read_parquet(path))
+                except (FileNotFoundError, OSError) as exc:
+                    if not self._skip_missing_parquet_files:
+                        raise
+                    skipped += 1
+                    print(f"[Dataset Warning] skipped_unreadable_parquet={path} reason={exc}", flush=True)
+            if skipped:
+                print(f"[Dataset Warning] skipped_unreadable_parquet_files={skipped}", flush=True)
+            if not frames:
+                raise ValueError("No parquet frames remain after filtering unreadable files")
             self.df = pd.concat(frames, ignore_index=True)
 
     @staticmethod
@@ -117,8 +152,16 @@ class ProcessSkeletonParquetDataset(Dataset):
             raise RuntimeError("lazy_load=True requires pyarrow to read parquet row-group metadata") from exc
 
         total = 0
+        skipped = 0
         for path in files:
-            parquet_file = pq.ParquetFile(path)
+            try:
+                parquet_file = pq.ParquetFile(path)
+            except (FileNotFoundError, OSError) as exc:
+                if not self._skip_missing_parquet_files:
+                    raise
+                skipped += 1
+                print(f"[Dataset Warning] skipped_unreadable_parquet={path} reason={exc}", flush=True)
+                continue
             for row_group_index in range(parquet_file.metadata.num_row_groups):
                 row_count = int(parquet_file.metadata.row_group(row_group_index).num_rows)
                 if row_count <= 0:
@@ -126,6 +169,10 @@ class ProcessSkeletonParquetDataset(Dataset):
                 self._row_group_refs.append((path, int(row_group_index), row_count))
                 total += row_count
                 self._row_group_ends.append(total)
+        if skipped:
+            print(f"[Dataset Warning] skipped_unreadable_parquet_files={skipped}", flush=True)
+        if total <= 0:
+            raise ValueError("No parquet rows available after lazy index initialization")
 
     def _schema_names_for_file(self, path: str) -> set[str]:
         """Returns top-level parquet schema names with a small per-file cache."""
