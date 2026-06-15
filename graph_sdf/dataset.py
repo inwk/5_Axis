@@ -114,6 +114,13 @@ class ProcessSkeletonParquetDataset(Dataset):
         roots: list[Path] = []
         seen: set[str] = set()
 
+        def add_root(candidate: Path) -> None:
+            key = str(candidate).lower()
+            if key in seen:
+                return
+            seen.add(key)
+            roots.append(candidate)
+
         env_roots = os.getenv("GRAPH_SDF_STATIC_FEATURE_ROOTS", "").strip()
         if not env_roots:
             env_roots = os.getenv("STATIC_FEATURE_ROOTS", "").strip()
@@ -122,12 +129,7 @@ class ProcessSkeletonParquetDataset(Dataset):
         for item in env_roots.split(os.pathsep):
             if not item.strip():
                 continue
-            candidate = Path(item.strip()).expanduser()
-            key = str(candidate).lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            roots.append(candidate)
+            add_root(Path(item.strip()).expanduser())
 
         for file_path in files:
             path = Path(file_path).expanduser()
@@ -137,11 +139,9 @@ class ProcessSkeletonParquetDataset(Dataset):
                 candidates.append(parent.parent)
             candidates.extend([parent, parent.parent])
             for candidate in candidates:
-                key = str(candidate).lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                roots.append(candidate)
+                add_root(candidate)
+                if candidate.name == "sdf_dataset_synthetic_v2":
+                    add_root(candidate.parent / "sdf_static_embeddings")
         return roots
 
     def _init_lazy_index(self, files: list[str]) -> None:
