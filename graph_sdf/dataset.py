@@ -13,7 +13,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from .schema import TOOL_CHOICE_TO_ID, TOOL_LIBRARY, tool_choice_key
+from .schema import TOOL_CHOICE_TO_ID, TOOL_KIND_TO_ID, TOOL_LIBRARY, tool_choice_key
 
 
 class ProcessSkeletonParquetDataset(Dataset):
@@ -651,15 +651,22 @@ class ProcessSkeletonParquetDataset(Dataset):
 
         tool_choice_id = row["tool_choice_id"] if "tool_choice_id" in row.index else None
         tool_diameter_value = row["tool_diameter"] if "tool_diameter" in row.index else None
+        tool_kind_value = None
+        if "tool_kind" in row.index and not self._is_missing(row["tool_kind"]):
+            tool_kind_value = row["tool_kind"]
+        elif "tool_type_name" in row.index and not self._is_missing(row["tool_type_name"]):
+            tool_kind_value = row["tool_type_name"]
         if tool_choice_id is None or (isinstance(tool_choice_id, float) and np.isnan(tool_choice_id)):
-            tool_kind = row["tool_type_name"] if "tool_type_name" in row.index else None
-            if tool_kind is not None and tool_diameter_value is not None:
-                key = tool_choice_key(str(tool_kind), float(tool_diameter_value))
+            if tool_kind_value is not None and tool_diameter_value is not None:
+                key = tool_choice_key(str(tool_kind_value), float(tool_diameter_value))
                 tool_choice_id = TOOL_CHOICE_TO_ID.get(key, -1)
             else:
                 tool_choice_id = -1
         if self._is_missing(tool_diameter_value) and 0 <= int(tool_choice_id) < len(TOOL_LIBRARY):
             tool_diameter_value = TOOL_LIBRARY[int(tool_choice_id)][1]
+        if tool_kind_value is None and 0 <= int(tool_choice_id) < len(TOOL_LIBRARY):
+            tool_kind_value = TOOL_LIBRARY[int(tool_choice_id)][0]
+        tool_kind_id = TOOL_KIND_TO_ID.get(str(tool_kind_value).lower(), -1) if tool_kind_value is not None else -1
         tool_choice_valid = row["tool_choice_valid"] if "tool_choice_valid" in row.index else None
         if tool_choice_valid is None or (isinstance(tool_choice_valid, float) and np.isnan(tool_choice_valid)):
             tool_choice_valid = 1 if int(tool_choice_id) >= 0 else 0
@@ -696,6 +703,7 @@ class ProcessSkeletonParquetDataset(Dataset):
             ),
             "macro_class_id": torch.tensor(int(row["macro_class_id"]), dtype=torch.long),
             "tool_choice_id": torch.tensor(int(max(int(tool_choice_id), 0)), dtype=torch.long),
+            "tool_kind_id": torch.tensor(int(max(int(tool_kind_id), 0)), dtype=torch.long),
             "action_face_id": torch.tensor(int(action_face_id), dtype=torch.long),
             "action_face_valid": torch.tensor(int(action_face_valid), dtype=torch.float32),
             "tool_choice_valid": torch.tensor(int(tool_choice_valid), dtype=torch.float32),

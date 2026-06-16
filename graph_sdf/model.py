@@ -103,8 +103,10 @@ class GraphSdfPlanningModel(nn.Module):
         macro_class_id: torch.Tensor,
         tool_choice_id: torch.Tensor,
         action_face_id: torch.Tensor,
+        tool_kind_id: Optional[torch.Tensor],
         axis_visible: Optional[torch.Tensor],
         axis_dir: Optional[torch.Tensor],
+        tool_diameter_norm: Optional[torch.Tensor],
         tool_radius_norm: Optional[torch.Tensor],
         tool_length_norm: Optional[torch.Tensor],
         holder_diameter_norm: Optional[torch.Tensor],
@@ -120,8 +122,10 @@ class GraphSdfPlanningModel(nn.Module):
             macro_class_id=macro_class_id,
             tool_choice_id=tool_choice_id,
             action_face_id=action_face_id,
+            tool_kind_id=tool_kind_id,
             axis_visible=axis_visible,
             axis_dir=axis_dir,
+            tool_diameter_norm=tool_diameter_norm,
             tool_radius_norm=tool_radius_norm,
             tool_length_norm=tool_length_norm,
             holder_diameter_norm=holder_diameter_norm,
@@ -315,8 +319,10 @@ class GraphSdfPlanningModel(nn.Module):
         octree_centers:  torch.Tensor,   # [B, K, 3]
         octree_depths:   torch.Tensor,   # [B, K]
         octree_occ_before: Optional[torch.Tensor] = None,  # [B, K]
+        tool_kind_id:    Optional[torch.Tensor] = None,
         axis_visible:         Optional[torch.Tensor] = None,
         axis_dir:             Optional[torch.Tensor] = None,
+        tool_diameter_norm:   Optional[torch.Tensor] = None,
         tool_radius_norm:     Optional[torch.Tensor] = None,
         tool_length_norm:     Optional[torch.Tensor] = None,
         holder_diameter_norm: Optional[torch.Tensor] = None,
@@ -359,8 +365,10 @@ class GraphSdfPlanningModel(nn.Module):
             macro_class_id=macro_class_id,
             tool_choice_id=tool_choice_id,
             action_face_id=action_face_id,
+            tool_kind_id=tool_kind_id,
             axis_visible=axis_visible,
             axis_dir=axis_dir,
+            tool_diameter_norm=tool_diameter_norm,
             tool_radius_norm=tool_radius_norm,
             tool_length_norm=tool_length_norm,
             holder_diameter_norm=holder_diameter_norm,
@@ -394,8 +402,10 @@ class GraphSdfPlanningModel(nn.Module):
         action_face_id: torch.Tensor,
         sdf_query_points: torch.Tensor,
         sdf_query_state: Optional[torch.Tensor] = None,
+        tool_kind_id: Optional[torch.Tensor] = None,
         axis_visible: Optional[torch.Tensor] = None,
         axis_dir: Optional[torch.Tensor] = None,
+        tool_diameter_norm: Optional[torch.Tensor] = None,
         tool_radius_norm: Optional[torch.Tensor] = None,
         tool_length_norm: Optional[torch.Tensor] = None,
         holder_diameter_norm: Optional[torch.Tensor] = None,
@@ -435,8 +445,10 @@ class GraphSdfPlanningModel(nn.Module):
             macro_class_id=macro_class_id,
             tool_choice_id=tool_choice_id,
             action_face_id=action_face_id,
+            tool_kind_id=tool_kind_id,
             axis_visible=axis_visible,
             axis_dir=axis_dir,
+            tool_diameter_norm=tool_diameter_norm,
             tool_radius_norm=tool_radius_norm,
             tool_length_norm=tool_length_norm,
             holder_diameter_norm=holder_diameter_norm,
@@ -486,8 +498,10 @@ class GraphSdfPlanningModel(nn.Module):
         macro_class_id: torch.Tensor,
         tool_choice_id: torch.Tensor,
         action_face_id: torch.Tensor,
+        tool_kind_id: Optional[torch.Tensor] = None,
         axis_visible: Optional[torch.Tensor] = None,
         axis_dir: Optional[torch.Tensor] = None,
+        tool_diameter_norm: Optional[torch.Tensor] = None,
         tool_radius_norm: Optional[torch.Tensor] = None,
         tool_length_norm: Optional[torch.Tensor] = None,
         holder_diameter_norm: Optional[torch.Tensor] = None,
@@ -520,8 +534,10 @@ class GraphSdfPlanningModel(nn.Module):
             macro_class_id=macro_class_id,
             tool_choice_id=tool_choice_id,
             action_face_id=action_face_id,
+            tool_kind_id=tool_kind_id,
             axis_visible=axis_visible,
             axis_dir=axis_dir,
+            tool_diameter_norm=tool_diameter_norm,
             tool_radius_norm=tool_radius_norm,
             tool_length_norm=tool_length_norm,
             holder_diameter_norm=holder_diameter_norm,
@@ -546,8 +562,10 @@ class GraphSdfPlanningModel(nn.Module):
         macro_class_id: torch.Tensor,
         tool_choice_id: torch.Tensor,
         action_face_id: torch.Tensor,
+        tool_kind_id: Optional[torch.Tensor] = None,
         axis_visible:   Optional[torch.Tensor] = None,
         axis_dir:       Optional[torch.Tensor] = None,
+        tool_diameter_norm: Optional[torch.Tensor] = None,
         tool_radius_norm: Optional[torch.Tensor] = None,
         tool_length_norm: Optional[torch.Tensor] = None,
         holder_diameter_norm: Optional[torch.Tensor] = None,
@@ -590,8 +608,10 @@ class GraphSdfPlanningModel(nn.Module):
             macro_class_id=macro_class_id,
             tool_choice_id=tool_choice_id,
             action_face_id=action_face_id,
+            tool_kind_id=tool_kind_id,
             axis_visible=axis_visible,
             axis_dir=axis_dir,
+            tool_diameter_norm=tool_diameter_norm,
             tool_radius_norm=tool_radius_norm,
             tool_length_norm=tool_length_norm,
             holder_diameter_norm=holder_diameter_norm,
@@ -638,6 +658,7 @@ class GraphSdfPlanningModel(nn.Module):
         tool_choice_mask:   Optional[torch.Tensor] = None,
         target_macro_class: Optional[torch.Tensor] = None,
         target_tool_choice: Optional[torch.Tensor] = None,
+        target_tool_kind: Optional[torch.Tensor] = None,
         target_action_face: Optional[torch.Tensor] = None,
         use_teacher_forcing_action: bool = False,
         run_transition: bool = True,
@@ -645,6 +666,13 @@ class GraphSdfPlanningModel(nn.Module):
         octree_centers: Optional[torch.Tensor] = None,   # [B, K, 3]
         octree_depths:  Optional[torch.Tensor] = None,   # [B, K]
         octree_occ_before: Optional[torch.Tensor] = None, # [B, K]
+        axis_dir: Optional[torch.Tensor] = None,
+        tool_diameter_norm: Optional[torch.Tensor] = None,
+        tool_radius_norm: Optional[torch.Tensor] = None,
+        tool_length_norm: Optional[torch.Tensor] = None,
+        holder_diameter_norm: Optional[torch.Tensor] = None,
+        holder_radius_norm: Optional[torch.Tensor] = None,
+        holder_length_norm: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """Run planner; optionally run octree decoder.
 
@@ -676,10 +704,12 @@ class GraphSdfPlanningModel(nn.Module):
                 )
             macro_class_id = target_macro_class
             tool_choice_id = target_tool_choice
+            tool_kind_id = target_tool_kind
             action_face_id = target_action_face
         else:
             macro_class_id = outputs["pred_macro_class"]
             tool_choice_id = outputs["pred_tool_choice"]
+            tool_kind_id = None
             action_face_id = outputs["pred_action_face"]
 
         # ── Optional: per-face SDF decoder (legacy) ───────────────────────
@@ -689,8 +719,15 @@ class GraphSdfPlanningModel(nn.Module):
                 state_points=state_points,
                 macro_class_id=macro_class_id,
                 tool_choice_id=tool_choice_id,
+                tool_kind_id=tool_kind_id,
                 action_face_id=action_face_id,
                 axis_visible=axis_visible,
+                tool_diameter_norm=tool_diameter_norm,
+                tool_radius_norm=tool_radius_norm,
+                tool_length_norm=tool_length_norm,
+                holder_diameter_norm=holder_diameter_norm,
+                holder_radius_norm=holder_radius_norm,
+                holder_length_norm=holder_length_norm,
                 node_process_state=node_process_state,
                 node_mask=node_mask,
             )
@@ -706,11 +743,19 @@ class GraphSdfPlanningModel(nn.Module):
                 state_points=state_points,
                 macro_class_id=macro_class_id,
                 tool_choice_id=tool_choice_id,
+                tool_kind_id=tool_kind_id,
                 action_face_id=action_face_id,
                 octree_centers=octree_centers,
                 octree_depths=octree_depths,
                 octree_occ_before=octree_occ_before,
                 axis_visible=axis_visible,
+                axis_dir=axis_dir,
+                tool_diameter_norm=tool_diameter_norm,
+                tool_radius_norm=tool_radius_norm,
+                tool_length_norm=tool_length_norm,
+                holder_diameter_norm=holder_diameter_norm,
+                holder_radius_norm=holder_radius_norm,
+                holder_length_norm=holder_length_norm,
                 node_process_state=node_process_state,
                 node_face_type=node_face_type,
                 node_mask=node_mask,

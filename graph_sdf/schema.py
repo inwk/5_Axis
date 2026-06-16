@@ -37,6 +37,13 @@ ID_TO_TOOL_CHOICE = {
     for idx, (tool_kind, tool_diameter) in enumerate(TOOL_LIBRARY)
 }
 
+TOOL_KIND_TO_ID = {
+    tool_kind: idx
+    for idx, tool_kind in enumerate(dict.fromkeys(tool_kind for tool_kind, _ in TOOL_LIBRARY))
+}
+
+ID_TO_TOOL_KIND = {idx: tool_kind for tool_kind, idx in TOOL_KIND_TO_ID.items()}
+
 ID_TO_MACRO_CLASS = {value: key for key, value in MACRO_CLASS_TO_ID.items()}
 
 

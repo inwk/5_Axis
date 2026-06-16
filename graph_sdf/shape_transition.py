@@ -9,17 +9,17 @@ from .config import GraphSdfModelConfig
 
 
 class ActionEmbedding(nn.Module):
-    """Builds an action context from discrete process choices and anchor-face state."""
+    """Builds an action context from operation class, tool kind, geometry, and anchor-face state."""
 
     def __init__(self, config: GraphSdfModelConfig) -> None:
-        """Initializes embeddings for macro class, tool choice, and action-face context."""
+        """Initializes projections for macro class, tool kind, geometry, and action-face context."""
         super().__init__()
         self.sdf_channel_index = config.sdf_channel_index
         self.node_process_feature_dim = config.node_process_feature_dim
         action_dim = config.action_embedding_dim
 
         self.macro_embedding = nn.Embedding(config.macro_class_count, action_dim)
-        self.tool_embedding = nn.Embedding(config.tool_choice_count, action_dim)
+        self.tool_kind_embedding = nn.Embedding(config.tool_kind_count, action_dim)
         self.tool_geometry_projection = nn.Sequential(
             nn.Linear(8, action_dim),
             nn.GELU(),
@@ -63,8 +63,10 @@ class ActionEmbedding(nn.Module):
         macro_class_id: torch.Tensor,
         tool_choice_id: torch.Tensor,
         action_face_id: torch.Tensor,
+        tool_kind_id: Optional[torch.Tensor] = None,
         axis_visible: Optional[torch.Tensor] = None,
         axis_dir: Optional[torch.Tensor] = None,
+        tool_diameter_norm: Optional[torch.Tensor] = None,
         tool_radius_norm: Optional[torch.Tensor] = None,
         tool_length_norm: Optional[torch.Tensor] = None,
         holder_diameter_norm: Optional[torch.Tensor] = None,
@@ -100,16 +102,22 @@ class ActionEmbedding(nn.Module):
         target_sdf_stats = self._gather_node_features(sdf_stats, action_face_id)
 
         macro_feature = self.macro_embedding(macro_class_id)
-        tool_feature = self.tool_embedding(tool_choice_id)
+        del tool_choice_id
+        if tool_kind_id is None:
+            tool_kind_id = macro_class_id.new_zeros(macro_class_id.shape)
+        tool_kind_feature = self.tool_kind_embedding(tool_kind_id.clamp_min(0))
         if axis_dir is None:
             axis_feature = target_normals
         else:
             axis_feature = axis_dir.to(node_embeddings.device).float().reshape(node_embeddings.shape[0], 3)
         axis_feature = axis_feature / axis_feature.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        if tool_radius_norm is None:
-            tool_radius_feature = node_embeddings.new_zeros(node_embeddings.shape[0], 1)
+        if tool_diameter_norm is None:
+            if tool_radius_norm is None:
+                tool_diameter_feature = node_embeddings.new_zeros(node_embeddings.shape[0], 1)
+            else:
+                tool_diameter_feature = 2.0 * tool_radius_norm.to(node_embeddings.device).float().reshape(node_embeddings.shape[0], -1)[:, :1]
         else:
-            tool_radius_feature = tool_radius_norm.to(node_embeddings.device).float().reshape(node_embeddings.shape[0], -1)[:, :1]
+            tool_diameter_feature = tool_diameter_norm.to(node_embeddings.device).float().reshape(node_embeddings.shape[0], -1)[:, :1]
         if tool_length_norm is None:
             tool_length_feature = node_embeddings.new_zeros(node_embeddings.shape[0], 1)
         else:
@@ -129,7 +137,7 @@ class ActionEmbedding(nn.Module):
         tool_geometry_feature = self.tool_geometry_projection(
             torch.cat(
                 [
-                    tool_radius_feature,
+                    tool_diameter_feature,
                     tool_length_feature,
                     holder_diameter_feature,
                     holder_radius_feature,
@@ -175,7 +183,7 @@ class ActionEmbedding(nn.Module):
             )
         )
         action_context = self.fuse(
-            torch.cat([macro_feature, tool_feature, tool_geometry_feature, target_feature, region_feature], dim=-1)
+            torch.cat([macro_feature, tool_kind_feature, tool_geometry_feature, target_feature, region_feature], dim=-1)
         )
         return {
             "action_context": action_context,
@@ -247,7 +255,14 @@ class ShapeTransitionHead(nn.Module):
         macro_class_id: torch.Tensor,
         tool_choice_id: torch.Tensor,
         action_face_id: torch.Tensor,
+        tool_kind_id: Optional[torch.Tensor] = None,
         axis_visible: Optional[torch.Tensor] = None,
+        tool_diameter_norm: Optional[torch.Tensor] = None,
+        tool_radius_norm: Optional[torch.Tensor] = None,
+        tool_length_norm: Optional[torch.Tensor] = None,
+        holder_diameter_norm: Optional[torch.Tensor] = None,
+        holder_radius_norm: Optional[torch.Tensor] = None,
+        holder_length_norm: Optional[torch.Tensor] = None,
         node_process_state: Optional[torch.Tensor] = None,
         node_mask: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
@@ -259,7 +274,14 @@ class ShapeTransitionHead(nn.Module):
             macro_class_id=macro_class_id,
             tool_choice_id=tool_choice_id,
             action_face_id=action_face_id,
+            tool_kind_id=tool_kind_id,
             axis_visible=axis_visible,
+            tool_diameter_norm=tool_diameter_norm,
+            tool_radius_norm=tool_radius_norm,
+            tool_length_norm=tool_length_norm,
+            holder_diameter_norm=holder_diameter_norm,
+            holder_radius_norm=holder_radius_norm,
+            holder_length_norm=holder_length_norm,
             node_process_state=node_process_state,
             node_mask=node_mask,
         )
